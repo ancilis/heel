@@ -1129,7 +1129,12 @@ def test_diag_wiring_child_parent_and_fixture_channels():
     child = source[source.index("def privileged_child("):source.index("def main(")]
     assert child.count('"link_diagnostics": collector.result(') == 2 and "read_ownership(out)" in child
     inside = source[source.index("def _inside("):source.index("def privileged_child(")]
-    assert 'for name in ("junit.xml", "records.raw.jsonl", OWNERSHIP_FILE):' in inside
+    # R4: the original JUnit/records copy loop is byte-identical to 945537; the registry has its own
+    # bounded transfer after it (see test_diag_r4_*).
+    assert ('    for name in ("junit.xml", "records.raw.jsonl"):\n        if (out / name).exists():\n'
+            '            h1f()._write_out(out_fd, name, (out / name).read_bytes(), request["uid"])\n'
+            '    handoff_ownership(out, out_fd, request["uid"])\n    return 0\n') in inside
+    assert "OWNERSHIP_FILE" not in inside and inside.count("read_bytes()") == 1
     assert 'DIAG_KEY_ENV: request["diagnostic_key"]' in inside
     parent = source[source.index("def parent("):source.index("# Privileged child:")]
     assert 'raw_cleanup, cleanup_capped = load_cleanup(out / "cleanup.raw.json")' in parent
@@ -1995,3 +2000,205 @@ def test_diag_r3_sysfs_ok_requires_every_descriptor_on_the_verified_mount(monkey
         assert _meta("mock0", 7, far, root=root, over=[link_dir]) == unknown
         assert _meta("absent", 7, far, root=root) == unknown
         assert not active
+
+# ---------------------------------------------------------------------------------------------
+# H2-LINK-DIAGNOSTICS-R4: the third review's F1 (the namespace init copied the registry with an
+# unbounded read_bytes before the later 64-KiB reader) and its M10 evidence defect.
+
+class _HandoffOs:
+    """The launcher's ``os`` with every read request and returned byte count recorded, and an
+    optional one-shot hook that changes the real scratch file just before the first read."""
+
+    def __init__(self, monkeypatch, hook=None, short=None):
+        self.requests, self.returned, self.hook, self.short, real = [], [], hook, short, os
+        outer = self
+
+        class _Proxy:
+            def __getattr__(self, attribute):
+                return getattr(real, attribute)
+
+            def read(self, descriptor, size):
+                if outer.hook is not None:
+                    hook, outer.hook = outer.hook, None
+                    hook()
+                outer.requests.append(size)
+                data = real.read(descriptor, size)
+                if outer.short is not None:  # modeled: the read ends early although the file is unchanged
+                    data, outer.short = data[:outer.short], 0
+                outer.returned.append(len(data))
+                return data
+
+        monkeypatch.setattr(LAUNCHER, "os", _Proxy())
+
+
+def _handoff(monkeypatch, tmp_path, make, hook=None, short=None):
+    """Run the real ``handoff_ownership`` (with H1F's real ``_write_out`` into a scratch destination)
+    on a registry made by ``make(path)``. Returns (outcome, destination bytes or None, reads, peak)."""
+    for name in ("src", "dst"):
+        if (tmp_path / name).exists():
+            shutil.rmtree(tmp_path / name)
+    source, destination = tmp_path / "src", tmp_path / "dst"
+    source.mkdir()
+    destination.mkdir()
+    make(source / LAUNCHER.OWNERSHIP_FILE)
+    reads = _HandoffOs(monkeypatch, hook, short)
+    out_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        tracemalloc.start()
+        outcome = LAUNCHER.handoff_ownership(source, out_fd, os.getuid())
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    finally:
+        os.close(out_fd)
+        monkeypatch.undo()
+    target = destination / LAUNCHER.OWNERSHIP_FILE
+    copied = target.read_bytes() if target.exists() else None
+    return outcome, copied, reads, peak
+
+
+def test_diag_r4_ownership_handoff_is_bounded_regular_no_follow_and_stable_before_any_copy(monkeypatch, tmp_path):
+    limit = LAUNCHER.DIAG_LIMITS["ownership_bytes"]
+    assert limit == 65536 and LAUNCHER.OWNERSHIP_REJECTED == b"\xff"
+    assert LAUNCHER.sanitize_ownership(LAUNCHER.OWNERSHIP_REJECTED) == ("invalid", [])  # never "missing"
+    # Positives: an ordinary registry and an exact 64-KiB file are copied byte for byte, read within
+    # the bound (64 KiB + 1 requested in all, the sentinel byte returning nothing).
+    for data in (fixture_registry(), b"x" * limit):
+        outcome, copied, reads, _peak = _handoff(monkeypatch, tmp_path, lambda path, data=data: path.write_bytes(data))
+        assert (outcome, copied) == ("copied", data) and sum(reads.returned) == len(data)
+        assert max(reads.requests) <= limit + 1 and sum(reads.returned) <= limit + 1
+    # Absent: nothing is written, exactly as before (the host then reports ownership_missing).
+    outcome, copied, reads, _peak = _handoff(monkeypatch, tmp_path, lambda path: None)
+    assert (outcome, copied, reads.requests) == ("absent", None, [])
+    # Oversized (65 KiB, 256 KiB and the review's 2 MiB): refused by size before one byte is read, so
+    # no allocation or copy grows with the file; the destination holds only the invalid marker.
+    for size in (65 * 1024, 256 * 1024, 2 * 1024 * 1024):
+        outcome, copied, reads, peak = _handoff(monkeypatch, tmp_path, lambda path, size=size: path.write_bytes(b"x" * size))
+        assert (outcome, copied) == ("rejected", LAUNCHER.OWNERSHIP_REJECTED), size
+        assert reads.requests == [] and peak < 16384, (size, peak)  # the review measured 2,103,151 peak bytes
+    # A symlink to owned scratch data is not followed: nothing of the target is read or copied.
+    target = tmp_path / "scratch-target"
+    target.write_bytes(b"scratch-canary")
+    outcome, copied, reads, _peak = _handoff(monkeypatch, tmp_path, lambda path: path.symlink_to(target))
+    assert (outcome, copied, reads.requests) == ("rejected", LAUNCHER.OWNERSHIP_REJECTED, [])
+    # Non-regular entries: a FIFO without a writer (O_NONBLOCK: never a blocking open or read) and a
+    # directory are refused before any read.
+    for make in (os.mkfifo, os.mkdir):
+        outcome, copied, reads, _peak = _handoff(monkeypatch, tmp_path, lambda path, make=make: make(path))
+        assert (outcome, copied, reads.requests) == ("rejected", LAUNCHER.OWNERSHIP_REJECTED, []), make
+
+    # Changing inputs, made by really changing the scratch file between the size check and the read.
+    def grow(path, by):
+        def append():
+            with path.open("ab") as handle:
+                handle.write(b"y" * by)
+        return append
+
+    def shrink(path):
+        return lambda: os.truncate(path, 7)
+
+    def rewrite(path):
+        def change():
+            path.write_bytes(b"z" * 100)  # the same size, other bytes and a later modification time
+            os.utime(path, ns=(10 ** 18, 10 ** 18))
+        return change
+
+    for name, size, hook in (("grows within the bound", 100, lambda path: grow(path, 50)),
+                             ("grows past the bound", limit, lambda path: grow(path, 10)),
+                             ("short read", 100, shrink), ("rewritten in place", 100, rewrite)):
+        path = tmp_path / "src" / LAUNCHER.OWNERSHIP_FILE
+        outcome, copied, reads, _peak = _handoff(monkeypatch, tmp_path, lambda p, size=size: p.write_bytes(b"x" * size),
+                                                 hook=lambda hook=hook, path=path: hook(path)())
+        assert (outcome, copied) == ("rejected", LAUNCHER.OWNERSHIP_REJECTED), name
+        assert reads.requests and max(reads.requests) <= limit + 1 and sum(reads.returned) <= limit + 1, name
+
+    # A short read of an unchanged file (modeled at the read call: the file's size and times stay the
+    # same, so only the bytes-read == size check can refuse it).
+    outcome, copied, reads, _peak = _handoff(monkeypatch, tmp_path, lambda p: p.write_bytes(b"x" * 100), short=7)
+    assert (outcome, copied, sum(reads.returned)) == ("rejected", LAUNCHER.OWNERSHIP_REJECTED, 7)
+
+    # The host side of the handoff: the same stable reader refuses the same changes, and the child
+    # turns any refusal into the same invalid marker (ownership_invalid, never ownership_missing).
+    out = tmp_path / "host"
+    out.mkdir()
+    (out / LAUNCHER.OWNERSHIP_FILE).write_bytes(b"x" * 100)
+    _HandoffOs(monkeypatch, grow(out / LAUNCHER.OWNERSHIP_FILE, 50))
+    with pytest.raises(ValueError):
+        LAUNCHER.read_ownership(out)
+    monkeypatch.undo()
+    (out / LAUNCHER.OWNERSHIP_FILE).write_bytes(LAUNCHER.OWNERSHIP_REJECTED)
+    assert LAUNCHER.read_ownership(out) == LAUNCHER.OWNERSHIP_REJECTED
+    source = (ROOT / "scripts/host_h2_policy_proof.py").read_text(encoding="utf-8")
+    child = source[source.index("def privileged_child("):source.index("def main(")]
+    assert "ownership = OWNERSHIP_REJECTED  # unreadable" in child and child.index("_inside(") < child.index("read_ownership(out)")
+
+
+def test_diag_r4_inside_copy_out_keeps_legacy_transfers_and_bounds_only_the_registry(monkeypatch, tmp_path):
+    """The actual statements of ``_inside`` after the suite (the unchanged JUnit/records loop and the
+    registry transfer), AST-extracted and run against scratch files: no namespace, mount or host path."""
+    source = (ROOT / "scripts/host_h2_policy_proof.py").read_text(encoding="utf-8")
+    inside = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "_inside")
+    loop = next(index for index, node in enumerate(inside.body)
+                if isinstance(node, ast.For) and "junit.xml" in ast.unparse(node.iter))
+    statements = inside.body[loop:loop + 2]
+    assert ast.unparse(statements[1]) == "handoff_ownership(out, out_fd, request['uid'])"
+    assert isinstance(inside.body[loop + 2], ast.Return)
+    code = compile(ast.Module(body=statements, type_ignores=[]), "_inside", "exec")
+    out, destination = tmp_path / "out", tmp_path / "dst"
+    out.mkdir()
+    destination.mkdir()
+    big = 2 * 1024 * 1024
+    (out / "junit.xml").write_bytes(b"j" * big)  # the original transfer: unchanged, whole-file semantics
+    (out / "records.raw.jsonl").write_bytes(b"r" * 300)
+    (out / LAUNCHER.OWNERSHIP_FILE).write_bytes(b"o" * big)
+    out_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        exec(code, dict(vars(LAUNCHER), out=out, out_fd=out_fd, request={"uid": os.getuid()}))  # noqa: S102
+    finally:
+        os.close(out_fd)
+    assert (destination / "junit.xml").read_bytes() == b"j" * big
+    assert (destination / "records.raw.jsonl").read_bytes() == b"r" * 300
+    assert (destination / LAUNCHER.OWNERSHIP_FILE).read_bytes() == LAUNCHER.OWNERSHIP_REJECTED
+    # Legacy files that are absent stay absent, as before; an ordinary registry is copied.
+    shutil.rmtree(destination)
+    destination.mkdir()
+    for name in ("junit.xml", "records.raw.jsonl"):
+        (out / name).unlink()
+    (out / LAUNCHER.OWNERSHIP_FILE).write_bytes(fixture_registry())
+    out_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        exec(code, dict(vars(LAUNCHER), out=out, out_fd=out_fd, request={"uid": os.getuid()}))  # noqa: S102
+    finally:
+        os.close(out_fd)
+    assert sorted(path.name for path in destination.iterdir()) == [LAUNCHER.OWNERSHIP_FILE]
+    assert (destination / LAUNCHER.OWNERSHIP_FILE).read_bytes() == fixture_registry()
+
+
+def test_diag_r4_set_guard_refuses_list_subclasses_before_any_visit():
+    """M10's distinguishing oracle: the set branch's exact ``type(value) is list`` refuses list
+    subclasses (an ``isinstance`` relaxation accepts a plain one), and a subclass that misreports its
+    length is refused before any item is visited."""
+    spec = ("set", LAUNCHER.DIAG_REASONS)
+    assert LAUNCHER._spec_ok(["collector_failed"], spec) is True  # the native JSON list is accepted
+
+    class Plain(list):
+        pass
+
+    assert LAUNCHER._spec_ok(Plain(["collector_failed"]), spec) is False
+
+    class Lying(list):
+        visits = 0
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            for item in super().__iter__():
+                type(self).visits += 1
+                yield item
+
+    for n in (128, 8192):
+        Lying.visits = 0
+        assert LAUNCHER._spec_ok(Lying(["collector_failed"] * n), spec) is False and Lying.visits == 0, n
+    raw = LAUNCHER.empty_diagnostics(["collector_failed"])
+    raw["incomplete_reasons"] = Plain(["collector_failed"])
+    assert LAUNCHER.sanitize_link_diagnostics(raw)["incomplete_reasons"] == ["diagnostics_invalid"]

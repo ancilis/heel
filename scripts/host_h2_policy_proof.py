@@ -304,16 +304,17 @@ def profile_fields(by_case: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, bounded corrections R2 and R3). Never
+# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, bounded corrections R2, R3 and R4). Never
 # part of the acceptance rule: the gate still hashes H0's own capture exactly as before. This describes
 # that same captured ``ip -o link show`` text, keyed with a run-private HMAC key and bounded before any
 # work (at most 64 lines, 4096 characters per line and 65536 in all are ever scanned), as one closed
 # object in cleanup.json. Every other diagnostic input (the fixture listing and registry, the
-# ancillary listing, /proc and sysfs text, the child's cleanup file and the parent's closed check) is
-# also bounded in bytes, lines, items and string length before it is copied, split, parsed, traversed,
-# hashed or sorted. Incomplete diagnostics can only hold a PASS back, never make one; a change class is
-# an observation class, never actor attribution, and a name/MAC match with a fixture registry entry is
-# a correlation only: no capture witnesses lifecycle continuity.
+# ancillary listing, /proc and sysfs text, the namespace init's registry handoff (R4), the child's
+# cleanup file and the parent's closed check) is also bounded in bytes, lines, items and string
+# length before it is copied, split, parsed, traversed, hashed or sorted. Incomplete diagnostics can
+# only hold a PASS back, never make one; a change class is an observation class, never actor
+# attribution, and a name/MAC match with a fixture registry entry is a correlation only: no capture
+# witnesses lifecycle continuity.
 
 DIAG_SCHEMA = "heel.host-h2-policy-proof.link-diagnostics.v2"
 OWNERSHIP_SCHEMA = "heel.host-h2-policy-proof.ownership.v1"
@@ -941,17 +942,38 @@ def sanitize_ownership(raw: bytes | None) -> tuple[str, list[dict]]:
     return "valid", entries
 
 
+OWNERSHIP_REJECTED = b"\xff"  # the registry existed but was refused: always ``invalid``, never ``missing``
+
+
 def read_ownership(out: Path) -> bytes | None:
-    """The fixture registry the namespace init copied out (O_NOFOLLOW; absent -> None). A regular file of
-    at most 64 KiB by its size, and never more than 64 KiB + 1 bytes read; anything else is invalid."""
+    """The fixture registry in ``out`` (O_NOFOLLOW|O_NONBLOCK; absent -> None). Both sides of the
+    handoff use it: the namespace init before copying the registry out, and the host child after. A
+    regular file of at most 64 KiB by its size, never more than 64 KiB + 1 bytes read, whose bytes read
+    equal its size and whose identity, size and times are unchanged after the read (R4: a short,
+    growing or rewritten file is refused). A symlink raises OSError; anything else raises ValueError."""
     try:
         descriptor = os.open(out / OWNERSHIP_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     try:
-        return _bounded_file(descriptor, DIAG_LIMITS["ownership_bytes"])
+        return _stable_file(descriptor, DIAG_LIMITS["ownership_bytes"])
     finally:
         os.close(descriptor)
+
+
+def _file_state(info: os.stat_result) -> tuple:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _stable_file(descriptor: int, limit: int) -> bytes:
+    """``_bounded_file`` (regular, size <= ``limit`` before any read, at most ``limit`` + 1 bytes read)
+    that also refuses a file whose bytes read differ from its size (short or grown) or whose
+    identity, size or times changed during the read. ValueError otherwise; nothing is returned."""
+    before = os.fstat(descriptor)
+    data = _bounded_file(descriptor, limit)
+    if len(data) != before.st_size or _file_state(os.fstat(descriptor)) != _file_state(before):
+        raise ValueError("diagnostic_file")
+    return data
 
 
 def _bounded_file(descriptor: int, limit: int) -> bytes:
@@ -1776,6 +1798,22 @@ def import_smoke(python: Path, source: Path, env: Path) -> bool:
     return completed.returncode == 0 and completed.stdout.startswith("import_smoke ok ")
 
 
+def handoff_ownership(out: Path, out_fd: int, uid: int) -> str:
+    """The namespace init's supplementary registry transfer (R4), separate from the unchanged
+    JUnit/records copy. The source is read by ``read_ownership`` (bounded, regular, no-follow,
+    stable) before anything is copied: absent -> nothing written (``absent``); refused for any reason
+    -> the one-byte ``OWNERSHIP_REJECTED`` marker is written instead (``rejected``), so the host reads
+    an invalid registry rather than a missing one; otherwise its bounded bytes (``copied``)."""
+    try:
+        registry = read_ownership(out)
+    except (OSError, ValueError):
+        registry = OWNERSHIP_REJECTED
+    if registry is None:
+        return "absent"
+    h1f()._write_out(out_fd, OWNERSHIP_FILE, registry, uid)
+    return "rejected" if registry is OWNERSHIP_REJECTED else "copied"
+
+
 def _inside(request: dict, wheel_bytes: dict[str, bytes], out_fd: int) -> int:
     """PID 1 of the outer PID namespace: private mounts, the fixed suite, then exit (kills all)."""
     helper = h0()
@@ -1822,9 +1860,10 @@ def _inside(request: dict, wheel_bytes: dict[str, bytes], out_fd: int) -> int:
               "leftover_processes": len(records), "leftover_records": records[:helper.LEFTOVER_RECORD_LIMIT],
               "leftover_after_kill": remaining, "import_smoke": "ok"}
     h1f()._write_out(out_fd, "inner.json", json.dumps(result).encode(), request["uid"])
-    for name in ("junit.xml", "records.raw.jsonl", OWNERSHIP_FILE):
+    for name in ("junit.xml", "records.raw.jsonl"):
         if (out / name).exists():
             h1f()._write_out(out_fd, name, (out / name).read_bytes(), request["uid"])
+    handoff_ownership(out, out_fd, request["uid"])
     return 0
 
 
@@ -1878,7 +1917,7 @@ def privileged_child() -> int:
     try:
         ownership = read_ownership(out)
     except (OSError, ValueError):
-        ownership = b"\xff"  # unreadable: the registry is invalid, never silently absent
+        ownership = OWNERSHIP_REJECTED  # unreadable: the registry is invalid, never silently absent
     finish({"namespace_child_exit": inner_exit, "host_fingerprints_unchanged": not differing,
             "differing_fingerprints": differing, "unstable_fingerprints": [],
             "kernel_modules_loaded": sorted(h1f().loaded_modules() - modules_before)[:64],

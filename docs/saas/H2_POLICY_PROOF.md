@@ -162,7 +162,7 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   injected failure in a live fixture resolves; then no fixture, domain, namespace descriptor, veth,
   socket, thread, helper, child process or outer-namespace change remains.
 
-## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2 and R3, supplementary)
+## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2, R3 and R4, supplementary)
 
 Run 41621515465 failed the host audit on `links` with no evidence of what changed (the original
 FAIL stands; its cause is underdetermined). This addition describes the same captured text; it does
@@ -171,7 +171,10 @@ source-review findings: diagnostic work is bounded before it starts (F1), a name
 is a correlation only (F2), and sysfs reads are descriptor-anchored and rechecked (F3). R3 extends
 the early bounds to every other diagnostic input (fixture listing and registry, ancillary listing,
 the child's cleanup file and the parent's closed check) and reports device facts only under a
-verified, supported sysfs mount, with claims limited to the sampled objects.
+verified, supported sysfs mount, with claims limited to the sampled objects. R4 corrects the third
+review's finding that the namespace init still copied the registry with an unbounded whole-file read
+(and followed a symlink) before the host's 64-KiB reader ran: the registry now has its own bounded
+transfer, and the R3 claim that every diagnostic input was bounded before copy was false until then.
 
 - **Same capture.** H0 `host_fingerprints(observer=None)` gains a default-disabled observer. With an
   observer, H0 hands it each fixed command's status (`ok`, `nonzero`, `timeout`, `oserror`), return
@@ -274,8 +277,23 @@ verified, supported sysfs mount, with claims limited to the sampled objects.
       the launcher's bounded command on a thread inside that namespace: at most 4097 bytes in 2 s,
       and its length is checked before any split or parse (more than one line is unobserved);
     - the L/R and outer namespace commitments.
-  - The registry is copied out with the records. It is supplementary only: it is not a case,
-    record or verdict, and the 18-case/eight-record inventory is unchanged.
+  - The registry is supplementary only: it is not a case, record or verdict, and the
+    18-case/eight-record inventory is unchanged.
+  - Transfer out of the namespace (R4). The original JUnit/records copy loop is unchanged (its exact
+    945537 bytes, whole-file reads). The registry is no longer in that loop: `handoff_ownership`
+    reads it with the same reader the host child uses (`read_ownership`) before anything is
+    allocated for its contents or copied. The source must be a regular file opened `O_NOFOLLOW` and
+    `O_NONBLOCK`, at most 64 KiB by its size before any read, never more than 64 KiB + 1 bytes read,
+    with bytes read equal to its size and identity, size and times unchanged after the read. An
+    absent registry is not written (the host reports `ownership_missing`, as before). An oversized,
+    non-regular (FIFO, directory), symlinked, short, growing or rewritten source is refused: the one
+    byte `\xff` marker is written in its place, so the host reports `ownership_invalid`, never a
+    missing registry and never any of the refused bytes. The host child reads the copy again with
+    the same reader; its own refusal is the same marker.
+  - The change detection is a same-descriptor comparison of `fstat` before and after one bounded
+    read. It does not detect a same-size rewrite whose modification and change times are both
+    unchanged (finer than the file system's timestamps), and it is not a lock: the registry stays a
+    bounded, supplementary, correlation-only input either way.
   - The registry records creation in a fixture namespace only. No capture witnesses that endpoint's
     later existence, move into the host or teardown, so proof (lifecycle) identity is never
     asserted: `proof_identity` is `unknown`. A reused name/MAC, a stale record, a moved endpoint and
@@ -289,9 +307,10 @@ verified, supported sysfs mount, with claims limited to the sampled objects.
     registry give `none`. The fixture namespace, ifindex and iflink stay bounded registry data;
     their presence alone proves no continuity.
   - Completeness (`complete`) describes the captures and inputs only, never attribution certainty.
-  - Reading the registry (R3): a regular file of at most 64 KiB by its size; then at most 32
-    newline-terminated lines, each at most 2048 printable-ASCII bytes, are counted and shaped before
-    any decode or JSON parse. More than 32 lines is `ownership_cap` with nothing parsed.
+  - Reading the registry (R3, R4): the file is read as above; then at most 32 lines (newline
+    separated; the final newline is optional), each at most 2048 printable-ASCII bytes, are counted
+    and shaped before any decode or JSON parse. More than 32 lines is `ownership_cap` with nothing
+    parsed.
 - **Limits and reasons.**
   - Limits: 64 links per capture, 4096 characters per line, 65536 scanned characters per capture,
     3 captures, 32 fixture endpoints, 64 changed entries, 16 fields per link, 64-character driver
