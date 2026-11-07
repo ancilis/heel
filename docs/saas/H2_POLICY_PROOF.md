@@ -162,7 +162,7 @@ allow-listed artifacts only (`summary.json`, `cases.jsonl`, `versions.txt`, `cle
   injected failure in a live fixture resolves; then no fixture, domain, namespace descriptor, veth,
   socket, thread, helper, child process or outer-namespace change remains.
 
-## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2, R3 and R4, supplementary)
+## Host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, corrected in R2, R3, R4 and R5, supplementary)
 
 Run 41621515465 failed the host audit on `links` with no evidence of what changed (the original
 FAIL stands; its cause is underdetermined). This addition describes the same captured text; it does
@@ -175,6 +175,10 @@ verified, supported sysfs mount, with claims limited to the sampled objects. R4 
 review's finding that the namespace init still copied the registry with an unbounded whole-file read
 (and followed a symlink) before the host's 64-KiB reader ran: the registry now has its own bounded
 transfer, and the R3 claim that every diagnostic input was bounded before copy was false until then.
+R5 corrects the fourth review's findings at that transfer's destination: H1F's shared writer ignored
+a short write, so a real kernel short write delivered one valid record of four and the diagnostics
+accepted it as complete (F1), and its blocking open waited on a writerless FIFO at the destination
+name (F2). The registry now has its own complete-or-failed writer.
 
 - **Same capture.** H0 `host_fingerprints(observer=None)` gains a default-disabled observer. With an
   observer, H0 hands it each fixed command's status (`ok`, `nonzero`, `timeout`, `oserror`), return
@@ -287,9 +291,27 @@ transfer, and the R3 claim that every diagnostic input was bounded before copy w
     with bytes read equal to its size and identity, size and times unchanged after the read. An
     absent registry is not written (the host reports `ownership_missing`, as before). An oversized,
     non-regular (FIFO, directory), symlinked, short, growing or rewritten source is refused: the one
-    byte `\xff` marker is written in its place, so the host reports `ownership_invalid`, never a
-    missing registry and never any of the refused bytes. The host child reads the copy again with
-    the same reader; its own refusal is the same marker.
+    byte `\xff` marker is written in its place, so the host reports `ownership_invalid`, never any
+    of the refused bytes. The host child reads the copy again with the same reader; its own refusal
+    is the same marker.
+  - Delivery (R5). The copy and the marker are written by `deliver_ownership`, not H1F's shared
+    `_write_out` (unchanged, and still used by the legacy loop and `inner.json`). The payload must be
+    1 byte to 64 KiB. The destination name is created with `O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK`
+    relative to the host's out directory descriptor, so any existing entry there (a FIFO, symlink,
+    directory or file) is refused at the open, which never follows, truncates or waits for a reader;
+    the descriptor must then be an empty regular file with one link, owned by the writer. A short
+    write is continued from the next byte; a zero, negative or over-long count, any write error
+    (`EFBIG`, `ENOSPC`, `EIO`, ...) and any exception raised by a signal handler fail the transfer,
+    as does a final size different from the payload. On failure the created file is emptied through
+    its own descriptor, its name is unlinked only while it is still that file, and the error is
+    raised: `_inside` exits 70, so the gate's child exit is nonzero (FAIL), and the host finds no
+    registry (`ownership_missing`, incomplete) or, if the destination entry was preexisting, refuses
+    or reads that entry as it is. A valid prefix is never left as the registry by this writer.
+    Limits: regular-file writes are kernel I/O with no deadline here (`O_NONBLOCK` has no effect on
+    them, and Python retries `EINTR` unless a handler raises); the writer bounds the bytes and the
+    loop, not wall-clock time. The best-effort cleanup can itself fail (then a prefix may remain, but
+    the transfer has still raised and the gate still fails). A preexisting entry is evidence that
+    something else wrote the private out directory; it is refused, not diagnosed.
   - The change detection is a same-descriptor comparison of `fstat` before and after one bounded
     read. It does not detect a same-size rewrite whose modification and change times are both
     unchanged (finer than the file system's timestamps), and it is not a lock: the registry stays a

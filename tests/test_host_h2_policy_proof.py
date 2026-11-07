@@ -2032,7 +2032,7 @@ class _HandoffOs:
 
 
 def _handoff(monkeypatch, tmp_path, make, hook=None, short=None):
-    """Run the real ``handoff_ownership`` (with H1F's real ``_write_out`` into a scratch destination)
+    """Run the real ``handoff_ownership`` (with its real writer, R5's ``deliver_ownership``, into a scratch destination)
     on a registry made by ``make(path)``. Returns (outcome, destination bytes or None, reads, peak)."""
     for name in ("src", "dst"):
         if (tmp_path / name).exists():
@@ -2202,3 +2202,298 @@ def test_diag_r4_set_guard_refuses_list_subclasses_before_any_visit():
     raw = LAUNCHER.empty_diagnostics(["collector_failed"])
     raw["incomplete_reasons"] = Plain(["collector_failed"])
     assert LAUNCHER.sanitize_link_diagnostics(raw)["incomplete_reasons"] == ["diagnostics_invalid"]
+
+
+# ---------------------------------------------------------------------------------------------
+# H2-LINK-DIAGNOSTICS-R5: the fourth review's F1 (a real kernel short write of the registry was
+# returned as ``copied`` and its valid one-record prefix accepted as complete diagnostics) and F2
+# (the refusal marker's open blocked on a writerless FIFO at the destination name).
+
+import contextlib  # noqa: E402
+import errno  # noqa: E402
+import resource  # noqa: E402
+import signal  # noqa: E402
+import stat  # noqa: E402
+
+H1F_WRITE_OUT_SHA256 = "701d58e43d56b2b9d36b345960d2ac0f73a9c6b58bd70308b4fd39d6721c70be"  # unchanged since 2cf90e6
+
+
+class _Blocked(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def _must_not_block(seconds=5):
+    """A destination open or write that waits (for a FIFO reader, say) fails the test instead of
+    hanging it: the alarm interrupts the blocked call with ``_Blocked``."""
+    def fire(*_args):
+        raise _Blocked("blocked")
+
+    previous = signal.signal(signal.SIGALRM, fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@contextlib.contextmanager
+def _file_size_limit(limit):
+    """A real kernel short write: this process's soft RLIMIT_FSIZE, restored before anything else runs
+    (Python ignores SIGXFSZ, so the write past the limit returns short, then EFBIG)."""
+    previous = resource.getrlimit(resource.RLIMIT_FSIZE)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, previous[1]))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, previous)
+
+
+def _inside_transfer():
+    """The actual post-suite statements of ``_inside`` (legacy loop + registry handoff), compiled."""
+    source = (ROOT / "scripts/host_h2_policy_proof.py").read_text(encoding="utf-8")
+    inside = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "_inside")
+    loop = next(index for index, node in enumerate(inside.body)
+                if isinstance(node, ast.For) and "junit.xml" in ast.unparse(node.iter))
+    assert ast.unparse(inside.body[loop + 1]) == "handoff_ownership(out, out_fd, request['uid'])"
+    return compile(ast.Module(body=inside.body[loop:loop + 2], type_ignores=[]), "_inside", "exec")
+
+
+class _Transfer:
+    """Owned scratch ``src`` (the namespace's out) and ``dst`` (the host's out, by descriptor)."""
+
+    def __init__(self, tmp_path):
+        self.base = tmp_path
+        self.src, self.dst = tmp_path / "src", tmp_path / "dst"
+        self.reset()
+
+    def reset(self):
+        for path in (self.src, self.dst):
+            if path.exists():
+                shutil.rmtree(path)
+            path.mkdir()
+        self.source, self.target = self.src / LAUNCHER.OWNERSHIP_FILE, self.dst / LAUNCHER.OWNERSHIP_FILE
+
+    def run(self, call):
+        out_fd = os.open(self.dst, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with _must_not_block():
+                return call(out_fd)
+        finally:
+            os.close(out_fd)
+
+    def handoff(self):
+        return self.run(lambda out_fd: LAUNCHER.handoff_ownership(self.src, out_fd, os.getuid()))
+
+    def inside(self, code):
+        return self.run(lambda out_fd: exec(code, dict(vars(LAUNCHER), out=self.src, out_fd=out_fd,  # noqa: S102
+                                                        request={"uid": os.getuid()})))
+
+    def host(self):
+        """The host child's read of the destination (refusal -> marker), the collector and the
+        parent's sanitizer on an unchanged modeled host, and the diagnostic rule on a passing gate."""
+        try:
+            raw = LAUNCHER.read_ownership(self.dst)
+        except (OSError, ValueError):
+            raw = LAUNCHER.OWNERSHIP_REJECTED
+        with pytest.MonkeyPatch.context() as patch:
+            clean = _audit(patch, [(0, BASE)] * 3, registry=raw)["clean"]
+        return raw, clean["ownership"]["status"], clean["complete"], LAUNCHER.diagnostic_result("PASS", clean)
+
+
+_PASSING = ("PASS", None)
+_HELD = ("FAIL", "link_diagnostics_incomplete")
+
+
+def test_diag_r5_real_short_write_fails_the_transfer_and_never_publishes_the_prefix(tmp_path):
+    payload = fixture_registry()
+    one_record = len(payload.splitlines(keepends=True)[0])
+    assert (len(payload), one_record) == (2420, 605)
+    run = _Transfer(tmp_path)
+    # The ordinary positive: all four records, a complete diagnostic that does not hold the PASS.
+    run.source.write_bytes(payload)
+    assert run.handoff() == "copied"
+    raw, status, complete, result = run.host()
+    assert (raw, status, complete, result) == (payload, "valid", True, _PASSING)
+    # The fourth review's witness at H2_POLICY 12b73e5: the same limit gave ``copied`` and one valid
+    # record accepted as complete with ("PASS", None). Now the kernel's short write is continued, the
+    # next write fails (EFBIG), the created file is emptied and removed, and the error propagates.
+    run.reset()
+    run.source.write_bytes(payload)
+    with pytest.raises(OSError) as raised, _file_size_limit(one_record):
+        run.handoff()
+    assert raised.value.errno == errno.EFBIG and resource.getrlimit(resource.RLIMIT_FSIZE)[0] != one_record
+    assert not run.target.exists() and run.source.read_bytes() == payload
+    raw, status, complete, result = run.host()
+    assert (raw, status, complete, result) == (None, "missing", False, _HELD)
+    # The same through the actual ``_inside`` statements: the exception leaves ``_inside`` (whose
+    # caller exits 70, so the gate's child_exit is nonzero) and no registry prefix is left behind.
+    run.reset()
+    run.source.write_bytes(payload)
+    with pytest.raises(OSError), _file_size_limit(one_record):
+        run.inside(_inside_transfer())
+    assert not run.target.exists() and run.host()[1:] == ("missing", False, _HELD)
+    # A short write that the next write completes is a complete copy (a limit above the payload).
+    run.reset()
+    run.source.write_bytes(payload)
+    with _file_size_limit(len(payload)):
+        assert run.handoff() == "copied"
+    assert run.host() == (payload, "valid", True, _PASSING)
+    # The refusal marker (an oversized source, never read) through the actual statements.
+    run.reset()
+    run.source.write_bytes(b"private-canary-" * 6000)
+    run.inside(_inside_transfer())
+    assert run.host() == (LAUNCHER.OWNERSHIP_REJECTED, "invalid", False, _HELD)
+    source = (ROOT / "scripts/host_h2_policy_proof.py").read_text(encoding="utf-8")
+    handoff = source[source.index("def handoff_ownership("):source.index("def _inside(")]
+    assert "_write_out" not in handoff and handoff.count("deliver_ownership(out_fd, registry, uid)") == 1
+
+
+def test_diag_r5_destination_entries_are_refused_at_a_nonblocking_open_and_left_untouched(tmp_path):
+    """F2: any existing entry at the destination name (a writerless FIFO, a symlink, a directory or a
+    regular file) is refused by O_CREAT|O_EXCL before it is opened, followed, truncated or waited on,
+    for the copy and for the refusal marker alike; the host then refuses the entry it finds."""
+    run = _Transfer(tmp_path)
+    canary = tmp_path / "canary"
+    code = _inside_transfer()
+
+    def fifo(path):
+        os.mkfifo(path)
+
+    def link(path):
+        canary.write_bytes(b"private-canary")
+        path.symlink_to(canary)
+
+    def directory(path):
+        path.mkdir()
+
+    def regular(path):
+        path.write_bytes(fixture_registry())
+
+    for name, make in (("fifo", fifo), ("symlink", link), ("directory", directory), ("regular", regular)):
+        for source in (fixture_registry(), b"x" * (65 * 1024)):  # a copy, then the refusal marker
+            run.reset()
+            run.source.write_bytes(source)
+            make(run.target)
+            before = os.lstat(run.target)
+            with pytest.raises(FileExistsError):
+                run.handoff()
+            with pytest.raises(FileExistsError):
+                run.inside(code)
+            after = os.lstat(run.target)
+            assert (after.st_ino, after.st_mode, after.st_size) == (before.st_ino, before.st_mode, before.st_size), name
+            if name == "symlink":
+                assert canary.read_bytes() == b"private-canary"
+            raw, status, complete, result = run.host()
+            if name == "regular":  # a preexisting file is the host's to judge; the transfer still failed
+                assert raw == fixture_registry()
+            else:
+                assert (raw, status, complete, result) == (LAUNCHER.OWNERSHIP_REJECTED, "invalid", False, _HELD), name
+    # The payload itself is bounded before any entry is created: empty, oversized or non-bytes.
+    run.reset()
+    for payload in (b"", b"x" * (LAUNCHER.DIAG_LIMITS["ownership_bytes"] + 1), bytearray(b"x"), "x"):
+        with pytest.raises(ValueError):
+            run.run(lambda out_fd, payload=payload: LAUNCHER.deliver_ownership(out_fd, payload, os.getuid()))
+        assert not run.target.exists()
+    assert run.run(lambda out_fd: LAUNCHER.deliver_ownership(out_fd, b"x" * 65536, os.getuid())) is None
+    assert run.target.read_bytes() == b"x" * 65536 and stat.S_IMODE(os.lstat(run.target).st_mode) == 0o600
+
+
+class _WriteOs:
+    """The launcher's ``os`` with ``write`` replaced by ``plan(real, descriptor, data, call)``; every
+    other call is the real one (so the files and descriptors are real scratch objects)."""
+
+    def __init__(self, monkeypatch, plan):
+        self.calls, real, outer = 0, os, self
+
+        class _Proxy:
+            def __getattr__(self, attribute):
+                return getattr(real, attribute)
+
+            def write(self, descriptor, data):
+                outer.calls += 1
+                return plan(real, descriptor, bytes(data), outer.calls)
+
+        monkeypatch.setattr(LAUNCHER, "os", _Proxy())
+
+
+class _HandlerRaised(BaseException):
+    """What a signal handler raising out of an interrupted write looks like to the writer."""
+
+
+def test_diag_r5_partial_zero_interrupted_and_failed_writes_are_complete_or_failed(tmp_path):
+    payload = fixture_registry()
+    run = _Transfer(tmp_path)
+
+    def attempt(plan):
+        run.reset()
+        run.source.write_bytes(payload)
+        with pytest.MonkeyPatch.context() as patch:
+            writes = _WriteOs(patch, plan)
+            try:
+                return run.handoff(), writes.calls
+            except BaseException as error:  # noqa: BLE001 - returned for the assertion
+                return error, writes.calls
+
+    # Partial writes are continued from the next unwritten byte until every byte is delivered.
+    for step in (1, 7, 604, 605, 2419):
+        outcome, calls = attempt(lambda real, fd, data, call, step=step: real.write(fd, data[:step]))
+        assert outcome == "copied" and run.target.read_bytes() == payload, step
+        assert calls == -(-len(payload) // step) and run.host()[1:] == ("valid", True, _PASSING), step
+
+    def after_prefix(fault):
+        """One real write of the first record, then ``fault`` (a count or an exception)."""
+        def plan(real, fd, data, call):
+            if call == 1:
+                return real.write(fd, data[:605])
+            if isinstance(fault, int):
+                return fault
+            raise fault
+        return plan
+
+    faults = {"zero": (0, ValueError), "negative": (-1, ValueError), "over-count": (10 ** 6, ValueError),
+              "interrupted": (InterruptedError(errno.EINTR, "interrupted"), InterruptedError),
+              "handler raised": (_HandlerRaised(), _HandlerRaised),
+              "no space": (OSError(errno.ENOSPC, "no space"), OSError), "io error": (OSError(errno.EIO, "io"), OSError),
+              "too large": (OSError(errno.EFBIG, "too large"), OSError)}
+    for name, (fault, kind) in faults.items():
+        outcome, calls = attempt(after_prefix(fault))
+        assert isinstance(outcome, kind) and calls == 2, name
+        assert not run.target.exists() and run.host() == (None, "missing", False, _HELD), name
+    # A write that reports more than it wrote: the final size check refuses the short file.
+    outcome, _calls = attempt(lambda real, fd, data, call: real.write(fd, data[:605]) and len(data))
+    assert isinstance(outcome, ValueError) and not run.target.exists()
+    # The count itself is checked, not only the final size: a write that delivers every remaining
+    # byte but reports zero or more than was asked still fails (the size check alone would pass it).
+    for name, reported in (("zero", lambda count, data: 0), ("over-count", lambda count, data: len(data) + 1)):
+        outcome, calls = attempt(lambda real, fd, data, call, reported=reported:
+                                 real.write(fd, data[:605]) if call == 1 else reported(real.write(fd, data), data))
+        assert isinstance(outcome, ValueError) and calls == 2 and not run.target.exists(), name
+    # A failure on the first write (nothing delivered) also fails, and nothing is left behind.
+    def fail_first(real, fd, data, call):
+        raise OSError(errno.EIO, "io")
+
+    outcome, calls = attempt(fail_first)
+    assert isinstance(outcome, OSError) and calls == 1 and not run.target.exists()
+
+    # The cleanup removes only its own file: if the name was replaced during the transfer, that
+    # entry is left as it is and the created file is emptied through its own descriptor.
+    moved = tmp_path / "moved-away"
+
+    def swap(real, fd, data, call):
+        real.write(fd, data[:605])
+        os.rename(run.target, moved)
+        run.target.write_bytes(b"someone else's file")
+        raise OSError(errno.EIO, "io")
+
+    if moved.exists():
+        moved.unlink()
+    outcome, _calls = attempt(swap)
+    assert isinstance(outcome, OSError)
+    assert run.target.read_bytes() == b"someone else's file" and moved.read_bytes() == b""
+    # Without this writer, H1F's shared helper is unchanged (one unchecked write, still used by the
+    # legacy JUnit/records loop and inner.json), and the registry no longer goes through it.
+    source = (ROOT / "scripts/host_lease_feasibility.py").read_text(encoding="utf-8")
+    node = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "_write_out")
+    assert hashlib.sha256(ast.get_source_segment(source, node).encode()).hexdigest() == H1F_WRITE_OUT_SHA256

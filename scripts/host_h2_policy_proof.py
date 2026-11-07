@@ -1798,19 +1798,74 @@ def import_smoke(python: Path, source: Path, env: Path) -> bool:
     return completed.returncode == 0 and completed.stdout.startswith("import_smoke ok ")
 
 
+def deliver_ownership(out_fd: int, payload: bytes, uid: int) -> None:
+    """The registry's own complete-or-failed writer (R5); H1F's shared ``_write_out`` and the legacy
+    JUnit/records loop are unchanged. ``payload`` (1 byte to 64 KiB) goes to a new entry created in
+    ``out_fd`` with ``O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK``: any existing entry (a FIFO, symlink,
+    directory or file) is refused at open, which never follows, waits for a reader or truncates. The
+    descriptor must be an empty regular file with one link, owned by this process. Short writes are
+    continued from the next byte; a zero or out-of-range count, any error (EFBIG/ENOSPC/EIO ...) and
+    any exception from a signal handler fail the transfer. Returns only when every byte is written
+    and the size matches. On failure the created file is truncated to empty and unlinked (only if the
+    name is still that file) and the error is raised, so no valid prefix stays as a registry: the
+    namespace init exits 70 and the host reports ``ownership_missing``, never a passing registry.
+    Limit: regular-file writes are kernel I/O with no deadline here; this bounds the bytes and the
+    loop, not wall-clock time (EINTR is retried by Python unless a handler raises)."""
+    if type(payload) is not bytes or not 0 < len(payload) <= DIAG_LIMITS["ownership_bytes"]:
+        raise ValueError("ownership_transfer")
+    descriptor = os.open(OWNERSHIP_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         0o600, dir_fd=out_fd)
+    created = None
+    try:
+        created = os.fstat(descriptor)
+        if (not stat.S_ISREG(created.st_mode) or created.st_size != 0 or created.st_nlink != 1
+                or created.st_uid != os.geteuid()):
+            raise ValueError("ownership_transfer")
+        view, written = memoryview(payload), 0
+        while written < len(payload):
+            count = os.write(descriptor, view[written:])
+            if type(count) is not int or not 0 < count <= len(payload) - written:
+                raise ValueError("ownership_transfer")
+            written += count
+        if os.fstat(descriptor).st_size != len(payload):
+            raise ValueError("ownership_transfer")
+        os.fchown(descriptor, uid, uid)
+    except BaseException:
+        _discard_ownership(out_fd, descriptor, created)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _discard_ownership(out_fd: int, descriptor: int, created) -> None:
+    """Best effort after a failed transfer: empty the created file through its own descriptor, then
+    unlink its name only while that name is still the same file. The caller re-raises either way."""
+    try:
+        os.ftruncate(descriptor, 0)
+    except OSError:
+        pass
+    try:
+        named = os.stat(OWNERSHIP_FILE, dir_fd=out_fd, follow_symlinks=False)
+        if created is not None and (named.st_dev, named.st_ino) == (created.st_dev, created.st_ino):
+            os.unlink(OWNERSHIP_FILE, dir_fd=out_fd)
+    except OSError:
+        pass
+
+
 def handoff_ownership(out: Path, out_fd: int, uid: int) -> str:
     """The namespace init's supplementary registry transfer (R4), separate from the unchanged
     JUnit/records copy. The source is read by ``read_ownership`` (bounded, regular, no-follow,
     stable) before anything is copied: absent -> nothing written (``absent``); refused for any reason
     -> the one-byte ``OWNERSHIP_REJECTED`` marker is written instead (``rejected``), so the host reads
-    an invalid registry rather than a missing one; otherwise its bounded bytes (``copied``)."""
+    an invalid registry rather than a missing one; otherwise its bounded bytes (``copied``). R5: both
+    go through ``deliver_ownership``, which delivers all of them or raises (never a partial copy)."""
     try:
         registry = read_ownership(out)
     except (OSError, ValueError):
         registry = OWNERSHIP_REJECTED
     if registry is None:
         return "absent"
-    h1f()._write_out(out_fd, OWNERSHIP_FILE, registry, uid)
+    deliver_ownership(out_fd, registry, uid)
     return "rejected" if registry is OWNERSHIP_REJECTED else "copied"
 
 
