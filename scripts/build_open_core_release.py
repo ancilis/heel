@@ -446,7 +446,19 @@ def _package_version(source: bytes) -> str:
     return versions[0]
 
 
-def _forbidden_local_import(tree: ast.Module) -> str | None:
+def _is_private_module(name: str) -> bool:
+    return name == "heel.saas" or name.startswith("heel.saas.")
+
+
+def _importing_package(path: str) -> tuple[str, ...]:
+    # Literal package context of a contract module path: heel/runner/execution.py
+    # and heel/runner/__init__.py both import relative to package heel.runner.
+    parts = PurePosixPath(path).with_suffix("").parts
+    return parts[:-1]
+
+
+def _forbidden_local_import(tree: ast.Module, path: str) -> str | None:
+    package = _importing_package(path)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -454,6 +466,23 @@ def _forbidden_local_import(tree: ast.Module) -> str | None:
                     return "heel.saas"
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
+            if node.level > 0:
+                # Resolve literal relative syntax exactly as importlib would
+                # from this module's package; nothing is imported or executed.
+                if node.level > len(package):
+                    raise OpenCoreBuildError(
+                        f"invalid relative import beyond top-level package in {path}"
+                    )
+                base = package[: len(package) - (node.level - 1)]
+                resolved = ".".join(base + tuple(module.split("."))) if module else ".".join(base)
+                if _is_private_module(resolved):
+                    return "heel.saas"
+                if any(
+                    _is_private_module(f"{resolved}.{alias.name}")
+                    for alias in node.names
+                    if alias.name != "*"
+                ):
+                    return "heel.saas"
             if node.level == 0:
                 if module == "heel.saas" or module.startswith("heel.saas."):
                     return "heel.saas"
@@ -563,7 +592,7 @@ def _load_public_sources(source: SourceTree) -> tuple[dict[str, object], dict[st
             tree = ast.parse(payloads[path], filename=path)
         except SyntaxError as error:
             raise OpenCoreBuildError(f"public Python module cannot be parsed: {path}") from error
-        forbidden = _forbidden_local_import(tree)
+        forbidden = _forbidden_local_import(tree, path)
         if forbidden is not None:
             raise OpenCoreBuildError(f"forbidden local import: {forbidden} in {path}")
     _validate_pyproject(payloads["pyproject.toml"], contract)
