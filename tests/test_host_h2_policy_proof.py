@@ -1328,12 +1328,15 @@ class _Opens:
                     return os.stat_result((info.st_mode, info.st_ino, info.st_dev + 1, *tuple(info)[3:10]))
                 return info
 
-            def open(self, path, flags, mode=0o777, *, dir_fd=None):
+            def open(self, path, flags, mode=None, *, dir_fd=None):
                 if action is not None and real.path.basename(str(path)) == component:
                     outer.count += 1
                     if outer.count == nth:
                         action()
-                descriptor = real.open(path, flags, mode, dir_fd=dir_fd)
+                if mode is None:
+                    descriptor = real.open(path, flags, dir_fd=dir_fd)
+                else:
+                    descriptor = real.open(path, flags, mode, dir_fd=dir_fd)
                 info = real.fstat(descriptor)
                 outer.reached.append((info.st_dev, info.st_ino))
                 return descriptor
