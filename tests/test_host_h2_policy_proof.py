@@ -65,8 +65,9 @@ UNCHANGED_SHA256 = {
     # H2-LINK-DIAGNOSTICS-R1: H0's default-disabled capture observer (was a1b32cc4...). A shared-helper
     # change: H0/H1F regressions and a fresh H0 qualification are required; it is not H2-only.
     "scripts/host_ingress_proof.py": "76958e1896110155aea9802996f00408c097a2a238b8c73ede138eafbccd4aa4",
-    # Dependency refresh: only the cryptography wheel record changes in this lock.
-    "deploy/host/ingress/runtime-lock.json": "c0ff9e8db82224715640881474e3fac89abe836ef2840409d100c262b2866ce1",
+    # H0-APP-LOCK: only the stale app.lockfile_sha256 pin changes (was c0ff9e8d..., the cryptography wheel
+    # refresh); it now names the tracked apps/heel-cloud/package-lock.json (5197b8b6...). H2 closure moves.
+    "deploy/host/ingress/runtime-lock.json": "f1fb8f3bb2ee54c3a5910ae0d5ee61ab65a39ee5a7412b1b5c14567535229db5",
 }
 RECORDED_PICK = {"targets": ("8.8.8.8", "8.8.4.4"), "unapproved_target": "1.1.1.1", "wrong_source": "9.9.9.9",
                  "dual_stack_ipv6": "2001:4860:4860::8888"}
@@ -398,11 +399,62 @@ def test_fixture_literals_are_the_recorded_pick_global_and_outside_the_deny_corp
         assert not ipaddress.ip_address(local).is_global
 
 
-def test_accepted_h2_1_inputs_and_refreshed_dependency_lock_match_recorded_hashes():
+def test_accepted_h2_1_inputs_and_refreshed_dependency_lock_match_recorded_hashes(tmp_path, monkeypatch):
     for name, digest in UNCHANGED_SHA256.items():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
     assert PROOF.H2_SOURCE_SHA256 == UNCHANGED_SHA256["deploy/host/h2_policy.py"]
     assert PROOF.HARNESS_SHA256 == UNCHANGED_SHA256["tests/support/edge_tls_harness.py"]
+
+    # H0-APP-LOCK: the shared lock's app pin must equal the tracked lockfile it names, read through the
+    # lock's own declared path. Missing data (key or file) is a failure, never a skip. This guard lives in
+    # ordinary CI from a full checkout, never inside a staged capsule, so H0's STAGE_PATHS stay unchanged.
+    spec = importlib.util.spec_from_file_location("h2_policy_proof_h0_app_lock_static", ROOT / "scripts" / "host_ingress_proof.py")
+    h0 = importlib.util.module_from_spec(spec)  # a fresh copy of the real H0 launcher, never a shared module object
+    spec.loader.exec_module(h0)
+    lock = h0.load_lock(H0_LOCK)
+    app = lock["app"]
+    assert app["lockfile"] == "apps/heel-cloud/package-lock.json" and app["directory"] == "apps/heel-cloud"
+    lockfile_bytes = (ROOT / app["lockfile"]).read_bytes()
+    assert hashlib.sha256(lockfile_bytes).hexdigest() == app["lockfile_sha256"], "runtime-lock app.lockfile_sha256 is stale"
+
+    # The real consumer (H0 stage_app) refuses a stale input before any subprocess: (a) the tracked lockfile
+    # with the stale pin H0 run 42528823162 failed on, (b) the current pin with a one-byte-changed lockfile.
+    # A matched copy is the control: the same call proceeds past the check to its first subprocess.
+    calls = []
+
+    class _Stop(Exception):
+        pass
+
+    def _record(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise _Stop()
+
+    stale_pin = "f1c1484a4287156e75b9d057ffc19b457ebae22379430399c69a8a0442e203fc"
+    changed = bytearray(lockfile_bytes)
+    changed[-1] ^= 0x01
+    for label, pin, content in (("stale_pin", stale_pin, lockfile_bytes), ("changed_lockfile", app["lockfile_sha256"], bytes(changed)),
+                                ("matched_control", app["lockfile_sha256"], lockfile_bytes)):
+        fake_root = tmp_path / label / "root"
+        (fake_root / app["lockfile"]).parent.mkdir(parents=True)
+        (fake_root / app["lockfile"]).write_bytes(content)
+        scratch = tmp_path / label / "scratch"
+        calls.clear()
+        with monkeypatch.context() as patch:
+            patch.setattr(h0, "ROOT", fake_root)
+            patch.setattr(h0.subprocess, "run", _record)
+            patch.setattr(h0.subprocess, "Popen", _record)
+            if label == "matched_control":
+                with pytest.raises(_Stop):
+                    h0.stage_app(dict(lock, app=dict(app, lockfile_sha256=pin)), scratch, "/nonexistent-node", 1e18, {})
+                assert len(calls) == 1 and calls[0][0][0] == ["git", "ls-files", "-z", "apps/heel-cloud"], label
+                assert calls[0][1]["cwd"] == fake_root, label
+            else:
+                with pytest.raises(h0.ProofFailure) as failure:
+                    h0.stage_app(dict(lock, app=dict(app, lockfile_sha256=pin)), scratch, "/nonexistent-node", 1e18, {})
+                assert failure.value.code == "app_lockfile_mismatch" and str(failure.value) == "app_lockfile_mismatch", label
+                assert calls == [], label
+        assert not scratch.exists(), label
+    assert stale_pin != app["lockfile_sha256"]
 
 
 def _replace(source: str, old: str, new: str) -> str:
