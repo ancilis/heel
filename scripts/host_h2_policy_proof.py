@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
 import re
 import secrets
+import select
 import shutil
 import stat
 import subprocess
@@ -59,6 +61,7 @@ RECORDS_ENV = "HEEL_HOST_H2_POLICY_RECORDS"
 WORK_ENV = "HEEL_HOST_H2_POLICY_WORK"
 TOKEN_ENV = "HEEL_HOST_H2_POLICY_TOKEN"
 RUNTIME_ASSUMPTION = "running-kernel"
+DIAG_KEY_ENV = "HEEL_HOST_H2_POLICY_DIAG_KEY"
 # The fixed tracked files the privileged child copies (byte for byte) into the namespace and hashes
 # into summary.json, in addition to the whole tracked heel/ tree: the H1 domain and profile, the H2-1
 # installer, this unit's files, the unchanged TLS harness, the H1F/H0 launchers and lock it imports
@@ -94,6 +97,7 @@ HEEL_TREE_FILES = (
     "heel/saas/dashboard.py", "heel/saas/device_auth.py", "heel/saas/egress.py", "heel/saas/entitlement.py",
     "heel/saas/findings_sync.py", "heel/saas/host_authority.py", "heel/saas/host_snapshot.py",
     "heel/saas/http_api.py", "heel/saas/iana_root_tlds.py", "heel/saas/jobs.py", "heel/saas/ledger.py",
+    "heel/saas/managed_authority_contracts.py",
     "heel/saas/migrate.py", "heel/saas/network_guard.py", "heel/saas/ops.py", "heel/saas/projects.py",
     "heel/saas/reconcile.py", "heel/saas/runner_auth.py", "heel/saas/runner_contexts.py", "heel/saas/server.py",
     "heel/saas/site.py", "heel/saas/tenancy.py", "heel/saas/verification.py", "heel/scenario_validate.py",
@@ -300,6 +304,1137 @@ def profile_fields(by_case: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
+# Supplementary host-link diagnostics (H2-LINK-DIAGNOSTICS-R1, bounded corrections R2, R3 and R4). Never
+# part of the acceptance rule: the gate still hashes H0's own capture exactly as before. This describes
+# that same captured ``ip -o link show`` text, keyed with a run-private HMAC key and bounded before any
+# work (at most 64 lines, 4096 characters per line and 65536 in all are ever scanned), as one closed
+# object in cleanup.json. Every other diagnostic input (the fixture listing and registry, the
+# ancillary listing, /proc and sysfs text, the namespace init's registry handoff (R4), the child's
+# cleanup file and the parent's closed check) is also bounded in bytes, lines, items and string
+# length before it is copied, split, parsed, traversed, hashed or sorted. Incomplete diagnostics can
+# only hold a PASS back, never make one; a change class is an observation class, never actor
+# attribution, and a name/MAC match with a fixture registry entry is a correlation only: no capture
+# witnesses lifecycle continuity.
+
+DIAG_SCHEMA = "heel.host-h2-policy-proof.link-diagnostics.v2"
+OWNERSHIP_SCHEMA = "heel.host-h2-policy-proof.ownership.v1"
+OWNERSHIP_FILE = "ownership.raw.jsonl"
+DIAG_PHASES = ("baseline_first", "baseline_second", "after_namespace_exit")
+DIAG_PAIRS = (("baseline", 0, 1), ("audit", 1, 2))
+DIAG_LIMITS = {"links_per_capture": 64, "captures": 3, "fixture_endpoints": 32, "changed_entries": 64,
+               "fields_per_link": 16, "driver_token_chars": 64, "commitment_hex_chars": 64, "payload_bytes": 262144,
+               "ancillary_read_bytes": 65536, "ancillary_command_ms": 2000, "ancillary_total_ms": 5000,
+               "line_chars": 4096, "scan_chars": 65536, "tokens_per_line": 64, "ownership_bytes": 65536, "sysfs_read_bytes": 64,
+               "sysfs_link_chars": 512, "sysfs_components": 32, "ownership_line_bytes": 2048, "mac_chars": 64,
+               "fdinfo_bytes": 1024, "mountinfo_bytes": 65536, "cleanup_bytes": 1048576}
+DIAG_REASONS = ("capture_missing", "capture_not_ok", "line_cap", "line_length_cap", "scan_cap", "unsupported_encoding",
+                "unsupported_syntax", "field_cap", "enrichment_timeout",
+                "enrichment_cap", "enrichment_budget", "enrichment_failed", "enrichment_unknown", "namespace_mismatch",
+                "collector_failed", "observer_failed", "ownership_missing", "ownership_invalid", "ownership_cap",
+                "changed_cap", "payload_cap", "diagnostics_missing", "diagnostics_invalid")
+CAPTURE_STATUSES = ("ok", "nonzero", "timeout", "oserror", "missing")
+ENRICH_STATUSES = ("ok", "timeout", "oserror", "nonzero", "cap", "invalid", "budget", "namespace_mismatch", "not_run")
+PARSE_STATUSES = ("complete", "incomplete", "not_applicable")
+SCAN_STATES = ("complete", "truncated")
+LINK_FLAGS = ("allmulti", "automedia", "broadcast", "debug", "dormant", "dynamic", "echo", "loopback", "lower_up", "m_down",
+              "master", "multicast", "no_carrier", "noarp", "notrailers", "pointopoint", "portsel", "promisc", "running",
+              "slave", "up")
+OPERSTATES = ("unknown", "notpresent", "down", "lowerlayerdown", "testing", "dormant", "up")
+LINK_TYPES = ("ether", "loopback", "none", "void", "ipip", "sit", "gre", "tunnel6", "ip6gre", "infiniband", "can", "ppp")
+LINK_KINDS = ("none", "veth", "bridge", "bond", "team", "vlan", "macvlan", "macvtap", "ipvlan", "vxlan", "geneve", "gre",
+              "gretap", "ip6gre", "ipip", "sit", "ip6tnl", "vti", "wireguard", "tun", "dummy", "ifb", "macsec", "vrf",
+              "netkit", "nlmon", "xfrm", "other", "unknown")
+BUSES = ("pci", "vmbus", "usb", "virtio", "platform", "xen", "auxiliary", "mdio_bus", "none", "other", "unknown")
+DRIVERS = ("mlx5_core", "mlx4_core", "mlx4_en", "hv_netvsc", "virtio_net", "ena", "gve", "ixgbevf", "igbvf", "iavf",
+           "i40e", "ice", "ixgbe", "igb", "e1000", "e1000e", "vmxnet3", "bnxt_en", "tg3", "r8169", "none", "unknown")
+FIELD_LABELS = ("ifindex", "iflink", "peer", "flags", "operstate", "link_type", "mtu", "qlen", "mac", "master", "netnsid",
+                "netns", "qdisc", "mode", "group", "brd", "peer_address", "permaddr", "altname", "alias", "vf", "unknown",
+                "line")
+PROVENANCE_LABELS = ("device_backed", "bus", "kind", "driver")
+CHANGE_KINDS = ("added", "removed", "changed")
+PROOF_IDENTITY = ("unknown", "not_applicable")  # never asserted: no capture witnesses lifecycle continuity
+CORRELATIONS = ("fixture_name_mac", "ambiguous", "none", "not_applicable")
+ATTRIBUTION = ("correlation_only",)
+HARDWARE = ("device_backed", "virtual", "unknown")
+DELTA_CLASSES = ("none", "command_status_change", "order_only_text_change", "fixture_name_mac_correlation",
+                 "hardware_backed_change", "unknown")
+OWNERSHIP_STATUSES = ("valid", "missing", "invalid", "capped")
+_MS = 1_000_000
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_LINK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}")
+
+
+def link_commitment(key: bytes, kind: str, value: str) -> str:
+    """The run-private keyed commitment of one raw value (a name, MAC, line or other text). Without
+    the key, which never leaves the run, a commitment cannot be tested against a guessed value."""
+    return hmac.new(key, kind.encode("ascii") + b"\0" + value.encode("utf-8", "surrogateescape"), hashlib.sha256).hexdigest()
+
+
+def namespace_commitment(key: bytes, device: int, inode: int) -> str:
+    return link_commitment(key, "netns", f"{device}:{inode}")
+
+
+_LINK_HEAD = re.compile(r"([0-9]{1,10}): ([^\s:/@]{1,64})(?:@([^\s:/]{1,64}))?: <([A-Za-z0-9_,-]{0,512})>(?: (.*))?")
+_SEGMENT = re.compile(r"\s*\\\s+")
+_HEAD_KEYS = {"mtu": "int", "qdisc": "text", "master": "text", "state": "text", "mode": "text", "group": "text", "qlen": "int"}
+_TAIL_KEYS = {"brd": "text", "peer": "text", "link-netnsid": "int", "link-netns": "text", "permaddr": "text"}
+_KEY_FIELDS = {"link-netnsid": "netnsid", "link-netns": "netns", "state": "operstate", "peer": "peer_address"}
+
+
+def _pairs(fields: dict, words: list[str], keys: dict) -> None:
+    for index in range(0, len(words), 2):
+        name = words[index]
+        value = words[index + 1] if index + 1 < len(words) else None
+        field = _KEY_FIELDS.get(name, name)
+        if name not in keys or value is None or fields.get(field) is not None or (
+                keys[name] == "int" and not re.fullmatch(r"-?[0-9]{1,10}", value)):
+            fields["unknown"].append(" ".join(words[index:index + 2]))
+            continue
+        fields[field] = int(value) if keys[name] == "int" else value
+
+
+def parse_link_line(line: str) -> dict | None:
+    """One ``ip -o link show`` line into raw fields, in memory only. Text outside the supported grammar
+    is kept in ``unknown`` (it still reaches the keyed ``other`` commitment) and is never normalized
+    away; None means the line head itself is unsupported."""
+    if not isinstance(line, str) or len(line) > DIAG_LIMITS["line_chars"]:
+        return None
+    segments = _SEGMENT.split(line.rstrip())
+    head = _LINK_HEAD.fullmatch(segments[0])
+    if head is None:
+        return None
+    fields: dict = {"ifindex": int(head[1]), "name": head[2], "iflink": None, "peer": None, "flags": [], "operstate": None,
+                    "link_type": None, "mtu": None, "qlen": None, "mac": None, "master": None, "netnsid": None, "netns": None,
+                    "qdisc": None, "mode": None, "group": None, "brd": None, "peer_address": None, "permaddr": None,
+                    "altname": [], "alias": None, "vf": [], "unknown": [], "line": line,
+                    "tokens": len(line.split())}
+    if head[3] is not None:
+        if re.fullmatch(r"if[0-9]{1,10}", head[3]):
+            fields["iflink"] = int(head[3][2:])
+        else:
+            fields["peer"] = head[3]
+    for flag in head[4].split(",") if head[4] else []:
+        token = flag.lower().replace("-", "_")
+        if token in LINK_FLAGS and token not in fields["flags"]:
+            fields["flags"].append(token)
+        else:
+            fields["unknown"].append("flag " + flag)
+    fields["flags"].sort()
+    _pairs(fields, (head[5] or "").split(), _HEAD_KEYS)
+    if fields["operstate"] is not None and fields["operstate"].lower() not in OPERSTATES:
+        fields["unknown"].append("state " + fields["operstate"])
+        fields["operstate"] = None
+    elif fields["operstate"] is not None:
+        fields["operstate"] = fields["operstate"].lower()
+    for segment in segments[1:]:
+        if segment.startswith("link/") and fields["link_type"] is None:
+            kind, _sep, rest = segment.partition(" ")
+            words = rest.split()
+            fields["link_type"] = kind[5:]
+            if words and words[0] not in _TAIL_KEYS:
+                fields["mac"] = words.pop(0).lower()
+            _pairs(fields, words, _TAIL_KEYS)
+        elif segment.startswith("altname ") and len(segment.split()) == 2:
+            fields["altname"].append(segment.split()[1])
+        elif segment.startswith("alias ") and fields["alias"] is None:
+            fields["alias"] = segment[6:]
+        elif segment.startswith("vf "):
+            fields["vf"].append(segment)
+        else:
+            fields["unknown"].append(segment)
+    if fields["link_type"] is not None and fields["link_type"] not in LINK_TYPES:
+        fields["unknown"].append("link/" + fields["link_type"])
+    return fields
+
+
+def scan_capture(key: bytes, stdout, *, parse: bool) -> dict:
+    """The only pass the diagnostics make over a captured text, bounded before any work: at most 64
+    lines, each found by a newline search confined to 4096 characters past its start, and 65536
+    characters in all; only such bounded slices are ever copied, encoded, committed or (for a
+    successful capture) parsed. An oversized line, more output or an unencodable line ends the scan as
+    ``truncated`` with a closed reason; the total byte and line counts are then unknown (None), never
+    estimated. ``chars`` is the exact length of the captured text (no pass over it)."""
+    limits = DIAG_LIMITS
+    text = stdout if isinstance(stdout, str) else ""
+    size, position, scanned, total_bytes = len(text), 0, 0, 0
+    lines, commitments, reasons = [], [], set()
+    while position < size:
+        if len(lines) >= limits["links_per_capture"]:
+            reasons.add("line_cap")
+            break
+        window = min(size, position + limits["line_chars"] + 1)
+        newline = text.find("\n", position, window)
+        stop = newline if newline >= 0 else window
+        if newline < 0 and (window < size or stop - position > limits["line_chars"]):
+            reasons.add("line_length_cap")
+            break
+        if scanned + (stop - position) > limits["scan_chars"]:
+            reasons.add("scan_cap")
+            break
+        line = text[position:stop]
+        try:
+            encoded = len(line.encode("utf-8", "surrogateescape"))
+        except UnicodeEncodeError:
+            reasons.add("unsupported_encoding")
+            break
+        scanned += stop - position
+        total_bytes += encoded + (1 if newline >= 0 else 0)
+        commitments.append(link_commitment(key, "line", line))
+        lines.append((line, parse_link_line(line) if parse else None))
+        position = stop + 1 if newline >= 0 else stop
+    complete = not reasons
+    return {"state": "complete" if complete else "truncated", "reasons": reasons, "lines": lines,
+            "commitments": commitments, "chars": size, "bytes": total_bytes if complete else None,
+            "line_count": len(lines) if complete else None}
+
+
+def _field_value(fields: dict, label: str):
+    if label == "unknown":
+        return tuple(fields["unknown"])
+    if label in ("altname", "vf", "flags"):
+        return tuple(fields[label])
+    if label == "line":
+        return fields["line"]
+    return fields.get(label)
+
+
+def changed_labels(before: dict, after: dict) -> list[str]:
+    """The closed labels of the raw fields that differ between two observations of one link (by
+    name); ``line`` alone means only text outside every labelled field moved (spacing, order)."""
+    labels = [label for label in FIELD_LABELS if label != "line" and _field_value(before, label) != _field_value(after, label)]
+    if not labels and before["line"] != after["line"]:
+        labels.append("line")
+    return sorted(set(labels))
+
+
+def _bounded_int(value, low: int, high: int):
+    return value if type(value) is int and low <= value <= high else None
+
+
+def link_entry(fields: dict, key: bytes, provenance: dict) -> dict:
+    """The exported, closed per-link object (exactly 16 fields): keyed commitments for every raw name,
+    address and text value, bounded integers and closed enums for the rest."""
+    def commit(kind: str, value):
+        return None if value is None else link_commitment(key, kind, value)
+
+    other = [(label, value) for label, value in (
+        ("qdisc", fields["qdisc"]), ("mode", fields["mode"]), ("group", fields["group"]), ("brd", fields["brd"]),
+        ("peer_address", fields["peer_address"]), ("permaddr", fields["permaddr"]), ("netns", fields["netns"]),
+        ("altname", "\n".join(fields["altname"]) or None), ("alias", fields["alias"]), ("vf", "\n".join(fields["vf"]) or None),
+        ("unknown", "\n".join(fields["unknown"]) or None)) if value is not None]
+    link_type = fields["link_type"] if fields["link_type"] in LINK_TYPES else None
+    return {"id": commit("name", fields["name"]), "ifindex": _bounded_int(fields["ifindex"], 0, 2 ** 31 - 1) or 0,
+            "iflink": _bounded_int(fields["iflink"], 0, 2 ** 31 - 1), "peer": commit("name", fields["peer"]),
+            "flags": list(fields["flags"]), "operstate": fields["operstate"], "link_type": link_type,
+            "mtu": _bounded_int(fields["mtu"], 0, 2 ** 31 - 1), "qlen": _bounded_int(fields["qlen"], 0, 2 ** 32),
+            "mac": commit("mac", fields["mac"]), "master": commit("name", fields["master"]),
+            "netnsid": _bounded_int(fields["netnsid"], -1, 2 ** 31 - 1), "line": commit("line", fields["line"]),
+            "other": commit("other", "\0".join(f"{label}={value}" for label, value in other)) if other else None,
+            "unknown": min(len(fields["unknown"]), 4096), "provenance": provenance}
+
+
+UNKNOWN_PROVENANCE = {"device_backed": "unknown", "bus": "unknown", "kind": "unknown", "driver": "unknown", "scope": "unknown"}
+
+
+_SYSFS_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_PROC_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _proc_read(path: str, limit: int) -> bytes | None:
+    """One small read-only /proc text of this process, read in a loop that never reads more than
+    ``limit`` + 1 bytes in all; None when it is longer than ``limit`` (it is then never split or parsed)."""
+    descriptor = os.open(path, _PROC_FILE)
+    try:
+        chunks, size = [], 0
+        while size <= limit:
+            chunk = os.read(descriptor, limit + 1 - size)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            size += len(chunk)
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def fdinfo_mount_id(data: bytes) -> int | None:
+    """The single ``mnt_id`` of a bounded /proc/self/fdinfo text; None if absent, repeated or malformed."""
+    found = None
+    for line in data.split(b"\n"):
+        if line.startswith(b"mnt_id:"):
+            value = line[7:].strip()
+            if found is not None or not re.fullmatch(rb"[0-9]{1,10}", value):
+                return None
+            found = int(value)
+    return found
+
+
+def sysfs_mount_supported(data: bytes, mount_id: int, device: int, root: str) -> bool:
+    """The one supported real-sysfs layout, decided from a bounded /proc/self/mountinfo text: exactly
+    one entry has this mount id, and it is a ``sysfs`` filesystem mounted from its own root ``/`` at
+    ``root`` on the anchor's device. A bind of a subdirectory, another filesystem type or mount point,
+    a duplicate or a malformed entry is unsupported."""
+    found = None
+    for line in data.split(b"\n"):
+        if not line:
+            continue
+        fields = line.split(b" ")
+        if len(fields) < 10 or not re.fullmatch(rb"[0-9]{1,10}", fields[0]) or b"-" not in fields[6:]:
+            return False
+        if int(fields[0]) != mount_id:
+            continue
+        if found is not None:
+            return False
+        found = fields
+    if found is None:
+        return False
+    tail = found.index(b"-", 6)
+    return (len(found) > tail + 1 and found[tail + 1] == b"sysfs" and found[3] == b"/"
+            and found[4] == root.encode("utf-8", "surrogateescape")
+            and found[2] == f"{os.major(device)}:{os.minor(device)}".encode("ascii"))
+
+
+class SysfsMount:
+    """The supported-root contract for link metadata: Linux only, read-only and bounded. ``descriptor``
+    names the mount of one descriptor this module owns (its fdinfo ``mnt_id``); ``supported`` says
+    whether that mount is the real sysfs root at ``root``. Anywhere else both answer "unsupported" and
+    metadata stays ``unknown``. No FFI, no host inventory; a mount id never leaves this module."""
+
+    def descriptor(self, descriptor: int) -> int | None:
+        if not sys.platform.startswith("linux"):
+            return None
+        data = _proc_read("/proc/self/fdinfo/%d" % descriptor, DIAG_LIMITS["fdinfo_bytes"])
+        return None if data is None else fdinfo_mount_id(data)
+
+    def supported(self, mount_id: int, device: int, root: str) -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        data = _proc_read("/proc/self/mountinfo", DIAG_LIMITS["mountinfo_bytes"])
+        return data is not None and sysfs_mount_supported(data, mount_id, device, root)
+
+
+SYSFS_MOUNT = SysfsMount()
+
+
+def _sysfs_read(directory: int, name: str, verify, limit: int = DIAG_LIMITS["sysfs_read_bytes"]) -> str:
+    """One small, fixed attribute of an already opened sysfs directory (O_NOFOLLOW, at most ``limit``):
+    the attribute's own descriptor must be a regular file on the verified mount before it is read."""
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        verify(descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("sysfs_type")
+        data = os.read(descriptor, limit + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > limit:
+        raise ValueError("sysfs_cap")
+    return data.decode("ascii").strip()
+
+
+def _sysfs_target(parts: tuple, directory: int, link: str, real_root: str) -> tuple | None:
+    """One intended metadata link (read at its directory's descriptor), resolved lexically against
+    that directory's components below the root. Lexical ``..`` is sound because every directory on
+    the way was reached through real entries only (see ``_sysfs_open``). None for a target that is
+    too long, leaves the root, or is absolute outside it; never a raw path out of this module."""
+    target = os.readlink(link, dir_fd=directory)
+    if not isinstance(target, str) or not target or len(target) > DIAG_LIMITS["sysfs_link_chars"] or "\0" in target:
+        return None
+    if target.startswith("/"):
+        if not target.startswith(real_root + "/"):
+            return None
+        components, target = [], target[len(real_root) + 1:]
+    else:
+        components = list(parts)
+    for component in target.split("/"):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if not components:
+                return None
+            components.pop()
+        else:
+            components.append(component)
+    return tuple(components) if len(components) <= DIAG_LIMITS["sysfs_components"] else None
+
+
+def _sysfs_open(root: int, parts: tuple, verify) -> tuple[int, tuple[int, int]]:
+    """A directory descriptor reached from the root descriptor one real component at a time
+    (O_DIRECTORY | O_NOFOLLOW at each parent's descriptor), each one verified on the anchor's mount:
+    no symlink is ever followed and no other mount is ever entered on the way, so a substituted parent
+    or ancestor, or an overmount, fails instead of leading out of the verified sysfs root."""
+    current = os.open(".", _SYSFS_DIRECTORY, dir_fd=root)
+    try:
+        identity = verify(current)
+        for component in parts:
+            if component in ("", ".", "..") or "/" in component:
+                raise ValueError("sysfs_component")
+            following = os.open(component, _SYSFS_DIRECTORY, dir_fd=current)
+            os.close(current)
+            current = following
+            identity = verify(current)
+        return current, identity
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _sysfs_identity(descriptor: int, device: int, mount_id: int, mount) -> tuple[int, int]:
+    """(device, inode) of a descriptor on the verified mount: the anchor's device and mount id."""
+    info = os.fstat(descriptor)
+    if info.st_dev != device or mount.descriptor(descriptor) != mount_id:
+        raise ValueError("sysfs_mount")
+    return info.st_dev, info.st_ino
+
+
+def _sysfs_pass(root: int, verify, real_root: str, name: str, ifindex: int, read) -> tuple | None:
+    """One complete descriptor-anchored pass: the link's class entry, its directory (ifindex read at
+    that descriptor before and after), and for a device-backed link its device, bus and driver, each
+    reached only through those four intended links. Returns the facts plus every endpoint identity and
+    resolved location on the way, so a second pass can compare them; None when anything is outside its
+    tree, missing or inconsistent."""
+    opened = []
+    try:
+        def reach(parts: tuple) -> tuple[int, tuple]:
+            descriptor, identity = _sysfs_open(root, parts, verify)
+            opened.append(descriptor)
+            return descriptor, (parts, identity)
+
+        def target(parts: tuple, directory: int, link: str):
+            try:
+                return _sysfs_target(parts, directory, link, real_root)
+            except FileNotFoundError:
+                return False
+
+        net, net_id = reach(("class", "net"))
+        base_parts = _sysfs_target(("class", "net"), net, name, real_root)
+        if not base_parts or len(base_parts) < 3 or base_parts[0] != "devices" or base_parts[-2:] != ("net", name):
+            return None
+        base, base_id = reach(base_parts)
+        if int(read(base, "ifindex", verify)) != ifindex:
+            return None
+        trail = [net_id, base_id]
+        device_parts = target(base_parts, base, "device")
+        if device_parts is False:
+            facts = ("no", "none", "none")
+        else:
+            if not device_parts or len(device_parts) < 2 or device_parts[0] != "devices":
+                return None
+            device_dir, device_id = reach(device_parts)
+            subsystem_parts = target(device_parts, device_dir, "subsystem")
+            if not subsystem_parts or len(subsystem_parts) != 2 or subsystem_parts[0] != "bus":
+                return None
+            trail += [device_id, reach(subsystem_parts)[1]]
+            bus = subsystem_parts[1]
+            driver_parts = target(device_parts, device_dir, "driver")
+            if driver_parts is False:
+                driver = "none"
+            else:
+                if not driver_parts or len(driver_parts) != 4 or driver_parts[:3] != ("bus", bus, "drivers"):
+                    return None
+                trail.append(reach(driver_parts)[1])
+                token = driver_parts[3]
+                driver = token if len(token) <= DIAG_LIMITS["driver_token_chars"] and token in DRIVERS else "unknown"
+            facts = ("yes", bus if bus in BUSES else "other", driver)
+        if int(read(base, "ifindex", verify)) != ifindex:
+            return None
+        return facts, tuple(trail)
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+
+def link_metadata(name: str, ifindex: int, deadline_ns: int, *, clock=time.monotonic_ns, root: str = "/sys",
+                  read=_sysfs_read, mount=SYSFS_MOUNT) -> dict:
+    """Read-only device facts for one link observed in the host capture: whether a device backs it,
+    that device's bus and an allowlisted driver token, or ``unknown``.
+
+    Supported layout only: ``ok`` requires that the root descriptor is the root of a verified real
+    sysfs mount (``mount``: Linux fdinfo mount id + mountinfo entry of fstype sysfs, mount root ``/``,
+    mount point ``root``, the descriptor's device) and that every descriptor opened afterwards (each
+    directory on every walk, each endpoint, each attribute file) is on that same device and mount.
+    Directories are reached from the root descriptor through real entries plus only the
+    class/device/subsystem/driver links, each resolved inside its own tree. A second full pass must
+    reach the same (device, inode) endpoints at the same locations with the same facts, and the
+    re-opened root must be the same object on the same mount.
+
+    What ``ok`` means: every sampled object was, when it was sampled, an object of that verified sysfs
+    mount at an intended location, and the two samples agreed. It is not lifecycle identity: an object
+    replaced by one with the same (device, inode) between samples, or a change after the second pass,
+    is not excluded. Any other layout, a failed check, a difference between passes or the deadline
+    leaves the answer ``unknown``. Never a bus path, serial, raw path, mount id or inode."""
+    answer = {"device_backed": "unknown", "bus": "unknown", "driver": "unknown", "status": "unknown"}
+    if not _LINK_NAME.fullmatch(name or "") or name in (".", ".."):
+        return answer
+    real_root = os.path.realpath(root)
+    try:
+        anchor = os.open(real_root, _SYSFS_DIRECTORY)
+    except OSError:
+        return answer
+    try:
+        device = os.fstat(anchor).st_dev
+        mount_id = mount.descriptor(anchor)
+        if mount_id is None or not mount.supported(mount_id, device, real_root):
+            return answer
+
+        def verify(descriptor: int) -> tuple[int, int]:
+            return _sysfs_identity(descriptor, device, mount_id, mount)
+
+        first = _sysfs_pass(anchor, verify, real_root, name, ifindex, read)
+        if first is None or clock() > deadline_ns:
+            return answer
+        second = _sysfs_pass(anchor, verify, real_root, name, ifindex, read)
+        again = os.open(real_root, _SYSFS_DIRECTORY)
+        try:
+            same_root = verify(again) == verify(anchor)
+        finally:
+            os.close(again)
+        if second != first or not same_root or clock() > deadline_ns:
+            return answer
+        backed, bus, driver = first[0]
+        return {"device_backed": backed, "bus": bus, "driver": driver, "status": "ok"}
+    except (OSError, ValueError):
+        return answer
+    finally:
+        os.close(anchor)
+
+
+def bounded_command(argv: tuple[str, ...], deadline_ns: int, *, clock=time.monotonic_ns,
+                    limit: int = DIAG_LIMITS["ancillary_read_bytes"]) -> tuple[str, bytes | None]:
+    """One fixed read-only ancillary command: stdout read at most ``limit`` bytes before the deadline
+    (then killed), stderr discarded, no input. Returns (status, stdout or None)."""
+    try:
+        process = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env=h0()._build_env())
+    except OSError:
+        return "oserror", None
+    chunks, size, status = [], 0, None
+    try:
+        while status is None:
+            remaining = (deadline_ns - clock()) / 1e9
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                status = "timeout"
+                break
+            chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                status = "cap"
+                break
+            chunks.append(chunk)
+        if status is None:
+            try:
+                code = process.wait(timeout=max(0.001, (deadline_ns - clock()) / 1e9))
+                status = "ok" if code == 0 else "nonzero"
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+    return status, (b"".join(chunks) if status == "ok" else None)
+
+
+ANCILLARY_LINK_KINDS = ("ip", "-d", "-j", "link", "show")
+
+
+def link_kinds(deadline_ns: int, *, clock=time.monotonic_ns, run=bounded_command) -> tuple[str, dict]:
+    """The one fixed read-only metadata listing: ifindex -> (name, closed link kind)."""
+    status, data = run(ANCILLARY_LINK_KINDS, deadline_ns, clock=clock)
+    if status != "ok":
+        return status, {}
+    try:
+        document = json.loads(data.decode("utf-8"), parse_constant=_no_constant)
+    except (ValueError, RecursionError):
+        return "invalid", {}
+    if not isinstance(document, list):
+        return "invalid", {}
+    if len(document) > DIAG_LIMITS["links_per_capture"]:  # more links than a capture is ever scanned for
+        return "cap", {}
+    kinds = {}
+    for item in document:
+        if (not isinstance(item, dict) or type(item.get("ifindex")) is not int or not isinstance(item.get("ifname"), str)
+                or len(item["ifname"]) > 64):
+            return "invalid", {}
+        info = item.get("linkinfo")
+        kind = info.get("info_kind") if isinstance(info, dict) else None
+        kinds[item["ifindex"]] = (item["ifname"], "none" if kind is None else (kind if kind in LINK_KINDS else "other"))
+    return "ok", kinds
+
+
+def _host_namespace() -> tuple[int, int]:
+    info = os.stat("/proc/self/ns/net")
+    return info.st_dev, info.st_ino
+
+
+def empty_diagnostics(reasons) -> dict:
+    return {"schema": DIAG_SCHEMA, "complete": False, "incomplete_reasons": sorted(set(reasons) & set(DIAG_REASONS)),
+            "attribution": "correlation_only", "host_namespace": None, "baseline_pause_ms": None, "ancillary_ms": 0,
+            "captures": [], "pairs": [],
+            "ownership": {"status": "missing", "endpoints": 0, "correlated": 0, "ambiguous": 0, "namespace_conflicts": 0}}
+
+
+_OWNERSHIP_KEYS = {"schema", "fixture", "side", "namespace", "outer", "requested_name", "requested_mac", "observed", "name",
+                   "mac", "ifindex", "iflink"}
+
+
+def ownership_record(key: bytes, fixture: int, side: str, namespace: tuple[int, int], outer: tuple[int, int], name: str,
+                     mac: str, listing: str | None) -> dict:
+    """The fixture's registry entry for one endpoint it just created: the requested name/MAC and the
+    read-only post-creation listing of that endpoint in its own namespace, keyed with the run key. The
+    listing's length is checked before any split or parse: more than one line's worth of text is
+    simply unobserved. A requested name or MAC outside the fixture's own shape is refused outright."""
+    if not isinstance(name, str) or not isinstance(mac, str) or not _LINK_NAME.fullmatch(name) or len(mac) > DIAG_LIMITS["mac_chars"]:
+        raise ValueError("ownership_request")
+    bounded = isinstance(listing, str) and len(listing) <= DIAG_LIMITS["line_chars"] + 1
+    lines = listing.splitlines() if bounded else []
+    fields = parse_link_line(lines[0]) if len(lines) == 1 else None
+    observed = fields is not None and fields["name"] == name and not fields["unknown"]
+    return {"schema": OWNERSHIP_SCHEMA, "fixture": fixture, "side": side,
+            "namespace": namespace_commitment(key, *namespace), "outer": namespace_commitment(key, *outer),
+            "requested_name": link_commitment(key, "name", name), "requested_mac": link_commitment(key, "mac", mac.lower()),
+            "observed": observed, "name": link_commitment(key, "name", fields["name"]) if observed else None,
+            "mac": link_commitment(key, "mac", fields["mac"]) if observed and fields["mac"] else None,
+            "ifindex": fields["ifindex"] if observed else None, "iflink": fields["iflink"] if observed else None}
+
+
+_REGISTRY_LINE = re.compile(rb"[\x20-\x7e]+")
+
+
+def sanitize_ownership(raw: bytes | None) -> tuple[str, list[dict]]:
+    """All or nothing: at most 32 closed registry entries, each a unique (fixture, side). The byte size,
+    the line count (more than 32 lines is ``capped`` with nothing parsed) and every line's length and
+    printable-ASCII shape are checked before any decode or JSON parse."""
+    if raw is None:
+        return "missing", []
+    if not isinstance(raw, bytes) or len(raw) > DIAG_LIMITS["ownership_bytes"]:
+        return "invalid", []
+    lines, position, size = [], 0, len(raw)
+    while position < size:
+        if len(lines) >= DIAG_LIMITS["fixture_endpoints"]:
+            return "capped", []
+        newline = raw.find(b"\n", position, position + DIAG_LIMITS["ownership_line_bytes"] + 1)
+        stop = newline if newline >= 0 else size
+        if stop - position > DIAG_LIMITS["ownership_line_bytes"] or not _REGISTRY_LINE.fullmatch(raw, position, stop):
+            return "invalid", []
+        lines.append((position, stop))
+        position = stop + 1
+    try:
+        entries = [json.loads(raw[start:stop].decode("ascii"), parse_constant=_no_constant) for start, stop in lines]
+    except (ValueError, RecursionError):
+        return "invalid", []
+    seen = set()
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != _OWNERSHIP_KEYS or entry["schema"] != OWNERSHIP_SCHEMA
+                or _bounded_int(entry["fixture"], 1, 4096) is None or entry["side"] not in ("l", "r")
+                or type(entry["observed"]) is not bool
+                or not all(isinstance(entry[name], str) and _HEX64.fullmatch(entry[name])
+                           for name in ("namespace", "outer", "requested_name", "requested_mac"))
+                or not all(entry[name] is None or (isinstance(entry[name], str) and _HEX64.fullmatch(entry[name]))
+                           for name in ("name", "mac"))
+                or not all(entry[name] is None or _bounded_int(entry[name], 0, 2 ** 31 - 1) is not None
+                           for name in ("ifindex", "iflink"))
+                or (entry["fixture"], entry["side"]) in seen):
+            return "invalid", []
+        seen.add((entry["fixture"], entry["side"]))
+    return "valid", entries
+
+
+OWNERSHIP_REJECTED = b"\xff"  # the registry existed but was refused: always ``invalid``, never ``missing``
+
+
+def read_ownership(out: Path) -> bytes | None:
+    """The fixture registry in ``out`` (O_NOFOLLOW|O_NONBLOCK; absent -> None). Both sides of the
+    handoff use it: the namespace init before copying the registry out, and the host child after. A
+    regular file of at most 64 KiB by its size, never more than 64 KiB + 1 bytes read, whose bytes read
+    equal its size and whose identity, size and times are unchanged after the read (R4: a short,
+    growing or rewritten file is refused). A symlink raises OSError; anything else raises ValueError."""
+    try:
+        descriptor = os.open(out / OWNERSHIP_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        return _stable_file(descriptor, DIAG_LIMITS["ownership_bytes"])
+    finally:
+        os.close(descriptor)
+
+
+def _file_state(info: os.stat_result) -> tuple:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _stable_file(descriptor: int, limit: int) -> bytes:
+    """``_bounded_file`` (regular, size <= ``limit`` before any read, at most ``limit`` + 1 bytes read)
+    that also refuses a file whose bytes read differ from its size (short or grown) or whose
+    identity, size or times changed during the read. ValueError otherwise; nothing is returned."""
+    before = os.fstat(descriptor)
+    data = _bounded_file(descriptor, limit)
+    if len(data) != before.st_size or _file_state(os.fstat(descriptor)) != _file_state(before):
+        raise ValueError("diagnostic_file")
+    return data
+
+
+def _bounded_file(descriptor: int, limit: int) -> bytes:
+    """The bytes of one regular file whose size is at most ``limit``, read in a loop that never reads
+    more than ``limit`` + 1 bytes in all. ValueError (never an over-long read) otherwise."""
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        raise ValueError("diagnostic_file")
+    chunks, size = [], 0
+    while size <= limit:
+        chunk = os.read(descriptor, limit + 1 - size)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+    raise ValueError("diagnostic_file")
+
+
+class LinkCollector:
+    """Links-only observer for H0 ``host_fingerprints``: it keeps the exact ``links`` capture the gate
+    digested (in memory), its status, return code, digest and bounds, plus run-local namespace
+    identities around each snapshot; read-only metadata is sampled next to (never atomically with)
+    the capture. Every method swallows its own failure as a closed reason: the gate never sees it."""
+
+    def __init__(self, key: bytes, anchor_ns: int, *, clock=time.monotonic_ns, sleep=time.sleep, namespace=_host_namespace,
+                 kinds=link_kinds, metadata=link_metadata):
+        self.key, self.anchor_ns, self.clock, self.sleep = key, anchor_ns, clock, sleep
+        self.namespace, self.kinds, self.metadata = namespace, kinds, metadata
+        self.phases: list[dict] = []
+        self.failures: set[str] = set()
+        self.budget_ns = DIAG_LIMITS["ancillary_total_ms"] * _MS
+        self.pause_ms: int | None = None
+
+    def _ms(self, value):
+        return None if value is None else max(0, min(10 ** 7, (value - self.anchor_ns) // _MS))
+
+    def _namespace_id(self):
+        try:
+            return namespace_commitment(self.key, *self.namespace())
+        except Exception:  # noqa: BLE001 - an unknown identity, never a guessed one
+            return None
+
+    def begin(self):
+        try:
+            if len(self.phases) >= len(DIAG_PHASES):
+                self.failures.add("collector_failed")
+                return None
+            phase = {"phase": DIAG_PHASES[len(self.phases)], "ordinal": len(self.phases), "namespace_before": self._namespace_id(),
+                     "namespace_after": None, "capture": None, "enrichment": None, "scan": None}
+            self.phases.append(phase)
+            return phase
+        except Exception:  # noqa: BLE001
+            self.failures.add("collector_failed")
+            return None
+
+    def observe(self, *, name, status, returncode, stdout, digest, started_ns, ended_ns) -> None:
+        if name != "links":
+            return
+        phase = self.phases[-1] if self.phases else None
+        if phase is None or phase["capture"] is not None:
+            self.failures.add("observer_failed")
+            return
+        phase["capture"] = {"status": status, "returncode": returncode, "stdout": stdout, "digest": digest,
+                            "started_ns": started_ns, "ended_ns": ended_ns}
+
+    def end(self, phase) -> None:
+        if phase is not None:
+            phase["namespace_after"] = self._namespace_id()
+
+    def snapshot(self, helper):
+        """The ``stable_fingerprints(snapshot=...)`` callable: H0's own snapshot with this observer."""
+        def capture() -> dict:
+            phase = self.begin()
+            try:
+                return helper.host_fingerprints(observer=self.observe)
+            finally:
+                self.end(phase)
+        return capture
+
+    def pause(self, seconds: float) -> None:
+        """The ``stable_fingerprints(pause=...)`` callable: the first snapshot's metadata inside at most
+        three quarters of the pause, then sleep the rest, so the second snapshot still starts no
+        earlier than ``seconds`` after the first ended."""
+        started = self.clock()
+        try:
+            self.enrich(limit_ns=int(seconds * 1e9 * 3 / 4))
+        except Exception:  # noqa: BLE001
+            self.failures.add("collector_failed")
+        remaining = seconds - (self.clock() - started) / 1e9
+        if remaining > 0:
+            self.sleep(remaining)
+        self.pause_ms = max(0, (self.clock() - started) // _MS)
+
+    def _scan(self, phase) -> dict:
+        """The one bounded scan of this phase's capture (cached); only a successful capture is parsed."""
+        if phase["scan"] is None:
+            capture = phase["capture"] or {}
+            phase["scan"] = scan_capture(self.key, capture.get("stdout"), parse=capture.get("status") == "ok")
+        return phase["scan"]
+
+    def enrich(self, limit_ns: int | None = None) -> None:
+        """Metadata for the latest snapshot: the fixed link-kind listing, then device facts per link,
+        rechecking the namespace identity around both. Bounded by the 2 s command and 5 s total budgets."""
+        phase = self.phases[-1] if self.phases else None
+        if phase is None or phase["enrichment"] is not None:
+            return
+        started = self.clock()
+        record = {"status": "ok", "started_ns": started, "ended_ns": None, "kinds": {}, "links": {}}
+        phase["enrichment"] = record
+        try:
+            budget = self.budget_ns if limit_ns is None else min(self.budget_ns, limit_ns)
+            deadline = started + max(0, budget)
+            capture = phase["capture"]
+            if capture is None or capture["status"] != "ok":
+                record["status"] = "not_run"
+                return
+            identity = self._namespace_id()
+            if identity is None or not (identity == phase["namespace_before"] == phase["namespace_after"]):
+                record["status"] = "namespace_mismatch"
+                return
+            if budget <= 0:
+                record["status"] = "budget"
+                return
+            status, kinds = self.kinds(min(deadline, started + DIAG_LIMITS["ancillary_command_ms"] * _MS), clock=self.clock)
+            record["kinds"] = kinds if status == "ok" else {}
+            if status != "ok":
+                record["status"] = status
+            for _line, fields in self._scan(phase)["lines"]:
+                if fields is None:
+                    continue
+                if self.clock() >= deadline:
+                    record["status"] = "budget" if record["status"] == "ok" else record["status"]
+                    break
+                record["links"][fields["ifindex"]] = self.metadata(fields["name"], fields["ifindex"], deadline, clock=self.clock)
+            if self._namespace_id() != identity:
+                record["status"], record["kinds"], record["links"] = "namespace_mismatch", {}, {}
+        except Exception:  # noqa: BLE001
+            record["status"], record["kinds"], record["links"] = "invalid", {}, {}
+            self.failures.add("collector_failed")
+        finally:
+            record["ended_ns"] = self.clock()
+            self.budget_ns -= max(0, record["ended_ns"] - started)
+
+    def _provenance(self, phase, fields) -> dict:
+        record = phase["enrichment"] or {}
+        if record.get("status") not in ("ok", "budget", "timeout", "nonzero", "cap", "invalid", "oserror"):
+            return dict(UNKNOWN_PROVENANCE)
+        device = record.get("links", {}).get(fields["ifindex"])
+        named = record.get("kinds", {}).get(fields["ifindex"])
+        kind = named[1] if named and named[0] == fields["name"] else "unknown"
+        if not device or device.get("status") != "ok":
+            return {**UNKNOWN_PROVENANCE, "kind": kind}
+        return {"device_backed": device["device_backed"], "bus": device["bus"], "kind": kind, "driver": device["driver"],
+                "scope": "host_verified"}
+
+    def result(self, ownership_raw: bytes | None) -> dict:
+        try:
+            return self._result(ownership_raw)
+        except Exception:  # noqa: BLE001 - a closed reason, never a message
+            return empty_diagnostics(["collector_failed"])
+
+    def _result(self, ownership_raw: bytes | None) -> dict:
+        key, reasons = self.key, set(self.failures)
+        captures, views = [], []
+        if len(self.phases) < len(DIAG_PHASES):
+            reasons.add("capture_missing")
+        for phase in self.phases:
+            capture, enrichment = phase["capture"], phase["enrichment"] or {"status": "not_run", "started_ns": None,
+                                                                              "ended_ns": None}
+            status = capture["status"] if capture else "missing"
+            scan = self._scan(phase) if capture else scan_capture(key, None, parse=False)
+            described = scan["lines"] if status == "ok" else []  # a failed capture's text is committed, never read as links
+            reasons |= scan["reasons"]
+            if status != "ok":
+                reasons.add("capture_missing" if status == "missing" else "capture_not_ok")
+            if phase["namespace_before"] is None or phase["namespace_before"] != phase["namespace_after"]:
+                reasons.add("namespace_mismatch")
+            if status == "ok" and enrichment["status"] != "ok":
+                reasons.add({"timeout": "enrichment_timeout", "cap": "enrichment_cap", "budget": "enrichment_budget",
+                             "namespace_mismatch": "namespace_mismatch"}.get(enrichment["status"], "enrichment_failed"))
+            line_commitments = scan["commitments"]
+            scanned = scan["state"] == "complete"
+            links, view, parse_ok = [], {}, status == "ok" and scanned
+            for line, fields in described:
+                if fields is None:
+                    reasons.add("unsupported_syntax")
+                    parse_ok = False
+                    continue
+                if fields["tokens"] > DIAG_LIMITS["tokens_per_line"]:
+                    reasons.add("field_cap")
+                    parse_ok = False
+                if fields["unknown"]:
+                    reasons.add("unsupported_syntax")
+                    parse_ok = False
+                provenance = self._provenance(phase, fields)
+                if provenance["scope"] != "host_verified" and enrichment["status"] == "ok":
+                    reasons.add("enrichment_unknown")
+                entry = link_entry(fields, key, provenance)
+                if entry["id"] in view:
+                    reasons.add("unsupported_syntax")
+                    parse_ok = False
+                view[entry["id"]] = (fields, entry)
+                links.append(entry)
+            captures.append({
+                "phase": phase["phase"], "ordinal": phase["ordinal"], "namespace_before": phase["namespace_before"],
+                "namespace_after": phase["namespace_after"], "start_ms": self._ms(capture["started_ns"]) if capture else None,
+                "end_ms": self._ms(capture["ended_ns"]) if capture else None, "status": status,
+                "returncode": _bounded_int(capture["returncode"], -255, 255) if capture else None,
+                "gate_digest": capture["digest"] if capture else None, "chars": scan["chars"], "bytes": scan["bytes"],
+                "line_count": scan["line_count"], "lines_scanned": len(scan["lines"]), "scan": scan["state"],
+                "parse": "not_applicable" if status != "ok" else ("complete" if parse_ok else "incomplete"),
+                "lines": line_commitments,
+                "multiset": link_commitment(key, "multiset", "\n".join(sorted(line_commitments)))
+                if capture and scanned else None,
+                "links": links, "enrichment": {"status": enrichment["status"], "start_ms": self._ms(enrichment["started_ns"]),
+                                               "end_ms": self._ms(enrichment["ended_ns"])}})
+            views.append({"status": status, "returncode": capture["returncode"] if capture else None,
+                          "digest": capture["digest"] if capture else None, "lines": line_commitments, "view": view,
+                          "complete": parse_ok, "scanned": scanned})
+        identities = {phase["namespace_before"] for phase in self.phases} | {phase["namespace_after"] for phase in self.phases}
+        host = next(iter(identities)) if len(identities) == 1 else None
+        if self.phases and host is None:
+            reasons.add("namespace_mismatch")
+        ownership_status, registry = sanitize_ownership(ownership_raw)
+        ownership = {"status": ownership_status, "endpoints": 0, "correlated": 0, "ambiguous": 0, "namespace_conflicts": 0}
+        usable = []
+        for entry in registry:
+            if host is not None and host in (entry["namespace"], entry["outer"]):
+                ownership["namespace_conflicts"] += 1
+                reasons.add("namespace_mismatch")
+            elif not (entry["observed"] and entry["name"] == entry["requested_name"] and entry["mac"] == entry["requested_mac"]):
+                reasons.add("ownership_invalid")
+            else:
+                usable.append(entry)
+        ownership["endpoints"] = len(usable)
+        reasons.add({"missing": "ownership_missing", "invalid": "ownership_invalid", "capped": "ownership_cap"}.get(
+            ownership_status, "ownership_missing" if not registry else None))
+        reasons.discard(None)
+        pairs, budget = [], DIAG_LIMITS["changed_entries"]
+        for name, first, second in DIAG_PAIRS:
+            if second >= len(views):
+                continue
+            pair, budget = self._pair(name, views, first, second, usable if ownership_status == "valid" else None,
+                                      ownership, budget, reasons)
+            pairs.append(pair)
+        return {"schema": DIAG_SCHEMA, "complete": not reasons, "incomplete_reasons": sorted(reasons),
+                "attribution": "correlation_only", "host_namespace": host,
+                "baseline_pause_ms": None if self.pause_ms is None else min(self.pause_ms, 10 ** 7),
+                "ancillary_ms": max(0, min(10 ** 7, (DIAG_LIMITS["ancillary_total_ms"] * _MS - self.budget_ns) // _MS)),
+                "captures": captures, "pairs": pairs, "ownership": ownership}
+
+    def _pair(self, name, views, first, second, registry, ownership, budget, reasons):
+        a, b = views[first], views[second]
+        gate_equal = a["digest"] is not None and a["digest"] == b["digest"]
+        status_change = (a["status"], a["returncode"]) != (b["status"], b["returncode"])
+        order_only = (not gate_equal and not status_change and a["scanned"] and b["scanned"]  # whole texts only
+                      and sorted(a["lines"]) == sorted(b["lines"]) and a["lines"] != b["lines"])
+        changes, enrichment_changes, counts = [], [], {"added": 0, "removed": 0, "changed": 0}
+        comparable = a["status"] == b["status"] == "ok"  # links are compared only between two successful captures
+        for link_id in sorted(set(a["view"]) | set(b["view"])) if comparable else []:
+            before, after = a["view"].get(link_id), b["view"].get(link_id)
+            if before and after:
+                labels = changed_labels(before[0], after[0])
+                kind = "changed" if labels else None
+                if not labels and before[1]["provenance"]["scope"] == after[1]["provenance"]["scope"] == "host_verified":
+                    moved = sorted(label for label in PROVENANCE_LABELS
+                                   if before[1]["provenance"][label] != after[1]["provenance"][label])
+                    if moved:
+                        if budget <= 0:
+                            reasons.add("changed_cap")
+                        else:
+                            enrichment_changes.append({"id": link_id, "fields": moved})
+                            budget -= 1
+            else:
+                kind, labels = ("added", []) if after else ("removed", [])
+            if kind is None:
+                continue
+            counts[kind] += 1
+            if budget <= 0:
+                reasons.add("changed_cap")
+                continue
+            observed = (after or before)[1]["provenance"]
+            hardware = ("unknown" if observed["scope"] != "host_verified"
+                        else {"yes": "device_backed", "no": "virtual"}.get(observed["device_backed"], "unknown"))
+            # Proof identity is never asserted: the registry records creation in a fixture namespace,
+            # and no capture witnesses that endpoint's later existence, move or teardown. A name/MAC
+            # match with one registry entry is labelled as that correlation and nothing more.
+            identity = "not_applicable" if name == "baseline" else "unknown"
+            correlation = "not_applicable" if name == "baseline" else "none"
+            if name == "audit" and kind == "added" and registry is not None and link_id not in views[0]["view"]:
+                candidates = [entry for entry in registry if entry["name"] == link_id and entry["mac"] is not None
+                              and entry["mac"] == after[1]["mac"]]
+                if len(candidates) == 1:
+                    correlation = "fixture_name_mac"
+                    ownership["correlated"] += 1
+                elif len(candidates) > 1:
+                    correlation = "ambiguous"
+                    ownership["ambiguous"] += 1
+            changes.append({"id": link_id, "change": kind, "fields": labels, "proof_identity": identity,
+                            "correlation": correlation, "hardware": hardware})
+            budget -= 1
+        if gate_equal:
+            classes = {"none"}
+        else:
+            classes = set()
+            if status_change:
+                classes.add("command_status_change")
+            elif order_only:
+                classes.add("order_only_text_change")
+            for change in changes:
+                classes.add("hardware_backed_change" if change["hardware"] == "device_backed" else "unknown")
+                if change["correlation"] == "fixture_name_mac":
+                    classes.add("fixture_name_mac_correlation")
+            if not classes or (comparable and not (a["complete"] and b["complete"])) or "changed_cap" in reasons:
+                classes.add("unknown")
+        return ({"name": name, "from": DIAG_PHASES[first], "to": DIAG_PHASES[second], "gate_digest_equal": gate_equal,
+                 "status_change": status_change, "order_only": order_only, **counts, "classes": sorted(classes),
+                 "changes": changes, "enrichment_changes": enrichment_changes}, budget)
+
+
+def _longest(choices) -> int:
+    return max(len(choice) for choice in choices)
+
+
+def _spec_ok(value, spec) -> bool:
+    """The parent's closed check of one value. Every container must be the exact JSON type and pass
+    its size check (dict key count, list length, set cardinality) before it is traversed, and every
+    string (dict keys and set items included) its length check before any regex, membership, hash,
+    set or sort: rejecting an oversized or malformed value costs at most the spec's own bounds."""
+    kind = spec[0]
+    if kind == "hex":
+        return type(value) is str and len(value) == 64 and _HEX64.fullmatch(value) is not None
+    if kind == "digest":
+        return type(value) is str and (value == "unavailable" or (len(value) == 64 and _HEX64.fullmatch(value) is not None))
+    if kind == "int":
+        return type(value) is int and spec[1] <= value <= spec[2]
+    if kind == "bool":
+        return type(value) is bool
+    if kind == "enum":
+        return type(value) is str and len(value) <= _longest(spec[1]) and value in spec[1]
+    if kind == "opt":
+        return value is None or _spec_ok(value, spec[1])
+    if kind == "list":
+        if type(value) is not list or len(value) > spec[2]:
+            return False
+        return all(_spec_ok(item, spec[1]) for item in value)
+    if kind == "set":
+        if type(value) is not list or len(value) > len(spec[1]):
+            return False
+        longest = _longest(spec[1])
+        for item in value:
+            if type(item) is not str or len(item) > longest or item not in spec[1]:
+                return False
+        return value == sorted(set(value))
+    if kind == "dict":
+        if type(value) is not dict or len(value) != len(spec[1]):
+            return False
+        longest = _longest(spec[1])
+        for key in value:
+            if type(key) is not str or len(key) > longest or key not in spec[1]:
+                return False
+        return all(_spec_ok(value[key], item) for key, item in spec[1].items())
+    return False
+
+
+_HEX = ("hex",)
+_MS_INT = ("opt", ("int", 0, 10 ** 7))
+_INDEX = ("int", 0, 2 ** 31 - 1)
+_PROVENANCE_SPEC = ("dict", {"device_backed": ("enum", ("yes", "no", "unknown")), "bus": ("enum", BUSES),
+                             "kind": ("enum", LINK_KINDS), "driver": ("enum", DRIVERS),
+                             "scope": ("enum", ("host_verified", "unknown"))})
+_LINK_SPEC = ("dict", {"id": _HEX, "ifindex": _INDEX, "iflink": ("opt", _INDEX), "peer": ("opt", _HEX),
+                       "flags": ("set", LINK_FLAGS), "operstate": ("opt", ("enum", OPERSTATES)),
+                       "link_type": ("opt", ("enum", LINK_TYPES)), "mtu": ("opt", _INDEX), "qlen": ("opt", ("int", 0, 2 ** 32)),
+                       "mac": ("opt", _HEX), "master": ("opt", _HEX), "netnsid": ("opt", ("int", -1, 2 ** 31 - 1)),
+                       "line": _HEX, "other": ("opt", _HEX), "unknown": ("int", 0, 4096), "provenance": _PROVENANCE_SPEC})
+_CAPTURE_SPEC = ("dict", {"phase": ("enum", DIAG_PHASES), "ordinal": ("int", 0, 2), "namespace_before": ("opt", _HEX),
+                          "namespace_after": ("opt", _HEX), "start_ms": _MS_INT, "end_ms": _MS_INT,
+                          "status": ("enum", CAPTURE_STATUSES), "returncode": ("opt", ("int", -255, 255)),
+                          "gate_digest": ("opt", ("digest",)), "chars": ("int", 0, 2 ** 62),
+                          "bytes": ("opt", ("int", 0, 4 * DIAG_LIMITS["scan_chars"] + DIAG_LIMITS["links_per_capture"])),
+                          "line_count": ("opt", ("int", 0, DIAG_LIMITS["links_per_capture"])),
+                          "lines_scanned": ("int", 0, DIAG_LIMITS["links_per_capture"]), "scan": ("enum", SCAN_STATES),
+                          "parse": ("enum", PARSE_STATUSES), "lines": ("list", _HEX, DIAG_LIMITS["links_per_capture"]),
+                          "multiset": ("opt", _HEX), "links": ("list", _LINK_SPEC, DIAG_LIMITS["links_per_capture"]),
+                          "enrichment": ("dict", {"status": ("enum", ENRICH_STATUSES), "start_ms": _MS_INT, "end_ms": _MS_INT})})
+_CHANGE_SPEC = ("dict", {"id": _HEX, "change": ("enum", CHANGE_KINDS), "fields": ("set", FIELD_LABELS),
+                         "proof_identity": ("enum", PROOF_IDENTITY), "correlation": ("enum", CORRELATIONS),
+                         "hardware": ("enum", HARDWARE)})
+_COUNT = ("int", 0, 10 ** 6)
+_PAIR_SPEC = ("dict", {"name": ("enum", ("baseline", "audit")), "from": ("enum", DIAG_PHASES), "to": ("enum", DIAG_PHASES),
+                       "gate_digest_equal": ("bool",), "status_change": ("bool",), "order_only": ("bool",), "added": _COUNT,
+                       "removed": _COUNT, "changed": _COUNT, "classes": ("set", DELTA_CLASSES),
+                       "changes": ("list", _CHANGE_SPEC, DIAG_LIMITS["changed_entries"]),
+                       "enrichment_changes": ("list", ("dict", {"id": _HEX, "fields": ("set", PROVENANCE_LABELS)}),
+                                              DIAG_LIMITS["changed_entries"])})
+DIAGNOSTICS_SPEC = ("dict", {"schema": ("enum", (DIAG_SCHEMA,)), "complete": ("bool",),
+                             "incomplete_reasons": ("set", DIAG_REASONS), "attribution": ("enum", ATTRIBUTION),
+                             "host_namespace": ("opt", _HEX),
+                             "baseline_pause_ms": _MS_INT, "ancillary_ms": ("int", 0, 10 ** 7),
+                             "captures": ("list", _CAPTURE_SPEC, DIAG_LIMITS["captures"]),
+                             "pairs": ("list", _PAIR_SPEC, len(DIAG_PAIRS)),
+                             "ownership": ("dict", {"status": ("enum", OWNERSHIP_STATUSES), "endpoints": _COUNT,
+                                                    "correlated": _COUNT, "ambiguous": _COUNT, "namespace_conflicts": _COUNT})})
+
+
+def sanitize_link_diagnostics(raw) -> dict:
+    """The parent's own closed check of the child's diagnostics (all or nothing), then the payload cap.
+    ``complete`` is honest only if it agrees with the reasons; a stripped payload is never complete."""
+    if raw is None:
+        return empty_diagnostics(["diagnostics_missing"])
+    if not _spec_ok(raw, DIAGNOSTICS_SPEC) or raw["complete"] != (not raw["incomplete_reasons"]) or sum(
+            len(pair["changes"]) + len(pair["enrichment_changes"]) for pair in raw["pairs"]) > DIAG_LIMITS["changed_entries"]:
+        return empty_diagnostics(["diagnostics_invalid"])
+    clean = json.loads(json.dumps(raw))
+    if len(json.dumps(clean, sort_keys=True).encode()) > DIAG_LIMITS["payload_bytes"]:
+        for capture in clean["captures"]:
+            capture["lines"], capture["links"] = [], []
+        for pair in clean["pairs"]:
+            pair["changes"], pair["enrichment_changes"] = [], []
+        clean["incomplete_reasons"] = sorted(set(clean["incomplete_reasons"]) | {"payload_cap"})
+        clean["complete"] = False
+    return clean
+
+
+def load_cleanup(path: Path) -> tuple[dict, bool]:
+    """The child's cleanup.raw.json, bounded before any decode or JSON parse: a regular file (O_NOFOLLOW)
+    of at most 1 MiB by its size, never more than 1 MiB + 1 bytes read. Absent -> ({}, False). Larger
+    or not a regular file -> ({}, True): nothing is parsed, so every cleanup field is absent (the gate
+    then fails closed on ``host_fingerprints_unchanged``) and the diagnostics are ``diagnostics_invalid``."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}, False
+    except OSError:  # a symlink or another unreadable entry: refused, never followed
+        return {}, True
+    try:
+        data = _bounded_file(descriptor, DIAG_LIMITS["cleanup_bytes"])
+    except (OSError, ValueError):
+        return {}, True
+    finally:
+        os.close(descriptor)
+    return json.loads(data.decode("utf-8")), False
+
+
+def diagnostic_result(gate_result: str, diagnostics: dict) -> tuple[str, str | None]:
+    """Stricter only: a gate PASS with incomplete link diagnostics is held as FAIL; nothing else moves."""
+    if gate_result == "PASS" and diagnostics.get("complete") is not True:
+        return "FAIL", "link_diagnostics_incomplete"
+    return gate_result, None
+
+
+def diagnostic_report_lines(diagnostics: dict) -> list[str]:
+    lines = [f"link_diagnostics_complete {diagnostics.get('complete') is True}"]
+    lines += [f"link_diagnostics_reason {reason}" for reason in diagnostics.get("incomplete_reasons") or []]
+    for pair in diagnostics.get("pairs") or []:
+        lines += [f"link_delta {pair['name']} {name}" for name in pair["classes"]]
+    return lines
+
+
+# ---------------------------------------------------------------------------------------------
 # Parent: reviewed ref, candidate, dependencies, the fixed child, sanitized evidence.
 
 def staged_files() -> tuple[str, ...]:
@@ -460,11 +1595,13 @@ def report_lines(summary: dict, failure: str | None, cleanup: dict) -> list[str]
     report.append(f"leftover_processes {cleanup.get('leftover_processes')}")
     report += [f"missing_tool {name}" for name in cleanup.get("missing_tools") or []]
     report += [f"kernel_module_loaded {name}" for name in cleanup.get("kernel_modules_loaded") or []]
+    report += [f"gate_result {summary.get('gate_result')}", f"diagnostic_hold {summary.get('diagnostic_hold')}"]
+    report += diagnostic_report_lines(cleanup.get("link_diagnostics") or {})
     return report
 
 
 def parent() -> int:
-    started = time.monotonic()
+    started, anchor_ns = time.monotonic(), time.monotonic_ns()
     deadline = started + LAUNCHER_SECONDS - CLEANUP_RESERVE_SECONDS
     timings: dict[str, float] = {}
     summary: dict = {"schema_version": "heel.host-h2-policy-proof.summary.v1", "profile": PROFILE, "reviewed_ref": REVIEWED_REF,
@@ -473,6 +1610,7 @@ def parent() -> int:
                      "negative_controls": sorted(case for case, item in RECORD_CASES.items() if item[1] == "negative")}
     scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=os.environ.get("RUNNER_TEMP") or None))
     token = secrets.token_hex(16)
+    diagnostic_key = secrets.token_hex(32)  # run-private HMAC key: sent to the child only, never written
     exit_code, failure, cleanup, versions, by_case = 1, None, {}, [], {}
     try:
         check_ref()
@@ -495,14 +1633,15 @@ def parent() -> int:
         if remaining < 120:
             raise ProofFailure("budget_exhausted_before_tests")
         request = {"schema": CHILD_SCHEMA, "wheels": str(wheels), "out": str(out), "uid": os.getuid(),
-                   "tests_seconds": min(TESTS_SECONDS, remaining - 60), "token": token}
+                   "tests_seconds": min(TESTS_SECONDS, remaining - 60), "token": token, "diagnostic_key": diagnostic_key,
+                   "anchor_ns": anchor_ns}
         child_started = time.monotonic()
         child = subprocess.run(["sudo", "-n", "--", sys.executable, "-I", str(Path(__file__).resolve())],
                                input=json.dumps(request).encode(), capture_output=True, timeout=remaining,
                                env={"PATH": FIXED_PATH, "LC_ALL": "C"})
         timings["privileged_child"] = round(time.monotonic() - child_started, 3)
         inner = json.loads((out / "inner.json").read_text()) if (out / "inner.json").exists() else {}
-        raw_cleanup = json.loads((out / "cleanup.raw.json").read_text()) if (out / "cleanup.raw.json").exists() else {}
+        raw_cleanup, cleanup_capped = load_cleanup(out / "cleanup.raw.json")
         names = h0().FINGERPRINT_NAMES
         cleanup.update({
             "child_exit": child.returncode, "namespace_child_exit": raw_cleanup.get("namespace_child_exit"),
@@ -514,7 +1653,9 @@ def parent() -> int:
                                             if isinstance(name, str) and re.fullmatch(r"[a-z0-9_]{1,56}", name))[:64],
             "leftover_processes": inner.get("leftover_processes"), "leftover_after_kill": inner.get("leftover_after_kill"),
             "leftover_records": h0().sanitize_leftovers(inner.get("leftover_records")),
-            "reaped_before_count": inner.get("reaped_before_count")})
+            "reaped_before_count": inner.get("reaped_before_count"),
+            "link_diagnostics": empty_diagnostics(["diagnostics_invalid"]) if cleanup_capped
+            else sanitize_link_diagnostics(raw_cleanup.get("link_diagnostics"))})
         if isinstance(inner.get("pytest_seconds"), (int, float)):
             timings["inner_pytest"] = round(float(inner["pytest_seconds"]), 3)
         junit = summarize_junit(out / "junit.xml")
@@ -525,16 +1666,20 @@ def parent() -> int:
         summary["import_smoke"] = "ok" if inner.get("import_smoke") == "ok" else "not_ok"
         (ARTIFACT_DIR / "cases.jsonl").write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
         verdict = evaluate(junit, records, dropped, cleanup, inner, child.returncode)
+        result, hold = diagnostic_result(verdict["result"], cleanup["link_diagnostics"])
         summary.update(verdict, tests=junit, pytest_exit=inner.get("pytest_exit"), tests_timed_out=inner.get("timed_out"),
                        records=[{"case": r["case"], "control": r["control"], "verdict": r["verdict"]} for r in records])
+        summary.update(gate_result=verdict["result"], result=result, diagnostic_hold=hold,
+                       link_diagnostics_complete=cleanup["link_diagnostics"]["complete"])
         versions = version_lines(by_case, verdict["kernel_profile"])
-        exit_code = 0 if verdict["result"] == "PASS" else 1
+        exit_code = 0 if result == "PASS" else 1
     except ProofFailure as error:
         failure = error.code
     except Exception as error:  # noqa: BLE001 - a fixed class name only, never a message
         failure = "unexpected_" + type(error).__name__
     finally:
         ARTIFACT_DIR.mkdir(exist_ok=True)
+        cleanup.setdefault("link_diagnostics", empty_diagnostics(["diagnostics_missing"]))
         versions = versions + ["launcher_python {}.{}.{}".format(*sys.version_info[:3]), h0().cpu_count_line(),
                                f"platform {sys.platform}"]
         summary.update(failure=failure, timings=timings, seconds=round(time.monotonic() - started, 3),
@@ -546,7 +1691,7 @@ def parent() -> int:
         (ARTIFACT_DIR / "report.txt").write_text("\n".join(report) + "\n")
         for name in ARTIFACT_FILES:
             (ARTIFACT_DIR / name).touch()
-        flagged = artifact_scan(ARTIFACT_DIR, token)
+        flagged = sorted(set(artifact_scan(ARTIFACT_DIR, token)) | set(artifact_scan(ARTIFACT_DIR, diagnostic_key)))
         if flagged:
             for name in flagged:
                 (ARTIFACT_DIR / name).write_text('{"suppressed":"artifact scan"}\n')
@@ -581,13 +1726,18 @@ def validated_request(raw: str) -> dict | None:
         request = json.loads(raw, parse_constant=_no_constant)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(request, dict) or set(request) != {"schema", "wheels", "out", "uid", "tests_seconds", "token"}:
+    if not isinstance(request, dict) or set(request) != {"schema", "wheels", "out", "uid", "tests_seconds", "token",
+                                                          "diagnostic_key", "anchor_ns"}:
         return None
     if request["schema"] != CHILD_SCHEMA or type(request["uid"]) is not int or not 1 <= request["uid"] < 2 ** 31:
         return None
     if type(request["tests_seconds"]) is not int or not 60 <= request["tests_seconds"] <= TESTS_SECONDS:
         return None
     if not isinstance(request["token"], str) or not re.fullmatch(r"[0-9a-f]{32}", request["token"]):
+        return None
+    if not isinstance(request["diagnostic_key"], str) or not _HEX64.fullmatch(request["diagnostic_key"]):
+        return None
+    if type(request["anchor_ns"]) is not int or not 0 <= request["anchor_ns"] < 2 ** 63:
         return None
     try:
         if not all(_owned_private_directory(request[key], request["uid"], key) for key in ("wheels", "out")):
@@ -648,6 +1798,77 @@ def import_smoke(python: Path, source: Path, env: Path) -> bool:
     return completed.returncode == 0 and completed.stdout.startswith("import_smoke ok ")
 
 
+def deliver_ownership(out_fd: int, payload: bytes, uid: int) -> None:
+    """The registry's own complete-or-failed writer (R5); H1F's shared ``_write_out`` and the legacy
+    JUnit/records loop are unchanged. ``payload`` (1 byte to 64 KiB) goes to a new entry created in
+    ``out_fd`` with ``O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK``: any existing entry (a FIFO, symlink,
+    directory or file) is refused at open, which never follows, waits for a reader or truncates. The
+    descriptor must be an empty regular file with one link, owned by this process. Short writes are
+    continued from the next byte; a zero or out-of-range count, any error (EFBIG/ENOSPC/EIO ...) and
+    any exception from a signal handler fail the transfer. Returns only when every byte is written
+    and the size matches. On failure the created file is truncated to empty and unlinked (only if the
+    name is still that file) and the error is raised, so no valid prefix stays as a registry: the
+    namespace init exits 70 and the host reports ``ownership_missing``, never a passing registry.
+    Limit: regular-file writes are kernel I/O with no deadline here; this bounds the bytes and the
+    loop, not wall-clock time (EINTR is retried by Python unless a handler raises)."""
+    if type(payload) is not bytes or not 0 < len(payload) <= DIAG_LIMITS["ownership_bytes"]:
+        raise ValueError("ownership_transfer")
+    descriptor = os.open(OWNERSHIP_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         0o600, dir_fd=out_fd)
+    created = None
+    try:
+        created = os.fstat(descriptor)
+        if (not stat.S_ISREG(created.st_mode) or created.st_size != 0 or created.st_nlink != 1
+                or created.st_uid != os.geteuid()):
+            raise ValueError("ownership_transfer")
+        view, written = memoryview(payload), 0
+        while written < len(payload):
+            count = os.write(descriptor, view[written:])
+            if type(count) is not int or not 0 < count <= len(payload) - written:
+                raise ValueError("ownership_transfer")
+            written += count
+        if os.fstat(descriptor).st_size != len(payload):
+            raise ValueError("ownership_transfer")
+        os.fchown(descriptor, uid, uid)
+    except BaseException:
+        _discard_ownership(out_fd, descriptor, created)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def _discard_ownership(out_fd: int, descriptor: int, created) -> None:
+    """Best effort after a failed transfer: empty the created file through its own descriptor, then
+    unlink its name only while that name is still the same file. The caller re-raises either way."""
+    try:
+        os.ftruncate(descriptor, 0)
+    except OSError:
+        pass
+    try:
+        named = os.stat(OWNERSHIP_FILE, dir_fd=out_fd, follow_symlinks=False)
+        if created is not None and (named.st_dev, named.st_ino) == (created.st_dev, created.st_ino):
+            os.unlink(OWNERSHIP_FILE, dir_fd=out_fd)
+    except OSError:
+        pass
+
+
+def handoff_ownership(out: Path, out_fd: int, uid: int) -> str:
+    """The namespace init's supplementary registry transfer (R4), separate from the unchanged
+    JUnit/records copy. The source is read by ``read_ownership`` (bounded, regular, no-follow,
+    stable) before anything is copied: absent -> nothing written (``absent``); refused for any reason
+    -> the one-byte ``OWNERSHIP_REJECTED`` marker is written instead (``rejected``), so the host reads
+    an invalid registry rather than a missing one; otherwise its bounded bytes (``copied``). R5: both
+    go through ``deliver_ownership``, which delivers all of them or raises (never a partial copy)."""
+    try:
+        registry = read_ownership(out)
+    except (OSError, ValueError):
+        registry = OWNERSHIP_REJECTED
+    if registry is None:
+        return "absent"
+    deliver_ownership(out_fd, registry, uid)
+    return "rejected" if registry is OWNERSHIP_REJECTED else "copied"
+
+
 def _inside(request: dict, wheel_bytes: dict[str, bytes], out_fd: int) -> int:
     """PID 1 of the outer PID namespace: private mounts, the fixed suite, then exit (kills all)."""
     helper = h0()
@@ -672,7 +1893,8 @@ def _inside(request: dict, wheel_bytes: dict[str, bytes], out_fd: int) -> int:
     out = root / "out"
     env = {"PATH": FIXED_PATH, "LC_ALL": "C", "TZ": "UTC", "HOME": str(root / "home"), "TMPDIR": str(root / "home"),
            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", REQUIRED_ENV: "1",
-           RECORDS_ENV: str(out / "records.raw.jsonl"), WORK_ENV: str(root / "work"), TOKEN_ENV: request["token"]}
+           RECORDS_ENV: str(out / "records.raw.jsonl"), WORK_ENV: str(root / "work"), TOKEN_ENV: request["token"],
+           DIAG_KEY_ENV: request["diagnostic_key"]}
     started = time.monotonic()
     process = subprocess.Popen([str(python), "-m", "pytest", "-q", "-p", "no:cacheprovider", "-o", "console_output_style=classic",
                                 "-o", "xfail_strict=true", f"--junitxml={out / 'junit.xml'}", TEST_MODULE],
@@ -696,6 +1918,7 @@ def _inside(request: dict, wheel_bytes: dict[str, bytes], out_fd: int) -> int:
     for name in ("junit.xml", "records.raw.jsonl"):
         if (out / name).exists():
             h1f()._write_out(out_fd, name, (out / name).read_bytes(), request["uid"])
+    handoff_ownership(out, out_fd, request["uid"])
     return 0
 
 
@@ -715,10 +1938,13 @@ def privileged_child() -> int:
         finish({"missing_tools": missing, "host_fingerprints_unchanged": False})
         return 1
     helper = h0()
-    before, unstable = helper.stable_fingerprints()
+    # The same stable baseline (two H0 snapshots, two seconds apart) observed by the links collector.
+    collector = LinkCollector(bytes.fromhex(request["diagnostic_key"]), request["anchor_ns"])
+    before, unstable = helper.stable_fingerprints(snapshot=collector.snapshot(helper), pause=collector.pause)
+    collector.enrich()
     if unstable:
         finish({"namespace_child_exit": None, "host_fingerprints_unchanged": False, "differing_fingerprints": [],
-                "unstable_fingerprints": unstable})
+                "unstable_fingerprints": unstable, "link_diagnostics": collector.result(None)})
         return 1
     modules_before = h1f().loaded_modules()
     wheel_bytes = {filename: (Path(request["wheels"]) / filename).read_bytes() for filename in WHEEL_FILES}
@@ -740,11 +1966,17 @@ def privileged_child() -> int:
     _pid, status = os.waitpid(child, 0)
     os.close(out_fd)
     inner_exit = os.waitstatus_to_exitcode(status)
-    after = helper.host_fingerprints()
+    after = collector.snapshot(helper)()
     differing = sorted(key for key in before if before[key] != after[key])
+    collector.enrich()
+    try:
+        ownership = read_ownership(out)
+    except (OSError, ValueError):
+        ownership = OWNERSHIP_REJECTED  # unreadable: the registry is invalid, never silently absent
     finish({"namespace_child_exit": inner_exit, "host_fingerprints_unchanged": not differing,
             "differing_fingerprints": differing, "unstable_fingerprints": [],
-            "kernel_modules_loaded": sorted(h1f().loaded_modules() - modules_before)[:64]})
+            "kernel_modules_loaded": sorted(h1f().loaded_modules() - modules_before)[:64],
+            "link_diagnostics": collector.result(ownership)})
     return 0 if inner_exit == 0 and not differing else 1
 
 

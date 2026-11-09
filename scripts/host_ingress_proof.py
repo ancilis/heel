@@ -409,15 +409,36 @@ def stable_fingerprints(snapshot=None, pause=time.sleep) -> tuple[dict, list[str
     return second, sorted(key for key in set(first) | set(second) if first.get(key) != second.get(key))
 
 
-def host_fingerprints() -> dict:
+def _notify(observer, name: str, status: str, returncode, stdout, digest: str, started_ns: int) -> None:
+    """Hand one finished capture to an optional observer. Its failure is swallowed here, outside the
+    capture's own ``try``, so it can neither change a digest nor turn one into ``unavailable``."""
+    if observer is None:
+        return
+    try:
+        observer(name=name, status=status, returncode=returncode, stdout=stdout, digest=digest,
+                 started_ns=started_ns, ended_ns=time.monotonic_ns())
+    except Exception:  # noqa: BLE001 - diagnostics only; the gate value is already fixed
+        pass
+
+
+def host_fingerprints(observer=None) -> dict:
+    """``observer`` (default None: no call at all) receives each fixed command's status, return code, the
+    exact stdout the digest was computed from, that digest and monotonic bounds. It is never consulted
+    for the digest, which is computed exactly as before."""
     def command(name: str) -> str:
+        started_ns = time.monotonic_ns()
         try:
             completed = subprocess.run(list(FINGERPRINT_COMMANDS[name]), capture_output=True, text=True, timeout=20,
                                        env=_build_env())
             output = normalize_fingerprint_output(name, completed.stdout)
-            return hashlib.sha256((str(completed.returncode) + output).encode()).hexdigest()
-        except (OSError, subprocess.TimeoutExpired):
+            digest = hashlib.sha256((str(completed.returncode) + output).encode()).hexdigest()
+        except (OSError, subprocess.TimeoutExpired) as error:
+            _notify(observer, name, "timeout" if isinstance(error, subprocess.TimeoutExpired) else "oserror", None, None,
+                    "unavailable", started_ns)
             return "unavailable"
+        _notify(observer, name, "ok" if completed.returncode == 0 else "nonzero", completed.returncode, completed.stdout,
+                digest, started_ns)
+        return digest
 
     def file_digest(path: str) -> str:
         try:
