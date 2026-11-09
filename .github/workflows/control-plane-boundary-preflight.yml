@@ -1,0 +1,66 @@
+name: Control-plane boundary preflight
+
+# Read-only Ubuntu 24.04 prerequisite facts (docs/saas/CONTROL_PLANE_BOUNDARY_PREFLIGHT.md).
+# The result is UNPROVEN facts with runtime_qualified=false; it never qualifies B0 or a runtime.
+# Runs only for a same-repository pull request from the exact reviewed branch that touches one of
+# the four preflight paths. No inputs, tokens beyond contents:read, environments or installs.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/control_plane_boundary_preflight.py'
+      - 'tests/test_control_plane_boundary_preflight.py'
+      - '.github/workflows/control-plane-boundary-preflight.yml'
+      - 'docs/saas/CONTROL_PLANE_BOUNDARY_PREFLIGHT.md'
+
+permissions:
+  contents: read
+
+jobs:
+  boundary-preflight:
+    name: boundary-preflight (ubuntu-24.04, read-only)
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'codex/control-plane-boundary-preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      group: control-plane-boundary-preflight
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Bind the executed commit to the pull request head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_HEAD"
+          echo "executed_head=$actual executed_tree=$(git rev-parse 'HEAD^{tree}')"
+      - name: Require a fresh output path (earlier output is never reused, removed or replaced)
+        run: |
+          test ! -e control-plane-boundary-preflight
+          test ! -L control-plane-boundary-preflight
+      - name: Fixed read-only collector (existing system Python, no arguments)
+        id: collect
+        timeout-minutes: 3
+        run: |
+          rc=0
+          /usr/bin/python3 -I -B scripts/control_plane_boundary_preflight.py || rc=$?
+          echo "collector_exit=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+      # Upload only output this invocation finished writing: exit 0 complete, 3 incomplete, 2 refused.
+      # Exit 1 (internal error, existing output, late finalization) and a cancelled or timed-out step
+      # leave collector_exit unset or 1, so no artifact is published for them.
+      - name: Upload the closed report and command summary
+        if: always() && (steps.collect.outputs.collector_exit == '0' || steps.collect.outputs.collector_exit == '3' || steps.collect.outputs.collector_exit == '2')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: control-plane-boundary-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            control-plane-boundary-preflight/report.json
+            control-plane-boundary-preflight/commands.json
