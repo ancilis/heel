@@ -152,6 +152,44 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertIn("python3.13 -m pip --isolated install", source)
             self.assertIn("--require-hashes --only-binary=:all:", source)
 
+    def test_customer_install_is_the_runbook_command_for_the_bundled_release(self):
+        import json
+
+        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC2.md").read_text(encoding="utf-8")
+        section = runbook[runbook.index("## Customer install command"):]
+        command = re.search(r"```sh\n(.*)\n```", section).group(1)
+        manifest = json.loads(
+            (ROOT / "apps/heel-cloud/public/downloads" / MANIFEST).read_text(encoding="utf-8")
+        )
+        version = manifest["version"]
+        wheel_sha = next(a["sha256"] for a in manifest["artifacts"] if a["name"] == WHEEL)
+        # The public command installs exactly the bundled wheel from its own version's release.
+        self.assertIn(
+            f"releases/download/v{version}/{WHEEL}#sha256={wheel_sha}'", command,
+        )
+        self.assertTrue(command.startswith("python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install "))
+        self.assertTrue(command.endswith(" && ./heel-rc2/bin/heel --version"))
+        release = f"https://github.com/ancilis/heel/releases/tag/v{version}"
+        for path in ("README.md", "docs/MCP_QUICKSTART.md", "docs/EXPORT_DEMO.md",
+                     "apps/heel-cloud/app/runner/page.tsx"):
+            source = (ROOT / path).read_text(encoding="utf-8")
+            unwrapped = " ".join(source.split())
+            self.assertIn(command, source, path)
+            self.assertIn(release, source, path)
+            self.assertIn("./heel-rc2/bin/heel ", source, path)
+            self.assertIn("Intel macOS is unsupported", unwrapped, path)
+            self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped, path)
+            self.assertIn("Python 3.11 or newer", unwrapped, path)
+            self.assertNotRegex(unwrapped, r"(?i)unpublished 1\.3\.0rc2|no public 1\.3\.0rc2 download", path)
+        page = (ROOT / "apps/heel-cloud/app/agent/page.tsx").read_text(encoding="utf-8")
+        digest = re.search(r'const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";', page).group(1)
+        template = re.search(r"const INSTALL_PUBLIC_AGENT = `([^`]*)`;", page).group(1)
+        self.assertEqual(template.replace("${PUBLIC_WHEEL_SHA256}", digest), command)
+        launch = " ".join((ROOT / "docs/saas/LAUNCH.md").read_text(encoding="utf-8").split())
+        self.assertIn(release, launch)
+        self.assertNotIn("later work", launch)
+        self.assertIn("not publicly deployed", launch)
+
 
 if __name__ == "__main__":
     unittest.main()

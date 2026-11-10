@@ -4,7 +4,7 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
-- Upgrade the unpublished runner candidate and control-plane cryptography pin to 50.0.1, synchronize the hosted-proof wheel lock, and regenerate deterministic candidate artifacts. Intel macOS is no longer supported by the candidate runner dependency; historical RC1 artifacts and publisher remain unchanged.
+- Upgrade the control-plane cryptography pin to 50.0.1 and synchronize the hosted-proof wheel lock. The hosted control plane is not deployed; the runner side of this upgrade shipped in 1.3.0rc2 (below). Historical RC1 artifacts and publisher remain unchanged.
 
 - Answer a v3 runner pairing activation that loses its short SQLite busy wait (numeric `SQLITE_BUSY`/`SQLITE_LOCKED`, no open transaction, independent runner connection) with `503 runner_control_busy` (`retry_after_ms: 1000`, `Retry-After: 1`); `heel runner pair` resends the identical sealed activation after that bounded hint and never past the challenge deadline. Every other route and error stays a generic 500, whose log line gains only a typed `sqlite_primary_code` (H1A3-1F3DF).
 - Add the control-plane host-authority snapshot decision and private listener wiring (H1A-2), default off: migration 31 adds a permanent anti-replay generation ledger (no row ever leaves it; 65 536 rows, fail-closed), `HEEL_MANAGED_HOST=1` refuses a missing or unsafe listener configuration before any lock or bind, and a listener thread that outlives its bounded stop keeps database ownership until the process exits. See `docs/saas/HOST_AUTHORITY_SNAPSHOT.md`.
@@ -33,10 +33,14 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc2]: unpublished candidate
+## [1.3.0rc2]: 2026-11-10
 
-Corrected runner preview release candidate. It carries the changes listed under Unreleased at its
-candidate commit and is not yet published as a GitHub release or to PyPI.
+Corrected runner preview prerelease, published as a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc2> from source commit
+`c082d238d7439730ef7fcfa98676167540b90172`. It is not a stable release, its GitHub release record is
+not immutable, and it is not published to PyPI. Publishing this runner package does not deploy Heel
+Cloud, the control plane or any hosted service; the hosted and control-plane work listed under
+Unreleased remains unreleased.
 
 ### Fixed
 - A response that is a recognized error or denial envelope is inconclusive for either plan at
@@ -65,6 +69,10 @@ candidate commit and is not yet published as a GitHub release or to PyPI.
   reviews and findings-sync sources remain readable alongside `1.1.0`, `1.1.1` and `1.2.0`.
 - Regenerated `heel_sim-1.3.0rc2` and `heel_browser-1.3.0rc2` artifacts through the existing
   deterministic builders. The published 1.3.0rc1 release and its assets are unchanged.
+- The `runner` extra pins `cryptography==50.0.1`, which publishes macOS wheels for Apple silicon
+  only. Intel macOS is unsupported by this preview; a source build of that dependency needs an
+  additional (Rust) toolchain and is untested. The documented one-command install targets Apple
+  silicon macOS or Linux x86_64/aarch64 with Python 3.11 or newer.
 
 ## [1.3.0rc1]: 2026-10-23
 

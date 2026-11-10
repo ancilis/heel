@@ -21,14 +21,18 @@ include a Stripe or PostgreSQL integration.
 - Anonymous browser-local OpenAPI review with a committed sample on first visit.
 - Same-origin, pinned Pyodide runtime and Heel wheel; no analyzer network calls.
 - Explicit local browser save/export without retaining the source document.
-- Checked-in Heel 1.3.0rc2 runner preview candidate wheel, source archive, and manifest
-  under `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The candidate
-  is unreleased: it is not published as a GitHub release or to PyPI, and it is not publicly
-  deployed. It corrects the public 1.3.0rc1 prerelease's `error_envelope` and `hardened`
+- Checked-in Heel 1.3.0rc2 runner preview wheel, source archive, and manifest under
+  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The same 1.3.0rc2
+  component is published as the public GitHub prerelease
+  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>, with a one-command hash-pinned install
+  whose independent anonymous run passed on Apple silicon macOS with Python 3.13.5. It is not a
+  stable release, its release record is not immutable, it is not published to PyPI, and the website
+  that bundles these files is not publicly deployed. It corrects the public 1.3.0rc1 prerelease's `error_envelope` and `hardened`
   errata (an error envelope is inconclusive at every HTTP status), stores no inconclusive
   plan-differential pair as a finding, and never passes a regression whose denial status still
-  carries the paid payload. A one-command public install of a corrected
-  release is later work.
+  carries the paid payload. Publishing the component is not a completed customer journey:
+  runner pairing, `heel runner serve`, HTTPS target traffic, hosted findings and the full customer
+  acceptance remain unproven.
 - Local CLI/MCP review without an account.
 - Free account signup/login and private `__Host-heel_session` handling at the edge.
 - Browser-mediated device authorization for CLI/MCP machines.

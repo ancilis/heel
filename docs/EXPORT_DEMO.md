@@ -4,24 +4,30 @@ This optional local preview runs a synthetic reference product on your machine. 
 the default Heel journey (signup, product URL and credentials, explicit authorization, then discovery
 and scanning), which needs no OpenAPI document or manual runner setup.
 
-Heel 1.3.0rc1 is a public preview prerelease at
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. It is not a stable release, its GitHub
+Heel 1.3.0rc2 is a public preview prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>. It is not a stable release, its GitHub
 release record is not immutable, and it is not published to PyPI. The release is not a deployed Heel
 Cloud URL and does not indicate customer acceptance.
 
-You need a POSIX shell and Python 3.11 or newer (`python3 --version`). No source checkout or Heel
-Cloud deployment is needed. Work in an empty private directory you own. pip installs the public wheel
-only if it matches the pinned SHA-256. `--isolated` makes pip ignore environment variables and user
+You need a POSIX shell and Python 3.11 or newer as `python3` (`python3 --version`) with its standard
+`venv` module, on Apple silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this
+preview: its pinned `cryptography` dependency ships no Intel macOS wheel, and a source build needs an
+additional (Rust) toolchain and is untested. No source checkout, manual download, or Heel Cloud
+deployment is needed. Work in an empty private directory you own. The first command below creates a
+virtual environment in `./heel-rc2`, installs the hash-pinned public wheel with its `runner` extra,
+and prints `heel 1.3.0rc2`; the CLI is then `./heel-rc2/bin/heel`. pip installs the public wheel only
+if it matches the pinned SHA-256. `--isolated` makes pip ignore environment variables and user
 configuration. The `runner` extra then downloads the pinned `cryptography` dependency and its
-dependencies from the Python package index (PyPI by default).
+dependencies from the Python package index (PyPI by default) under pip's normal verification; this
+command does not hash-pin them. An independent anonymous run of this exact install command passed on
+Apple silicon macOS with Python 3.13.5; other platforms and Python versions have not been clean-room
+tested.
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip --isolated install \
-  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a'
+python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc2/heel_sim-1.3.0rc2-py3-none-any.whl#sha256=f8698204e1d38aa80b8ca31dedd743c3d42e28d02c5153bddb4f02b44ecdf01c' && ./heel-rc2/bin/heel --version
 export HEEL_HOME="$(pwd -P)/.heel"
-.venv/bin/heel reference prepare
-.venv/bin/heel scope create --target reference:export --operator "demo owner" --confirm
+./heel-rc2/bin/heel reference prepare
+./heel-rc2/bin/heel scope create --target reference:export --operator "demo owner" --confirm
 ```
 
 Use the same absolute physical `HEEL_HOME`, in which no component is a symbolic link, from the first
@@ -33,26 +39,29 @@ opens the private runner and reference storage without following symbolic links,
 refuses that `HEEL_HOME`. Do not disable or work around that check. Run the commands below in the
 same shell so that `HEEL_HOME` stays set.
 
-A Heel Cloud deployment built from the current repository serves the unpublished 1.3.0rc2 candidate
-on its `/agent` page instead of the public 1.3.0rc1 wheel. If you downloaded
-`heel_sim-1.3.0rc2-py3-none-any.whl` there, you can install that file instead with
-`.venv/bin/python -m pip --isolated install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'`.
+A Heel Cloud deployment built from the current repository also serves its own bundled wheel on its
+`/agent` page. That file is the build's artifact, not a separate verified public release; the public
+command above is the recommended install. If you did download `heel_sim-1.3.0rc2-py3-none-any.whl`
+there, you can install that file instead with
+`python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'`.
 
 Replace SCOPE_ID below with the returned ID. Each attempt ID is consumed once, including cancelled or interrupted attempts; choose fresh 32-character lowercase hexadecimal IDs on repetition.
 
 ```sh
-.venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
-.venv/bin/heel reference run --scope SCOPE_ID --case public --attempt 22222222222222222222222222222222
-.venv/bin/heel reference run --scope SCOPE_ID --case error_envelope --attempt 33333333333333333333333333333333
-.venv/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 44444444444444444444444444444444
-.venv/bin/heel reference run --scope SCOPE_ID --case inconclusive --attempt 55555555555555555555555555555555
-.venv/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 66666666666666666666666666666666 --stop
+./heel-rc2/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
+./heel-rc2/bin/heel reference run --scope SCOPE_ID --case public --attempt 22222222222222222222222222222222
+./heel-rc2/bin/heel reference run --scope SCOPE_ID --case error_envelope --attempt 33333333333333333333333333333333
+./heel-rc2/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 44444444444444444444444444444444
+./heel-rc2/bin/heel reference run --scope SCOPE_ID --case inconclusive --attempt 55555555555555555555555555555555
+./heel-rc2/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 66666666666666666666666666666666 --stop
 ```
 
 Results, in order: verified_violation; invariant_held with regression_passed=true for `public`, a
-successful read that withholds the protected field; for `error_envelope` and for `hardened`,
-1.3.0rc1 prints invariant_held with regression_passed=true, which is a known erratum (see below) and
-must be read as inconclusive; inconclusive; inconclusive with cancellation. `redacted` is the other
+successful read that withholds the protected field; inconclusive with `evidence_state` `unknown` and
+regression_passed=false for `error_envelope` and for `hardened`; inconclusive; inconclusive with
+cancellation. These are synthetic reference results on your machine, not live SaaS findings. The
+earlier 1.3.0rc1 prerelease printed invariant_held with regression_passed=true for `error_envelope`
+and `hardened`, a known erratum (see below) that must be read as inconclusive. `redacted` is the other
 supported passing case. A missing positive control never passes.
 
 **Erratum for 1.3.0rc1: `error_envelope`.** The published 1.3.0rc1 wheel reports the
@@ -61,18 +70,17 @@ defect. In this case the reference product answers the lower-plan export with HT
 `{"error":"license required"}` body. A denial inside a successful response does not establish that
 protected content was withheld, so the correct result is inconclusive. Treat the rc1
 `error_envelope` report as inconclusive: it does not validate the invariant and is not a passing
-regression. The commands and output above are the actual rc1 behavior; the published rc1 artifacts
-are unchanged. The corrected 1.3.0rc2 candidate, whose evaluator, tests and artifacts changed
+regression. The published rc1 artifacts at <https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>
+are unchanged. The corrected 1.3.0rc2 release, whose evaluator, tests and artifacts changed
 together, prints `inconclusive` for `error_envelope`, with `evidence_state` `unknown` and
-`regression_passed=false`. 1.3.0rc2 is not yet published as a GitHub release or to PyPI, and no
-public 1.3.0rc2 download exists.
+`regression_passed=false`.
 
 **Erratum for 1.3.0rc1: `hardened`.** The same rule applies to an error response at any HTTP status.
 In the `hardened` case the reference product answers the lower-plan export with HTTP 403 and the
 same `{"error":"license required"}` body. The published 1.3.0rc1 wheel reports that case as
 `invariant_held` with `regression_passed=true`. An error envelope neither proves a disclosure nor a
 denial, and the status alone never decides it, so that report is also inconclusive and is not a
-passing regression or a verified repair. The unpublished 1.3.0rc2 candidate prints `inconclusive`
+passing regression or a verified repair. The 1.3.0rc2 release prints `inconclusive`
 for `hardened`, with `evidence_state` `unknown` and `regression_passed=false`. The `vulnerable`,
 `public` and `redacted` results are not affected.
 

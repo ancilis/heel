@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { access, constants, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -11,6 +11,25 @@ import test from "node:test";
 const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const pageUrl = new URL("../app/agent/page.tsx", import.meta.url);
 const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
+// Every environment a displayed command creates, and every executable a displayed command runs.
+const createdEnvironments = (source) => [...source.matchAll(/python3 -m venv (\S+)/g)].map((match) => match[1]);
+const executableReferences = (source) =>
+  [...source.matchAll(/([\w.-]+)\/bin\/(heel-mcp|heel|python)\b/g)].map(([, environment, executable]) => ({
+    environment,
+    executable,
+  }));
+
+
+test("both install variants and every later step use one environment", async () => {
+  const source = await readFile(pageUrl, "utf8");
+  const created = createdEnvironments(source);
+  assert.equal(created.length, 2, "the public and bundled installs each create an environment");
+  assert.deepEqual(new Set(created), new Set(["heel-rc2"]));
+  const references = executableReferences(source);
+  assert.ok(references.length >= 7, JSON.stringify(references));
+  for (const reference of references) assert.equal(reference.environment, "heel-rc2", JSON.stringify(reference));
+  assert.doesNotMatch(source, /\.venv\b/);
+});
 
 
 test("the displayed install and verification perform a real handshake against the release wheel", async () => {
@@ -23,9 +42,9 @@ test("the displayed install and verification perform a real handshake against th
   const displayedVerify = verifyMatch[1].replaceAll("\\\\", "\\");
   assert.equal(
     displayedInstall,
-    "python3 -m venv .venv\n.venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
+    "python3 -m venv heel-rc2\n./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
   );
-  assert.match(displayedVerify, /\| \.venv\/bin\/heel-mcp$/);
+  assert.match(displayedVerify, /\| \.\/heel-rc2\/bin\/heel-mcp$/);
   const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc2-py3-none-any.whl");
   const workingDirectory = await mkdtemp(join(await realpath(repoRoot), ".heel-mcp-quickstart-"));
   const currentInstall = displayedInstall.replace(
@@ -50,6 +69,10 @@ test("the displayed install and verification perform a real handshake against th
       env: environment,
     });
     assert.equal(install.status, 0, install.stderr || install.stdout);
+    // Every executable the page later runs or configures exists in the environment just installed.
+    for (const { environment, executable } of executableReferences(source)) {
+      await access(join(workingDirectory, environment, "bin", executable), constants.X_OK);
+    }
     const verification = spawnSync("/bin/sh", ["-c", displayedVerify], {
       cwd: workingDirectory,
       encoding: "utf8",

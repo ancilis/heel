@@ -290,7 +290,11 @@ class LocalAgentJourneyTests(unittest.TestCase):
             readme,
         )
         self.assertIn("/downloads/heel_sim-1.3.0rc2-py3-none-any.whl", readme)
-        self.assertIn("not yet published", readme.lower())
+        self.assertIn("not yet published to pypi", readme.lower())
+        # The recommended install is the one public command, then the CLI it creates.
+        self.assertIn("python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install", readme)
+        self.assertIn("./heel-rc2/bin/heel review openapi ./sanitized-openapi.json", readme)
+        self.assertIn("./heel-rc2/bin/heel review openapi ./sanitized-openapi.json", quickstart)
         self.assertNotIn("git clone https://github.com/ancilis/heel", readme)
         self.assertIn("python3 -m pip install heel-sim", quickstart)
         self.assertIn("only after an actual pypi release", quickstart.lower())
