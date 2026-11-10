@@ -98,19 +98,28 @@ substitute a fake binding in a release build.
 1. Complete the owner actions for domain/DNS, Cloudflare Worker/Tunnel/VPC service,
    private Linux container host, persistent volume, secrets, legal/support copy, and
    backup/uptime monitoring.
-2. Fill the ignored `deploy/.env.production` from
-   `deploy/.env.production.example` through the deployment secret manager.
+2. Create the two separate secret files as described in `OPERATIONS.md` ("Deploy the
+   private services"). The ignored `deploy/.env.production` holds only control-plane
+   values: remove the `HEEL_CLOUDFLARE_TUNNEL_TOKEN` and `HEEL_CLOUDFLARED_IMAGE` lines
+   that `deploy/.env.production.example` still lists. Those two values go only into a
+   0600 interpolation file outside the checkout, in a 0700 directory. Fill values
+   through the deployment secret manager, never on a command line.
 3. Run the verification commands above.
-4. Validate and start the private control plane:
+4. From the checkout root, validate and start the private control plane. Every Compose
+   command passes the interpolation file with `--env-file`:
 
    ```bash
-   docker compose --env-file deploy/.env.production \
-     -f deploy/compose.yaml config
-   docker compose --env-file deploy/.env.production \
-     -f deploy/compose.yaml up -d --build
-   docker compose --env-file deploy/.env.production \
-     -f deploy/compose.yaml ps
+   HEEL_INTERP_ENV="$HOME/heel-secrets/cloudflared-interp.env"
+   hc() { docker compose -f deploy/compose.yaml --env-file "$HEEL_INTERP_ENV" "$@"; }
+   hc config --quiet
+   hc up -d --build
+   hc ps
    ```
+
+   `hc config --quiet` must exit 0 with no output. Never run bare `config`,
+   `config --format`, `docker inspect`, `exec … env`, or `set -x`. If the separated
+   configuration does not work, stop and roll back (`RUNBOOKS.md` "Rollback"). Never
+   put the Tunnel token into `deploy/.env.production`.
 
 5. Configure the Worker secret `CONTROL_PLANE_EDGE_SECRET` with the exact same value
    as `HEEL_EDGE_AUTH_SECRET_B64`, then deploy the Worker:
