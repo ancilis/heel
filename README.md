@@ -64,14 +64,15 @@ each rc1 result as inconclusive, not a pass; 1.3.0rc2 reports each case inconclu
 regression_passed=false. See the [export demo](docs/EXPORT_DEMO.md).
 
 A Heel Cloud deployment built from this repository also serves its own bundled Agent files on its
-origin, such as `/downloads/heel_sim-1.3.0rc2-py3-none-any.whl`. Those files are that build's
-artifacts, not a separate verified public release; the public command above is the recommended
-install. If you did download that file from a deployment's `/agent` page, install it from the folder
-where you saved it:
+origin, such as `/downloads/heel_sim-1.3.0rc3-py3-none-any.whl`. Those files are that build's
+artifacts, not a separate verified public release: in this repository they are the 1.3.0rc3
+candidate, which is not yet published as a public release. The public command above is the
+recommended install. If you did download that file from a deployment's `/agent` page, install it
+from the folder where you saved it:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc3-py3-none-any.whl
 ```
 
 The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`

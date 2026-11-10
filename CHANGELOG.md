@@ -33,6 +33,23 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
+## [1.3.0rc3]: unpublished candidate
+
+Release-owner candidate re-version, prepared so the accepted H3 runner seam can later be integrated
+without overwriting the published 1.3.0rc2 prerelease. It is not a GitHub release, not on PyPI and
+not publicly deployed; customer copy keeps the published, hash-pinned 1.3.0rc2 install, and the
+same-origin `/downloads/` files are labeled as this not-yet-published candidate.
+
+- Version identity 1.3.0rc3 (npm 1.3.0-rc.3) across the package, release contract, review engine,
+  MCP server info, `server.json` and browser engine; 1.3.0rc2 stays an accepted saved-review and
+  findings-sync engine version.
+- Wheel, source archive, manifest, browser wheel/manifest, browser sample and review golden
+  regenerated with the unchanged builders from current main sources. Compared with the published
+  1.3.0rc2 wheel, only version strings, the two supported-engine-version sets and `RECORD` differ;
+  no runner, network-guard, dependency or pricing change.
+- The published 1.3.0rc2 bytes and version sources are kept byte for byte as the historical fixture
+  `tests/fixtures/runner_preview_rc2/`, against which the fixed rc2 publisher is tested.
+
 ## [1.3.0rc2]: 2026-11-10
 
 Corrected runner preview prerelease, published as a GitHub prerelease at
