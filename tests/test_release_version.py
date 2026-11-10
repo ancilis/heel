@@ -12,17 +12,19 @@ from heel.review_contract import ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 # The Python package, release contract, engine and server.json use the PEP 440 spelling.
-VERSION = "1.3.0rc2"
+# The current version is the checked-in 1.3.0rc3 candidate, which is not yet published.
+VERSION = "1.3.0rc3"
 # npm metadata needs SemVer; this is the single normalization mapping, not a second version.
-NPM_VERSION = "1.3.0-rc.2"
-LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"})
-# The current version is the public GitHub prerelease that customer copy installs from its pinned
-# release URL. 1.3.0rc1 stays a published prerelease, named in copy only as erratum history.
+NPM_VERSION = "1.3.0-rc.3"
+LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1", "1.3.0rc2"})
+# The public GitHub prerelease that customer copy installs from its pinned release URL. 1.3.0rc1
+# stays a published prerelease, named in copy only as erratum history.
+PUBLIC_VERSION = "1.3.0rc2"
 PREVIOUS_PREVIEW_VERSION = "1.3.0rc1"
-PUBLIC_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{VERSION}"
+PUBLIC_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{PUBLIC_VERSION}"
 PUBLIC_WHEEL_URL = (
-    f"https://github.com/ancilis/heel/releases/download/v{VERSION}/"
-    f"heel_sim-{VERSION}-py3-none-any.whl"
+    f"https://github.com/ancilis/heel/releases/download/v{PUBLIC_VERSION}/"
+    f"heel_sim-{PUBLIC_VERSION}-py3-none-any.whl"
 )
 AGENT_WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 AGENT_SDIST = f"heel_sim-{VERSION}.tar.gz"
@@ -58,8 +60,8 @@ class ReleaseVersionContractTests(unittest.TestCase):
         self.assertEqual(app_lock["packages"][""]["version"], NPM_VERSION)
 
     def test_pep440_and_semver_spellings_name_one_release(self):
-        self.assertRegex(VERSION, r"\A1\.3\.0rc2\Z")
-        self.assertRegex(NPM_VERSION, r"\A1\.3\.0-rc\.2\Z")
+        self.assertRegex(VERSION, r"\A1\.3\.0rc3\Z")
+        self.assertRegex(NPM_VERSION, r"\A1\.3\.0-rc\.3\Z")
         major_minor_patch, candidate = VERSION.split("rc")
         self.assertEqual(NPM_VERSION, f"{major_minor_patch}-rc.{candidate}")
         self.assertNotEqual(VERSION, NPM_VERSION)
@@ -104,22 +106,28 @@ class ReleaseVersionContractTests(unittest.TestCase):
         combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
         self.assertIn(AGENT_WHEEL, combined)
         self.assertIn(AGENT_SDIST, combined)
+        # The only older wheel name allowed is the published rc2 wheel inside its own release URL.
+        without_public_install = combined.replace(PUBLIC_WHEEL_URL, "")
         for legacy_version in LEGACY_VERSIONS:
-            self.assertNotIn(f"heel_sim-{legacy_version}", combined)
-        # Customer copy installs the current version from its own public release and never from
-        # an older release's download URL.
+            self.assertNotIn(f"heel_sim-{legacy_version}", without_public_install)
+        # Customer copy installs the published rc2 from its own public release, never from an older
+        # release's download URL, and claims no public release for the unpublished candidate.
         customer = paths[:4] + [ROOT / "docs/EXPORT_DEMO.md", ROOT / "apps/heel-cloud/app/runner/page.tsx"]
         for path in customer:
             text = path.read_text(encoding="utf-8")
-            self.assertIn(f"releases/tag/v{VERSION}", text, path)
+            self.assertIn(f"releases/tag/v{PUBLIC_VERSION}", text, path)
             self.assertNotIn(f"releases/download/v{PREVIOUS_PREVIEW_VERSION}", text, path)
-            self.assertNotRegex(text, rf"{VERSION}[^.]*not yet published as a GitHub release", path)
+            self.assertNotRegex(text, rf"{PUBLIC_VERSION}[^.]*not yet published as a GitHub release", path)
+            self.assertNotIn(f"releases/tag/v{VERSION}", text, path)
+            self.assertNotIn(f"releases/download/v{VERSION}", text, path)
         for path in customer[:2] + customer[4:5]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn(f"## [{VERSION}]: 2026-11-10", changelog)
+        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
+        self.assertEqual(changelog.count("unpublished candidate"), 1)
+        self.assertNotIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
+        self.assertIn(f"## [{PUBLIC_VERSION}]: 2026-11-10", changelog)
         self.assertIn(PUBLIC_RELEASE_URL, changelog)
-        self.assertNotIn("unpublished candidate", changelog)
         self.assertIn(f"## [{PREVIOUS_PREVIEW_VERSION}]: 2026-10-23", changelog)
         self.assertIn(
             f"https://github.com/ancilis/heel/releases/tag/v{PREVIOUS_PREVIEW_VERSION}", changelog,

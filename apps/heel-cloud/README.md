@@ -41,11 +41,13 @@ remains published and unchanged at <https://github.com/ancilis/heel/releases/tag
 pages keep its errata as history.
 
 The builder-verified Agent files advertised on `/agent` are the bundled artifacts of the deployed
-build, not themselves a verified public release; a future build's bundled version becomes a public
-release only through a separate publication and verification. The same-origin files are:
+build, not themselves a verified public release. In this repository they are the 1.3.0rc3 candidate,
+which is not yet published as a public release; a bundled version becomes a public release only
+through a separate publication and verification, and deploying the Worker with these files exposes
+the unpublished candidate only under an explicit exposure decision. The same-origin files are:
 
-- `/downloads/heel_sim-1.3.0rc2-py3-none-any.whl`
-- `/downloads/heel_sim-1.3.0rc2.tar.gz`
+- `/downloads/heel_sim-1.3.0rc3-py3-none-any.whl`
+- `/downloads/heel_sim-1.3.0rc3.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
 
 ## Dashboard account onboarding

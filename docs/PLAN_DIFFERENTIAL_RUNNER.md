@@ -32,11 +32,12 @@ widen or re-sign a scope.
 
 Run these in order. Replace the values in capitals.
 
-The wheel below is the unreleased 1.3.0rc2 runner preview candidate, which is checked in
+The wheel below is the unreleased 1.3.0rc3 runner preview candidate, which is checked in
 under `apps/heel-cloud/public/downloads/` with its source archive and manifest. It is not yet
 published as a GitHub release or to PyPI, so no public download URL, registry command or
-release-asset digest is given here. (The earlier 1.3.0rc1 preview is a public GitHub prerelease;
-see [the export demo](EXPORT_DEMO.md) for its `error_envelope` and `hardened` errata.) A one-command public install is later work. Run the
+release-asset digest is given here. (The earlier 1.3.0rc2 and 1.3.0rc1 previews are public GitHub
+prereleases; the [README](../README.md) gives the hash-pinned rc2 install and
+[the export demo](EXPORT_DEMO.md) the rc1 `error_envelope` and `hardened` errata.) Run the
 command in a directory that holds that local wheel. This journey is the standalone CLI. It
 does not use Heel Cloud pairing, which is still an incomplete public journey (see
 [capabilities](CAPABILITIES.md)).
@@ -44,7 +45,7 @@ does not use Heel Cloud pairing, which is still an incomplete public journey (se
 ```sh
 python3 -m venv --copies .venv
 . .venv/bin/activate
-python -m pip install './heel_sim-1.3.0rc2-py3-none-any.whl[runner]'
+python -m pip install './heel_sim-1.3.0rc3-py3-none-any.whl[runner]'
 export HEEL_HOME="$PWD/.heel"
 ```
 
@@ -376,7 +377,7 @@ pair with a new invitation).
   before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
   installed it is unknown; this path is tested, not assumed unused. The current checked-in
-  artifact is the unreleased 1.3.0rc2 runner preview candidate. It reports `1.3.0rc2` and,
+  artifact is the unreleased 1.3.0rc3 runner preview candidate. It reports `1.3.0rc3` and,
   like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no
