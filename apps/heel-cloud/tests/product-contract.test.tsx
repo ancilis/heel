@@ -245,9 +245,9 @@ describe("Heel anonymous launch review", () => {
     const wheelArtifact = manifest.artifacts.find((artifact) => artifact.name.endsWith(".whl"));
     expect(wheelArtifact).toBeTruthy();
     expect(document.body.textContent).toContain(wheelArtifact?.sha256);
-    expect(document.body.textContent).toContain("python3 -m venv .venv");
+    expect(document.body.textContent).toContain("python3 -m venv heel-rc2\n");
     expect(document.body.textContent).toContain(
-      ".venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
+      "./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
     );
     expect(RUNBOOK_INSTALL).toBe(PUBLIC_INSTALL);
     expect(document.body.textContent).toContain(PUBLIC_INSTALL);
@@ -259,6 +259,15 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).not.toMatch(PREVIOUS_RELEASE_DOWNLOAD);
     expect(document.body.textContent).toMatch(/bundled files, not themselves a verified public release/);
     expect(document.body.textContent).toContain("./heel-rc2/bin/heel-mcp");
+    // Both install variants create the one environment that every later command runs from.
+    const commands = Array.from(document.querySelectorAll("pre"), (block) => block.textContent ?? "");
+    expect(commands.flatMap((command) => [...command.matchAll(/python3 -m venv (\S+)/g)].map((m) => m[1])))
+      .toEqual(["heel-rc2", "heel-rc2"]);
+    const executables = commands.flatMap((command) =>
+      [...command.matchAll(/([\w.-]+)\/bin\/(heel-mcp|heel|python)\b/g)].map((m) => m[1]));
+    expect(executables.length).toBeGreaterThanOrEqual(8);
+    expect(new Set(executables)).toEqual(new Set(["heel-rc2"]));
+    expect(document.body.textContent).not.toMatch(/\.venv\//);
     expect(document.body.textContent).toMatch(/passed on Apple silicon macOS with Python 3\.13\.5; other platforms have not been clean-room tested/);
     for (const limit of RETAINED_LIMITS) expect(document.body.textContent).toMatch(limit);
     expect(document.body.textContent).toMatch(/1\.3\.0rc1 errata[^.]*HTTP 200 error_envelope case as a passed regression/i);
