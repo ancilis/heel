@@ -133,19 +133,31 @@ beforeEach(() => {
 
 
 
-const PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc1";
-const PUBLIC_WHEEL_SHA256 = "176a17b0d4d7f4ea44420d8099239f32dbb17eeead981e5aa360f0a5bbccb94a";
-const PUBLIC_INSTALL = [
-  "python3 -m venv .venv",
-  ".venv/bin/python -m pip --isolated install \\",
-  `  'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc1/heel_sim-1.3.0rc1-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'`,
-].join("\n");
-// Claims that the public 1.3.0rc1 prerelease is unpublished are stale. The corrected 1.3.0rc2
-// candidate is unpublished, must say so, and must never get a public release URL.
+// The verified public 1.3.0rc2 prerelease and its one-command install, verbatim from
+// docs/RUNNER_PREVIEW_RELEASE_RC2.md. 1.3.0rc1 remains published and is named only as history.
+const PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc2";
+const PUBLIC_WHEEL_SHA256 = "f8698204e1d38aa80b8ca31dedd743c3d42e28d02c5153bddb4f02b44ecdf01c";
+const PUBLIC_INSTALL =
+  "python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install " +
+  `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc2/heel_sim-1.3.0rc2-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'` +
+  " && ./heel-rc2/bin/heel --version";
+const RUNBOOK_INSTALL = readFileSync(
+  resolve(process.cwd(), "../../docs/RUNNER_PREVIEW_RELEASE_RC2.md"),
+  "utf8",
+).match(/## Customer install command[\s\S]*?```sh\n(.*)\n```/)?.[1];
 const STALE_GITHUB_CLAIMS =
   /unreleased 1\.3\.0rc1|1\.3\.0rc1[^.]*(unreleased|not yet published)|planned but not yet published|prerelease URL is not publicly verified/i;
-const CANDIDATE_UNPUBLISHED = /1\.3\.0rc2[^.]*(\.[^.]*)?not yet published as a GitHub release/i;
-const CANDIDATE_RELEASE_URL = /releases\/(tag|download)\/v1\.3\.0rc2/i;
+// Claims that the now-public 1.3.0rc2 prerelease is unpublished, or that a one-command install is
+// future work, are stale.
+const STALE_RC2_CLAIMS =
+  /unpublished 1\.3\.0rc2|1\.3\.0rc2[^.]*(\.[^.]*)?not yet published as a GitHub release|no public 1\.3\.0rc2 download|one-command public install[^.]*later work/i;
+const PREVIOUS_RELEASE_DOWNLOAD = /releases\/download\/v1\.3\.0rc1/i;
+// Limits that stay true for the public prerelease.
+const RETAINED_LIMITS = [
+  /not immutable/i,
+  /Apple silicon macOS or Linux x86_64\/aarch64/,
+  /Intel macOS is unsupported/,
+];
 
 describe("Heel anonymous launch review", () => {
   test("renders an abuse hypothesis and immediate actions without a wall", () => {
@@ -237,18 +249,25 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).toContain(
       ".venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
     );
+    expect(RUNBOOK_INSTALL).toBe(PUBLIC_INSTALL);
     expect(document.body.textContent).toContain(PUBLIC_INSTALL);
-    // The same-origin files are the unpublished candidate, not the public rc1 wheel bytes.
-    expect(PUBLIC_WHEEL_SHA256).not.toBe(wheelArtifact?.sha256);
-    expect(document.body.textContent).toMatch(CANDIDATE_UNPUBLISHED);
-    expect(document.body.textContent).not.toMatch(CANDIDATE_RELEASE_URL);
+    // At this tree the bundled wheel is the public release's wheel; a later bundled version would
+    // fail here instead of silently inheriting the public release's copy.
+    expect(manifest.version).toBe(PUBLIC_RELEASE.split("/v").pop());
+    expect(PUBLIC_WHEEL_SHA256).toBe(wheelArtifact?.sha256);
+    expect(document.body.textContent).not.toMatch(STALE_RC2_CLAIMS);
+    expect(document.body.textContent).not.toMatch(PREVIOUS_RELEASE_DOWNLOAD);
+    expect(document.body.textContent).toMatch(/bundled files, not themselves a verified public release/);
+    expect(document.body.textContent).toContain("./heel-rc2/bin/heel-mcp");
+    expect(document.body.textContent).toMatch(/passed on Apple silicon macOS with Python 3\.13\.5; other platforms have not been clean-room tested/);
+    for (const limit of RETAINED_LIMITS) expect(document.body.textContent).toMatch(limit);
     expect(document.body.textContent).toMatch(/1\.3\.0rc1 errata[^.]*HTTP 200 error_envelope case as a passed regression/i);
     // The hardened case answers with an HTTP 403 error envelope: a second rc1 erratum, never a pass.
     expect(document.body.textContent).toMatch(/and also the hardened case, an HTTP 403 error envelope\./i);
     expect(document.body.textContent).toMatch(/An error envelope is inconclusive at any status; treat each result as inconclusive, not a pass\./);
-    expect(document.body.textContent).toMatch(/1\.3\.0rc2 candidate, which reports both cases as inconclusive\./);
+    expect(document.body.textContent).toMatch(/Version 1\.3\.0rc2 reports the error_envelope and hardened reference cases as inconclusive\./);
     expect(document.body.textContent).not.toMatch(/hardened[^.]*HTTP 200/i);
-    const release = screen.getByRole("link", { name: /github\.com\/ancilis\/heel\/releases\/tag\/v1\.3\.0rc1/i });
+    const release = screen.getByRole("link", { name: /github\.com\/ancilis\/heel\/releases\/tag\/v1\.3\.0rc2/i });
     expect(release.getAttribute("href")).toBe(PUBLIC_RELEASE);
     expect(document.body.textContent).toMatch(/public preview prerelease/i);
     expect(document.body.textContent).toMatch(/not a stable release/i);
@@ -268,12 +287,12 @@ describe("Heel anonymous launch review", () => {
     expect(text).toContain(PUBLIC_INSTALL);
     expect(text).toContain('export HEEL_HOME="$(pwd -P)/.heel"');
     expect(text).not.toContain('"$PWD/.heel"');
-    expect(text).toContain(".venv/bin/heel scope create --target reference:export");
+    expect(text).toContain("./heel-rc2/bin/heel scope create --target reference:export");
     expect(text).toContain("--case vulnerable --attempt 11111111111111111111111111111111");
     expect(text).toContain("--case public --attempt 22222222222222222222222222222222");
     expect(text).not.toContain("--case hardened");
     expect(text).toMatch(/invariant_held with regression_passed=true for the public case/);
-    expect(screen.getByRole("link", { name: /releases\/tag\/v1\.3\.0rc1/i }).getAttribute("href"))
+    expect(screen.getByRole("link", { name: /releases\/tag\/v1\.3\.0rc2/i }).getAttribute("href"))
       .toBe(PUBLIC_RELEASE);
     expect(text).not.toMatch(STALE_GITHUB_CLAIMS);
     expect(text).toMatch(/pypi publication is not yet available/i);
@@ -295,13 +314,16 @@ describe("Heel anonymous launch review", () => {
     expect(text).toMatch(/no source checkout or manual wheel download is needed/i);
     expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*error_envelope[^.]*invariant_held with regression_passed=true/i);
     expect(text).toMatch(/That result is inconclusive, not a pass/);
-    expect(text).toMatch(/1\.3\.0rc2 candidate reports it as inconclusive with regression_passed=false; 1\.3\.0rc2 is not yet published/);
+    expect(text).toMatch(/1\.3\.0rc2 reports it as inconclusive with regression_passed=false\./);
     // The hardened case answers with an HTTP 403 error envelope: an rc1 erratum, never a repair.
     expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*hardened case, an HTTP 403 error response, as invariant_held with regression_passed=true/i);
-    expect(text).toMatch(/unpublished 1\.3\.0rc2 candidate reports the hardened case as inconclusive with regression_passed=false/);
+    expect(text).toMatch(/1\.3\.0rc2 reports the hardened case as inconclusive with regression_passed=false/);
     expect(text).not.toMatch(/hardened case[^.]*HTTP 200/i);
     expect(text).not.toMatch(/repeat with the hardened/i);
-    expect(text).not.toMatch(CANDIDATE_RELEASE_URL);
+    expect(text).not.toMatch(STALE_RC2_CLAIMS);
+    expect(text).not.toMatch(PREVIOUS_RELEASE_DOWNLOAD);
+    expect(text).toMatch(/synthetic reference results on your machine, not live findings/);
+    for (const limit of RETAINED_LIMITS.slice(1)) expect(text).toMatch(limit);
   });
 
   test("renders reference instructions in the runner body column beside the numbered rail", () => {
@@ -354,8 +376,10 @@ describe("Heel anonymous launch review", () => {
       const unwrapped = source.replace(/\s+/g, " ");
       expect(unwrapped, path).toContain(PUBLIC_RELEASE);
       expect(unwrapped, path).not.toMatch(STALE_GITHUB_CLAIMS);
-      expect(unwrapped, path).toMatch(CANDIDATE_UNPUBLISHED);
-      expect(unwrapped, path).not.toMatch(CANDIDATE_RELEASE_URL);
+      expect(unwrapped, path).not.toMatch(STALE_RC2_CLAIMS);
+      expect(unwrapped, path).not.toMatch(PREVIOUS_RELEASE_DOWNLOAD);
+      expect(unwrapped, path).toMatch(/not yet published to PyPI|not published to PyPI/);
+      for (const limit of RETAINED_LIMITS) expect(unwrapped, path).toMatch(limit);
       expect(source, path).not.toContain('"$PWD/.heel');
     }
     for (const [path, source] of documents.slice(0, 3)) {
@@ -372,7 +396,9 @@ describe("Heel anonymous launch review", () => {
     expect(demo).toMatch(/`error_envelope`[^.]*inconclusive/i);
     expect(demo).toMatch(/does not validate the invariant/i);
     expect(demo).toMatch(/verified_violation; invariant_held with regression_passed=true/i);
-    expect(demo).toMatch(/1\.3\.0rc2 candidate[^.]*prints `inconclusive` for `error_envelope`/i);
+    expect(demo).toMatch(/1\.3\.0rc2 release[^.]*prints `inconclusive` for `error_envelope`/i);
+    expect(demo).toMatch(/inconclusive with `evidence_state` `unknown` and regression_passed=false for `error_envelope` and for `hardened`/);
+    expect(demo).toMatch(/not live SaaS findings/);
   });
 
   test("states the MCP release, platform, privacy, and execution boundaries", () => {
