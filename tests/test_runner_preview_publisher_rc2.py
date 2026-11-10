@@ -6,10 +6,11 @@ test transport maps those logical hosts to the loopback socket.  None of this is
 real GitHub publication, and no test reads a real credential.
 
 The rc2 tool is a copy of the reviewed rc1 tool (scripts/publish_runner_preview_release.py) that
-differs only in the enumerated D1-D10 hunks; DiffBoundTests enforces that.  Its candidate is this
-checkout's committed downloads, bound below by git blob id, SHA-256 and size.  When a later
-release candidate replaces those downloads, this module fails at import on purpose: that packet
-must either move these bytes into a historical fixture (the rc1 precedent) or retire this tool.
+differs only in the enumerated D1-D10 hunks; DiffBoundTests enforces that.  Its candidate is the
+published 1.3.0rc2 bytes, bound below by git blob id, SHA-256 and size.  The 1.3.0rc3 candidate
+replaced the checkout's downloads and version sources, so, as the rc1 precedent did, those rc2 bytes
+now load from the historical fixture tests/fixtures/runner_preview_rc2/, exported from the accepted
+rc2 commit and verified offline; this module still fails at import on purpose if they ever differ.
 """
 from __future__ import annotations
 
@@ -39,6 +40,10 @@ SCRIPT = ROOT / "scripts/publish_runner_preview_release_rc2.py"
 RC1_SCRIPT = ROOT / "scripts/publish_runner_preview_release.py"
 RUNBOOK = ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC2.md"
 DOWNLOADS = "apps/heel-cloud/public/downloads"
+# The fixed publisher names the public 1.3.0rc2 release, whatever candidate this checkout carries,
+# so its input is the historical rc2 bytes: exported from the accepted rc2 commit, committed here and
+# bound by git blob id, so a shallow or source-only checkout loads them without history or git.
+HISTORICAL_FIXTURE = ROOT / "tests/fixtures/runner_preview_rc2"
 # The accepted rc2 candidate at main 1d1ec2d8986a1baca650ef0153d9ad0829c3886b
 # (RUNNER-RC2-PUBLISHER-DESIGN DECISION.md section 2), written out here independently of the tool.
 PINNED_COMMIT = "1d1ec2d8986a1baca650ef0153d9ad0829c3886b"
@@ -102,30 +107,43 @@ def _git_blob_id(payload: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(payload) + payload).hexdigest()
 
 
-def load_pinned_rc2(directory: Path = ROOT) -> tuple[dict[str, bytes], dict[str, bytes]]:
+FIXTURE_LAYOUT = {f"{DOWNLOADS}/{name}": f"artifacts/{name}" for name in P.ASSET_NAMES}
+FIXTURE_LAYOUT.update({source: f"version_sources/{Path(source).name}.txt" for source in P.VERSION_SOURCES})
+
+
+def load_pinned_rc2(directory: Path = HISTORICAL_FIXTURE) -> tuple[dict[str, bytes], dict[str, bytes]]:
     """The accepted rc2 artifacts by asset name and version sources by path, each pinned by blob id.
 
-    A mismatch is a hard failure, never a skip: it means this checkout no longer carries the
-    accepted rc2 candidate (see the module docstring).
+    A mismatch is a hard failure, never a skip: it means the historical fixture no longer holds the
+    accepted rc2 bytes (see the module docstring).
     """
     try:
-        downloads = directory / DOWNLOADS
-        if sorted(os.listdir(downloads)) != sorted(P.ASSET_NAMES):
-            raise PinnedCandidateError("downloads are not exactly the accepted rc2 wheel, sdist and manifest")
+        present = sorted(path.relative_to(directory).as_posix()
+                         for path in directory.rglob("*") if not path.is_dir())
+        if present != sorted([*FIXTURE_LAYOUT.values(), "provenance.json"]):
+            raise PinnedCandidateError("fixture is not exactly the rc2 artifacts, sources and provenance")
+        provenance = json.loads((directory / "provenance.json").read_text(encoding="utf-8"))
+        entries = [*provenance["artifacts"], *provenance["version_sources"]]
+        if (provenance["source_commit"] != PINNED_COMMIT or provenance["version"] != P.VERSION
+                or [entry["source_path"] for entry in entries] != list(FIXTURE_LAYOUT)):
+            raise PinnedCandidateError("provenance does not name the rc2 commit, version and layout")
         loaded = {}
-        for source in [f"{DOWNLOADS}/{name}" for name in P.ASSET_NAMES] + list(P.VERSION_SOURCES):
-            path = directory / source
+        for entry in entries:
+            source = entry["source_path"]
+            path = directory / FIXTURE_LAYOUT[source]
             if path.is_symlink() or not path.is_file():
-                raise PinnedCandidateError(f"{source} is not a regular file")
+                raise PinnedCandidateError(f"{FIXTURE_LAYOUT[source]} is not a regular file")
             payload = path.read_bytes()
-            if _git_blob_id(payload) != PINNED_BLOBS[source]:
-                raise PinnedCandidateError(f"{source} is not the accepted rc2 blob")
+            if not (_git_blob_id(payload) == entry["git_blob"] == PINNED_BLOBS[source]
+                    and len(payload) == entry["size"]
+                    and hashlib.sha256(payload).hexdigest() == entry["sha256"]):
+                raise PinnedCandidateError(f"{FIXTURE_LAYOUT[source]} is not the accepted rc2 blob")
             loaded[source] = payload
         for name in P.ASSET_NAMES:
             payload = loaded[f"{DOWNLOADS}/{name}"]
             if (hashlib.sha256(payload).hexdigest(), len(payload)) != (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]):
                 raise PinnedCandidateError(f"{name} digest or size is not the accepted rc2 value")
-    except (OSError, KeyError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         raise PinnedCandidateError(f"pinned rc2 candidate unreadable ({type(error).__name__})") from None
     artifacts = {name: loaded[f"{DOWNLOADS}/{name}"] for name in P.ASSET_NAMES}
     return artifacts, {source: loaded[source] for source in P.VERSION_SOURCES}
@@ -515,7 +533,7 @@ class FixtureCheckout:
 
 
 class PinnedLoaderTests(unittest.TestCase):
-    """The candidate is this checkout's accepted rc2 downloads, loaded offline and pinned."""
+    """The candidate is the historical accepted rc2 fixture, loaded offline and pinned."""
 
     def setUp(self):
         self.temporary = Path(tempfile.mkdtemp(prefix="heel-publisher-rc2-pinned-")).resolve()
@@ -523,9 +541,7 @@ class PinnedLoaderTests(unittest.TestCase):
 
     def copy(self, name="pinned") -> Path:
         target = self.temporary / name
-        for source in [f"{DOWNLOADS}/{n}" for n in P.ASSET_NAMES] + list(P.VERSION_SOURCES):
-            (target / source).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / source, target / source)
+        shutil.copytree(HISTORICAL_FIXTURE, target)
         return target
 
     def test_candidate_is_the_accepted_rc2_identity_the_fixed_publisher_names(self):
@@ -553,18 +569,32 @@ class PinnedLoaderTests(unittest.TestCase):
             self.assertEqual(load_pinned_rc2(copied), (CANDIDATE, CANDIDATE_SOURCES))
 
     def test_loader_rejects_missing_altered_relabelled_or_extra_bytes(self):
+        def provenance(directory, change):
+            path = directory / "provenance.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            change(document)
+            path.write_text(json.dumps(document), encoding="utf-8")
+
         def relabel_pyproject(directory):
-            path = directory / "pyproject.toml"
-            path.write_bytes(path.read_bytes().replace(b'version = "1.3.0rc2"', b'version = "1.3.0rc3"', 1))
+            # New bytes with a self-consistent provenance entry still differ from the pinned blob.
+            path = directory / "version_sources/pyproject.toml.txt"
+            payload = path.read_bytes().replace(b'version = "1.3.0rc2"', b'version = "1.3.0rc3"', 1)
+            path.write_bytes(payload)
+
+            def change(document):
+                entry = document["version_sources"][0]
+                entry.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                             git_blob=_git_blob_id(payload))
+            provenance(directory, change)
 
         def flip_sdist_byte(directory):
-            path = directory / DOWNLOADS / P.SDIST
+            path = directory / "artifacts" / P.SDIST
             payload = bytearray(path.read_bytes())
             payload[100] ^= 1
             path.write_bytes(bytes(payload))
 
         def symlink_manifest(directory):
-            path = directory / DOWNLOADS / P.MANIFEST
+            path = directory / "artifacts" / P.MANIFEST
             outside = self.temporary / "outside.json"
             outside.write_bytes(path.read_bytes())
             path.unlink()
@@ -572,17 +602,22 @@ class PinnedLoaderTests(unittest.TestCase):
 
         def canonical_but_wrong(directory):
             for name, payload in canonical_but_unaccepted().items():
-                (directory / DOWNLOADS / name).write_bytes(payload)
+                (directory / "artifacts" / name).write_bytes(payload)
 
         mutations = {
-            "missing wheel": lambda d: (d / DOWNLOADS / P.WHEEL).unlink(),
+            "missing wheel": lambda d: (d / "artifacts" / P.WHEEL).unlink(),
             "altered sdist": flip_sdist_byte,
-            "truncated version source": lambda d: (d / "heel/__init__.py").write_bytes(b""),
+            "truncated version source": lambda d: (d / "version_sources/__init__.py.txt").write_bytes(b""),
             "relabelled version source": relabel_pyproject,
-            "extra file": lambda d: (d / DOWNLOADS / "notes.txt").write_bytes(b"x"),
+            "extra file": lambda d: (d / "artifacts/notes.txt").write_bytes(b"x"),
             "symlinked manifest": symlink_manifest,
             "canonical but unaccepted bytes": canonical_but_wrong,
-            "missing version source": lambda d: (d / "release/open-core-v1.json").unlink(),
+            "missing version source": lambda d: (d / "version_sources/open-core-v1.json.txt").unlink(),
+            "movable reference": lambda d: provenance(d, lambda doc: doc.update(source_commit="main")),
+            "other version": lambda d: provenance(d, lambda doc: doc.update(version="1.3.0rc3")),
+            "reordered sources": lambda d: provenance(d, lambda doc: doc["version_sources"].reverse()),
+            "malformed provenance": lambda d: (d / "provenance.json").write_bytes(b"{not json"),
+            "missing provenance field": lambda d: provenance(d, lambda doc: doc.pop("artifacts")),
         }
         for index, (label, mutate) in enumerate(mutations.items()):
             with self.subTest(label):
@@ -776,7 +811,7 @@ class ImportAndCommandLineTests(unittest.TestCase):
         self.assertNotIn("http", notes.replace("HTTPS target traffic", "").replace(install, ""))
         self.assertNotIn(TOKEN, notes)
         # The manifest is the artifact; rendering external metadata leaves its bytes unchanged.
-        self.assertEqual((ROOT / DOWNLOADS / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
+        self.assertEqual((HISTORICAL_FIXTURE / "artifacts" / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
 
     def test_default_credential_source_is_gh_without_token_in_argv(self):
         completed = subprocess.CompletedProcess([], 0, stdout=TOKEN + "\n", stderr="")
@@ -1797,24 +1832,27 @@ class DiffBoundTests(unittest.TestCase):
 
 
 class PinnedCandidateTests(unittest.TestCase):
-    def test_checkout_downloads_and_version_sources_are_the_accepted_rc2_blobs(self):
-        self.assertEqual(sorted(os.listdir(ROOT / DOWNLOADS)), sorted(ACCEPTED_SHA256))
+    def test_fixture_artifacts_and_version_sources_are_the_accepted_rc2_blobs(self):
+        self.assertEqual(sorted(os.listdir(HISTORICAL_FIXTURE / "artifacts")), sorted(ACCEPTED_SHA256))
         for relative, blob in PINNED_BLOBS.items():
             with self.subTest(relative):
-                path = ROOT / relative
+                path = HISTORICAL_FIXTURE / FIXTURE_LAYOUT[relative]
                 self.assertFalse(path.is_symlink())
                 self.assertEqual(_git_blob_id(path.read_bytes()), blob)
         for name in ACCEPTED_SHA256:
-            payload = (ROOT / DOWNLOADS / name).read_bytes()
+            payload = (HISTORICAL_FIXTURE / "artifacts" / name).read_bytes()
             self.assertEqual((hashlib.sha256(payload).hexdigest(), len(payload)),
                              (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]))
-        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.3.0rc2"', pyproject)
-        self.assertIn('requires-python = ">=3.11"', pyproject)
-        self.assertIn('runner = ["cryptography==50.0.1"]', pyproject)
-        self.assertEqual(json.loads((ROOT / "release/open-core-v1.json").read_text())["version"], "1.3.0rc2")
-        self.assertIn('__version__ = "1.3.0rc2"', (ROOT / "heel/__init__.py").read_text())
-        self.assertIn('RELEASE_VERSION = "1.3.0rc2"', (ROOT / "scripts/build_open_core_release.py").read_text())
+        sources = {source: payload.decode("utf-8") for source, payload in CANDIDATE_SOURCES.items()}
+        self.assertIn('version = "1.3.0rc2"', sources["pyproject.toml"])
+        self.assertIn('requires-python = ">=3.11"', sources["pyproject.toml"])
+        self.assertIn('runner = ["cryptography==50.0.1"]', sources["pyproject.toml"])
+        self.assertEqual(json.loads(sources["release/open-core-v1.json"])["version"], "1.3.0rc2")
+        self.assertIn('__version__ = "1.3.0rc2"', sources["heel/__init__.py"])
+        self.assertIn('RELEASE_VERSION = "1.3.0rc2"', sources["scripts/build_open_core_release.py"])
+        provenance = json.loads((HISTORICAL_FIXTURE / "provenance.json").read_text(encoding="utf-8"))
+        self.assertEqual((provenance["public_release"]["tag"], provenance["public_release"]["target_commit"]),
+                         ("v1.3.0rc2", "c082d238d7439730ef7fcfa98676167540b90172"))
 
     def test_expected_digest_constants_equal_the_committed_manifest_and_bytes(self):
         self.assertEqual(dict(P.EXPECTED_SHA256), ACCEPTED_SHA256)
