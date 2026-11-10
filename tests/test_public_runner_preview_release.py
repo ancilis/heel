@@ -28,7 +28,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 DOWNLOADS = ROOT / "apps/heel-cloud/public/downloads"
 CONTRACT = ROOT / "release/open-core-v1.json"
-VERSION = "1.3.0rc2"
+VERSION = "1.3.0rc3"
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 SDIST = f"heel_sim-{VERSION}.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"

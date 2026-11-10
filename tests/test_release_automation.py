@@ -9,9 +9,14 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github/workflows/ci.yml"
 PUBLISH = ROOT / ".github/workflows/publish.yml"
-WHEEL = "heel_sim-1.3.0rc2-py3-none-any.whl"
-SDIST = "heel_sim-1.3.0rc2.tar.gz"
+# The checked-in candidate the CI package job verifies and installs.
+WHEEL = "heel_sim-1.3.0rc3-py3-none-any.whl"
+SDIST = "heel_sim-1.3.0rc3.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
+# The published GitHub prerelease customer copy installs; its bytes are the historical rc2 fixture.
+PUBLIC_VERSION = "1.3.0rc2"
+PUBLIC_WHEEL = f"heel_sim-{PUBLIC_VERSION}-py3-none-any.whl"
+PUBLIC_MANIFEST = ROOT / "tests/fixtures/runner_preview_rc2/artifacts" / MANIFEST
 RELEASE_REQUIREMENTS = ROOT / "release/requirements-release.txt"
 
 
@@ -136,6 +141,11 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         combined = "\n".join(documents.values())
 
         self.assertIn(f"/downloads/{WHEEL}", combined)
+        for path, source in documents.items():
+            # Same-origin downloads are the 1.3.0rc3 candidate and are named as not yet published.
+            if "/downloads/heel_sim-" in source:
+                self.assertRegex(" ".join(source.split()), r"1\.3\.0rc3 candidate[^.]*not yet published", path)
+            self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
         self.assertRegex(combined, r"(?i)not yet (?:available|published) (?:on|to) PyPI")
         self.assertRegex(combined, r"(?i)Apache-2\.0.{0,160}(?:unlimited|usage limit)")
         self.assertRegex(combined, r"(?is)hosted (?:findings )?synchronization.{0,180}paid")
@@ -152,21 +162,26 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertIn("python3.13 -m pip --isolated install", source)
             self.assertIn("--require-hashes --only-binary=:all:", source)
 
-    def test_customer_install_is_the_runbook_command_for_the_bundled_release(self):
+    def test_customer_install_is_the_runbook_command_for_the_published_release(self):
         import json
 
         runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC2.md").read_text(encoding="utf-8")
         section = runbook[runbook.index("## Customer install command"):]
         command = re.search(r"```sh\n(.*)\n```", section).group(1)
-        manifest = json.loads(
+        manifest = json.loads(PUBLIC_MANIFEST.read_text(encoding="utf-8"))
+        version = manifest["version"]
+        self.assertEqual(version, PUBLIC_VERSION)
+        wheel_sha = next(a["sha256"] for a in manifest["artifacts"] if a["name"] == PUBLIC_WHEEL)
+        # The public command installs exactly the published rc2 wheel from its own release, never
+        # the checked-in 1.3.0rc3 candidate, which is not yet published.
+        self.assertIn(
+            f"releases/download/v{version}/{PUBLIC_WHEEL}#sha256={wheel_sha}'", command,
+        )
+        bundled = json.loads(
             (ROOT / "apps/heel-cloud/public/downloads" / MANIFEST).read_text(encoding="utf-8")
         )
-        version = manifest["version"]
-        wheel_sha = next(a["sha256"] for a in manifest["artifacts"] if a["name"] == WHEEL)
-        # The public command installs exactly the bundled wheel from its own version's release.
-        self.assertIn(
-            f"releases/download/v{version}/{WHEEL}#sha256={wheel_sha}'", command,
-        )
+        self.assertEqual(bundled["version"], "1.3.0rc3")
+        self.assertNotIn("1.3.0rc3", command)
         self.assertTrue(command.startswith("python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install "))
         self.assertTrue(command.endswith(" && ./heel-rc2/bin/heel --version"))
         release = f"https://github.com/ancilis/heel/releases/tag/v{version}"
@@ -181,6 +196,13 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped, path)
             self.assertIn("Python 3.11 or newer", unwrapped, path)
             self.assertNotRegex(unwrapped, r"(?i)unpublished 1\.3\.0rc2|no public 1\.3\.0rc2 download", path)
+            # No copy advertises the candidate as published; any same-origin download names it
+            # as the not-yet-published 1.3.0rc3 candidate.
+            self.assertNotIn("releases/tag/v1.3.0rc3", source, path)
+            self.assertNotIn("releases/download/v1.3.0rc3", source, path)
+            self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
+            if "/downloads/heel_sim-" in source:
+                self.assertRegex(unwrapped, r"1\.3\.0rc3 candidate[^.]*not yet published", path)
         page = (ROOT / "apps/heel-cloud/app/agent/page.tsx").read_text(encoding="utf-8")
         digest = re.search(r'const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";', page).group(1)
         template = re.search(r"const INSTALL_PUBLIC_AGENT = `([^`]*)`;", page).group(1)

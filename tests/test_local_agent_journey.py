@@ -286,10 +286,13 @@ class LocalAgentJourneyTests(unittest.TestCase):
 
         self.assertIn("heel review openapi", readme)
         self.assertIn(
-            ".venv/bin/python -m pip install ./heel_sim-1.3.0rc2-py3-none-any.whl",
+            ".venv/bin/python -m pip install ./heel_sim-1.3.0rc3-py3-none-any.whl",
             readme,
         )
-        self.assertIn("/downloads/heel_sim-1.3.0rc2-py3-none-any.whl", readme)
+        self.assertIn("/downloads/heel_sim-1.3.0rc3-py3-none-any.whl", readme)
+        # The same-origin files are the 1.3.0rc3 candidate, named as not yet published.
+        self.assertRegex(" ".join(readme.split()), r"1\.3\.0rc3 candidate[^.]*not yet published")
+        self.assertNotIn("/downloads/heel_sim-1.3.0rc2", readme)
         self.assertIn("not yet published to pypi", readme.lower())
         # The recommended install is the one public command, then the CLI it creates.
         self.assertIn("python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install", readme)
