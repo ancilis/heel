@@ -362,9 +362,21 @@ function analyzeSource(fileName, text) {
   function validateControlPlaneProxyContract() {
     const sourceText = parsed.getFullText();
     if (!serverWorker || !sourceText.includes("CONTROL_PLANE")) return;
-    const routeContract = `function controlPlaneRoute(method: string, pathname: string): string | null {
+    const routeContract = `function isRunnerMachineRoute(upstreamPath: string): boolean {
+  return upstreamPath === RUNNER_PAIRING_EXCHANGE
+    || RUNNER_PAIRING_ACTIVATE.test(upstreamPath)
+    || RUNNER_ROTATION_PUBLIC.test(upstreamPath)
+    || RUNNER_CONTROL.test(upstreamPath)
+    || RUNNER_CONTEXT_CONTROL.test(upstreamPath)
+    || RUNNER_RESULT_PROJECTION.test(upstreamPath)
+    || RUNNER_RESYNC.test(upstreamPath)
+    || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
+}
+
+function controlPlaneRoute(method: string, pathname: string): string | null {
   if (pathname !== CONTROL_PLANE_PREFIX && !pathname.startsWith(\`\${CONTROL_PLANE_PREFIX}/\`)) {
-    return null;
+    if (!isRunnerMachineRoute(pathname)) return null;
+    return method === "POST" ? pathname : "";
   }
   const upstreamPath = pathname.slice(CONTROL_PLANE_PREFIX.length);
   if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)
