@@ -25,8 +25,20 @@ describe('deployment boundaries', () => {
       expect(() => deploymentConfig({ HEEL_PUBLIC_ORIGIN: invalid, HEEL_DEPLOYMENT_MODE: 'local_review' }, 'build')).toThrow(/canonical HTTPS/);
     }
   });
+  it('binds exactly one provider-issued UUID v7 VPC service in full deployment mode', () => {
+    // Representative synthetic v7 value (version nibble 7, RFC 4122 variant); not an account resource.
+    const v7 = '01890a5d-ac96-774b-bcce-b302099a8057';
+    for (const value of [v7, v7.toUpperCase(), ` ${v7}\n`]) {
+      expect(deploymentConfig({ HEEL_PUBLIC_ORIGIN: origin, HEEL_CONTROL_PLANE_VPC_SERVICE_ID: value }, 'build'))
+        .toEqual({ vars: { PUBLIC_ORIGIN: origin }, vpc_services: [{ binding: 'CONTROL_PLANE', service_id: value.trim() }] });
+    }
+  });
   it('rejects a full build whose private service id is not a VPC service UUID', () => {
-    for (const invalid of ['', 'not-a-uuid', '00000000-0000-0000-8000-000000000001', `${service}0`]) {
+    for (const invalid of [
+      '', 'not-a-uuid', '00000000-0000-0000-8000-000000000001', `${service}0`,
+      '01890a5d-ac96-874b-bcce-b302099a8057', '01890a5d-ac96-774b-7cce-b302099a8057',
+      '01890a5d-ac96-774b-ccce-b302099a8057', '01890a5d-ac96-774b-bcce-b302099a805', '01890a5dac96774bbcceb302099a8057',
+    ]) {
       expect(() => deploymentConfig({ HEEL_PUBLIC_ORIGIN: origin, HEEL_CONTROL_PLANE_VPC_SERVICE_ID: invalid }, 'build')).toThrow(/VPC service/);
     }
   });
