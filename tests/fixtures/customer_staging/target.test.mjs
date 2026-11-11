@@ -20,8 +20,16 @@ const PRO = "synthetic-pro-session-0001";
 const OTHER = "synthetic-other-session-0001";
 const VERIFY = "synthetic-ownership-token-0001-AbC_-";
 const sha = (value) => createHash("sha256").update(value).digest("hex");
-const EXPORT = { account_id: "acct_canary", format: "csv", rows: [{ id: "row_1", amount_cents: 1200 }], total: 1, protected_canary: CANARY_ID };
+// Ordinary markerless export, byte-for-byte the accepted 47ab432 payload (97 bytes).
+const ORDINARY = { account_id: "acct_canary", format: "csv", rows: [{ id: "row_1", amount_cents: 1200 }], total: 1 };
+const EXPORT = { ...ORDINARY, protected_canary: CANARY_ID };
+const ORDINARY_PATH = "/api/export";
 const EXPORT_PATH = `/api/exports/${CANARY_ID}`;
+// [path, exact payload, exact body bytes] for each export route.
+const EXPORTS = [
+  [ORDINARY_PATH, ORDINARY, 97, "a0dacf6ab6bf8e510e7d114137046acd91d209ef04fd448a0a4cbf596ca2c0aa"],
+  [EXPORT_PATH, EXPORT, 142, "32dcd0f899e627cf3d7c41cedf3a1ad67aba36523af5e404a71312304b3c28aa"],
+];
 
 function env(overrides = {}) {
   return {
@@ -81,7 +89,7 @@ test("ownership file fails closed when the token is missing or not an exact ASCI
 
 test("unknown paths are 404 and other methods on known routes are 405", async () => {
   const unknown = [
-    "/", "/api", "/api/export", "/api/export/", "/API/export", "/api/export.json", "/api/exports", "/api/exports/",
+    "/", "/api", "/api/export/", "/api/export/1", "/api/exports/export", "/API/export", "/api/export.json", "/api/exports", "/api/exports/",
     "/api/exports/heel-canary-export-0002", "/api/exports/HEEL-CANARY-EXPORT-0001", `${EXPORT_PATH}/`, `${EXPORT_PATH}x`,
     `/api/exports/%68eel-canary-export-0001`, `/API/exports/${CANARY_ID}`, `/api/exports/${CANARY_ID}/rows`,
     "/api/exports/attacker-id-0001", "/.well-known/", "/exports/1", "/api/pricing", "/healthz/x", "/openapi.yaml",
@@ -104,9 +112,10 @@ test("unknown paths are 404 and other methods on known routes are 405", async ()
   }
 });
 
-test("export authenticates only the two configured digests", async () => {
-  assert.equal((await call(EXPORT_PATH, { token: FREE })).status, 200);
-  assert.equal((await call(EXPORT_PATH, { token: PRO })).status, 200);
+test("both export routes authenticate only the two configured digests", async () => {
+  for (const [path] of EXPORTS) {
+  assert.equal((await call(path, { token: FREE })).status, 200, path);
+  assert.equal((await call(path, { token: PRO })).status, 200, path);
   const refused = [
     {},
     { token: OTHER },
@@ -121,10 +130,11 @@ test("export authenticates only the two configured digests", async () => {
     { authorization: `Bearer ${"a".repeat(513)}` },
   ];
   for (const options of refused) {
-    const got = await call(EXPORT_PATH, options);
-    assert.equal(got.status, 401, JSON.stringify(options));
+    const got = await call(path, options);
+    assert.equal(got.status, 401, `${path} ${JSON.stringify(options)}`);
     assert.deepEqual(JSON.parse(got.text), { error: "unauthenticated" });
     assert.equal(got.headers.get("www-authenticate"), "Bearer");
+  }
   }
 });
 
@@ -143,46 +153,73 @@ test("missing, malformed or equal digest configuration and an unknown mode fail 
     { HEEL_TARGET_MODE: "Vulnerable" },
     { HEEL_TARGET_MODE: "hardened" },
   ];
-  for (const overrides of broken) {
-    for (const token of [FREE, PRO]) {
-      const got = await call(EXPORT_PATH, { token, config: env(overrides) });
-      assert.equal(got.status, 503, JSON.stringify(overrides));
-      assert.deepEqual(JSON.parse(got.text), { error: "target not configured" });
+  for (const [path] of EXPORTS) {
+    for (const overrides of broken) {
+      for (const token of [FREE, PRO]) {
+        const got = await call(path, { token, config: env(overrides) });
+        assert.equal(got.status, 503, `${path} ${JSON.stringify(overrides)}`);
+        assert.deepEqual(JSON.parse(got.text), { error: "target not configured" });
+      }
     }
+    assert.equal((await call(path, { token: PRO, config: null })).status, 503);
+    assert.equal((await call(path, { token: PRO, config: {} })).status, 503);
   }
-  assert.equal((await call(EXPORT_PATH, { token: PRO, config: null })).status, 503);
-  assert.equal((await call(EXPORT_PATH, { token: PRO, config: {} })).status, 503);
 });
 
-test("modes are operator configured: vulnerable, patched and error_envelope", async () => {
-  const exportFor = async (mode, token, extra = {}) => call(EXPORT_PATH, { token, config: env({ HEEL_TARGET_MODE: mode }), ...extra });
-  const vulnerable = await exportFor("vulnerable", FREE);
-  assert.equal(vulnerable.status, 200);
-  assert.deepEqual(JSON.parse(vulnerable.text), EXPORT);
-  const patched = await exportFor("patched", FREE);
-  assert.equal(patched.status, 403);
-  assert.equal(patched.bytes.length, 0);
-  assert.equal(patched.headers.get("content-length"), "0");
-  const envelope = await exportFor("error_envelope", FREE);
-  assert.equal(envelope.status, 403);
-  assert.deepEqual(JSON.parse(envelope.text), { error: "upgrade required" });
+test("modes are operator configured on both routes: vulnerable, patched and error_envelope", async () => {
+  for (const [path, payload, length, digest] of EXPORTS) {
+    const exportFor = async (mode, token, extra = {}) => call(path, { token, config: env({ HEEL_TARGET_MODE: mode }), ...extra });
+    const vulnerable = await exportFor("vulnerable", FREE);
+    assert.equal(vulnerable.status, 200, path);
+    assert.deepEqual(JSON.parse(vulnerable.text), payload);
+    assert.equal(vulnerable.text, JSON.stringify(payload));
+    assert.equal(vulnerable.bytes.length, length, path);
+    assert.equal(sha(vulnerable.bytes), digest, path);
+    const patched = await exportFor("patched", FREE);
+    assert.equal(patched.status, 403);
+    assert.equal(patched.bytes.length, 0);
+    assert.equal(patched.headers.get("content-length"), "0");
+    const envelope = await exportFor("error_envelope", FREE);
+    assert.equal(envelope.status, 403);
+    assert.deepEqual(JSON.parse(envelope.text), { error: "upgrade required" });
+    for (const mode of MODES) {
+      const pro = await exportFor(mode, PRO);
+      assert.equal(pro.status, 200, `${path} ${mode}`);
+      assert.equal(pro.text, JSON.stringify(payload));
+      for (const token of mode === "vulnerable" ? [FREE, PRO] : [PRO]) {
+        const head = await call(path, { method: "HEAD", token, config: env({ HEEL_TARGET_MODE: mode }) });
+        assert.equal(head.status, 200);
+        assert.equal(head.bytes.length, 0);
+        assert.equal(head.headers.get("content-length"), String(length));
+      }
+      if (mode !== "vulnerable") {
+        const head = await call(path, { method: "HEAD", token: FREE, config: env({ HEEL_TARGET_MODE: mode }) });
+        assert.equal(head.status, 403, `${path} HEAD ${mode}`);
+        assert.equal(head.bytes.length, 0);
+      }
+    }
+    // The request cannot select or override the mode.
+    for (const extra of [
+      { headers: { "x-heel-target-mode": "vulnerable" } },
+      { headers: { cookie: "mode=vulnerable" } },
+    ]) {
+      assert.equal((await exportFor("patched", FREE, extra)).status, 403);
+    }
+    assert.equal((await call(`${path}?mode=vulnerable`, { token: FREE, config: env({ HEEL_TARGET_MODE: "patched" }) })).status, 403);
+  }
+});
+
+test("the ordinary export carries no canary marker; only the id route does", async () => {
   for (const mode of MODES) {
-    const pro = await exportFor(mode, PRO);
-    assert.equal(pro.status, 200, mode);
-    assert.deepEqual(JSON.parse(pro.text), EXPORT);
-    const head = await call(EXPORT_PATH, { method: "HEAD", token: PRO, config: env({ HEEL_TARGET_MODE: mode }) });
-    assert.equal(head.status, 200);
-    assert.equal(head.bytes.length, 0);
-    assert.equal(head.headers.get("content-length"), String(JSON.stringify(EXPORT).length));
+    for (const token of [FREE, PRO]) {
+      for (const method of ["GET", "HEAD"]) {
+        const got = await call(ORDINARY_PATH, { method, token, config: env({ HEEL_TARGET_MODE: mode }) });
+        assert.ok(!/canary-export|protected_canary/.test(got.text + JSON.stringify([...got.headers])), `${mode} ${method}`);
+      }
+    }
   }
-  // The request cannot select or override the mode.
-  for (const extra of [
-    { headers: { "x-heel-target-mode": "vulnerable" } },
-    { headers: { cookie: "mode=vulnerable" } },
-  ]) {
-    assert.equal((await exportFor("patched", FREE, extra)).status, 403);
-  }
-  assert.equal((await call(`${EXPORT_PATH}?mode=vulnerable`, { token: FREE, config: env({ HEEL_TARGET_MODE: "patched" }) })).status, 403);
+  assert.deepEqual(Object.keys(JSON.parse((await call(ORDINARY_PATH, { token: PRO })).text)), ["account_id", "format", "rows", "total"]);
+  assert.equal(JSON.parse((await call(EXPORT_PATH, { token: PRO })).text).protected_canary, CANARY_ID);
 });
 
 test("health reports only mode, revision and configured flags", async () => {
@@ -201,10 +238,10 @@ test("no token, digest, header, query or body value is reflected or logged; rece
   logs.length = 0;
   const secrets = [FREE, PRO, OTHER, sha(FREE), sha(PRO), VERIFY, "query-value-0001", "posted-body-0001", "header-value-0001"];
   const responses = [];
-  for (const mode of MODES) {
+  for (const [path] of EXPORTS) for (const mode of MODES) {
     for (const token of [FREE, PRO, OTHER]) {
       for (const method of ["GET", "HEAD", "POST"]) {
-        responses.push(await call(`${EXPORT_PATH}?q=query-value-0001`, {
+        responses.push(await call(`${path}?q=query-value-0001`, {
           method, token, config: env({ HEEL_TARGET_MODE: mode }), headers: { "x-probe": "header-value-0001" },
           body: method === "POST" ? "posted-body-0001" : undefined,
         }));
@@ -249,7 +286,10 @@ test("source has no outbound fetch, redirect, import, binding or plan metadata",
   }
   for (const forbidden of [FREE, PRO, VERIFY]) assert.ok(!config.includes(forbidden));
   const openapi = JSON.parse(readFileSync(join(HERE, "openapi.json"), "utf8"));
-  assert.deepEqual(Object.keys(openapi.paths), ["/api/exports/{id}"]);
+  assert.deepEqual(Object.keys(openapi.paths), ["/api/export", "/api/exports/{id}"]);
+  // The ordinary route has no parameter, so its mapping needs no fixture binding.
+  assert.deepEqual(Object.keys(openapi.paths["/api/export"]).sort(), ["get", "head"]);
+  for (const operation of Object.values(openapi.paths["/api/export"])) assert.deepEqual(Object.keys(operation).sort(), ["operationId", "responses"]);
   const item = openapi.paths["/api/exports/{id}"];
   assert.deepEqual(Object.keys(item).sort(), ["get", "head", "parameters"]);
   // An ordinary required path parameter: no example, enum, default or marker value.
@@ -269,8 +309,8 @@ test("the target serves its own inventory at /openapi.json, byte-identical to op
   const head = await call("/openapi.json", { method: "HEAD" });
   assert.equal(head.status, 200);
   assert.equal(head.bytes.length, 0);
-  // The inventory lists only the export route: no ownership, health or spec endpoint.
-  assert.deepEqual(Object.keys(JSON.parse(file).paths), ["/api/exports/{id}"]);
+  // The inventory lists only the two export routes: no ownership, health or spec endpoint.
+  assert.deepEqual(Object.keys(JSON.parse(file).paths), ["/api/export", "/api/exports/{id}"]);
 });
 
 // Component proof only: the worker's own responses are evaluated by the UNCHANGED product
@@ -287,7 +327,7 @@ for case in json.load(sys.stdin):
     observe = lambda side: PlanObservation(side["status"], base64.b64decode(side["body"]))
     verdict = evaluate_plan_pair(
         observe(case["lower"]), observe(case["higher"]), method=case["method"], marker=None,
-        executor_outcome=ExecutorOutcome("completed", "observed"),
+        executor_outcome=ExecutorOutcome("completed", case.get("assessment", "observed")),
     )
     out.append({"verdict": verdict.verdict, "row": verdict.row, "reason": verdict.reason,
                 "body_superset": verdict.body_superset})
@@ -306,14 +346,15 @@ test("component proof (not deployed acceptance): existing predicate on the worke
   const cases = [];
   const expected = [];
   const observe = (got) => ({ status: got.status, body: Buffer.from(got.bytes).toString("base64") });
+  let path = EXPORT_PATH;
   const add = async (mode, method, want) => {
     const config = env({ HEEL_TARGET_MODE: mode });
     cases.push({
       method,
-      lower: observe(await call(EXPORT_PATH, { method, token: FREE, config })),
-      higher: observe(await call(EXPORT_PATH, { method, token: PRO, config })),
+      lower: observe(await call(path, { method, token: FREE, config })),
+      higher: observe(await call(path, { method, token: PRO, config })),
     });
-    expected.push({ mode, method, ...want });
+    expected.push({ mode: `${path} ${mode}`, method, ...want });
   };
   // Vulnerable: a stored body_superset finding (row 6) -> replay fail/still_reachable.
   await add("vulnerable", "GET", { verdict: "finding", row: 6, reason: "lower_superset", body_superset: true });
@@ -326,6 +367,30 @@ test("component proof (not deployed acceptance): existing predicate on the worke
   // The alternative patched shape proposed by ops, 403 with "{}", is checked directly too.
   cases.push({ method: "GET", lower: { status: 403, body: Buffer.from("{}").toString("base64") }, higher: cases[1].higher });
   expected.push({ mode: "patched-{}", method: "GET", verdict: "held", row: 7, reason: "lower_denied", body_superset: false });
+  // The ordinary markerless route gives the same comparator rows with marker=None, both
+  // with the executor's observed assessment and with the inconclusive assessment the
+  // paired executor reports for a route with no canary binding (it is ignored without a marker).
+  path = ORDINARY_PATH;
+  const ordinaryStart = cases.length;
+  await add("vulnerable", "GET", { verdict: "finding", row: 6, reason: "lower_superset", body_superset: true });
+  await add("patched", "GET", { verdict: "held", row: 7, reason: "lower_denied", body_superset: false });
+  await add("error_envelope", "GET", { verdict: "inconclusive", row: 9, reason: "lower_denial_envelope", body_superset: null });
+  for (let index = ordinaryStart, end = cases.length; index < end; index += 1) {
+    cases.push({ ...cases[index], assessment: "inconclusive" });
+    expected.push({ ...expected[index], mode: `${expected[index].mode} assessment=inconclusive` });
+  }
+  // The ordinary bodies really are markerless.
+  for (const item of cases.slice(ordinaryStart)) {
+    for (const side of [item.lower, item.higher]) assert.ok(!Buffer.from(side.body, "base64").toString().includes("canary-export"));
+  }
+  // HEAD on both routes, every mode: never a finding. A HEAD 200/200 pair is status parity
+  // only (row 8); a HEAD 403/200 pair is a status-only hold (row 7) with body_superset null.
+  for (const route of [EXPORT_PATH, ORDINARY_PATH]) {
+    path = route;
+    await add("vulnerable", "HEAD", { verdict: "inconclusive", row: 8, reason: "head_status_only", body_superset: null });
+    await add("patched", "HEAD", { verdict: "held", row: 7, reason: "lower_denied", body_superset: null });
+    await add("error_envelope", "HEAD", { verdict: "held", row: 7, reason: "lower_denied", body_superset: null });
+  }
 
   const run = spawnSync(python(), ["-I", "-B", "-c", PREDICATE, REPO], { input: JSON.stringify(cases), encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr);
@@ -362,9 +427,11 @@ inventory = RouteInventory(json.loads(base64.b64decode(request["openapi"])))
 
 def actions(method, fixture_id):
     catalog = CATALOG_BY_ID[SCENARIO]
+    # fixture_id None selects the ordinary route, whose mapping has EMPTY fixture bindings.
     mapping = _mapping_record({
-        "scenario_id": SCENARIO, "method": method, "route_template": "/api/exports/{id}",
-        "fixture_bindings": [{"parameter_name": "id", "fixture_id": fixture_id}],
+        "scenario_id": SCENARIO, "method": method,
+        "route_template": "/api/export" if fixture_id is None else "/api/exports/{id}",
+        "fixture_bindings": [] if fixture_id is None else [{"parameter_name": "id", "fixture_id": fixture_id}],
     })
     return [{
         "ordinal": ordinal, "scenario_id": SCENARIO, "adapter_version": catalog["adapter_version"],
@@ -378,7 +445,14 @@ def actions(method, fixture_id):
     } for ordinal, role in enumerate(catalog["semantic_roles"])]
 
 if request["phase"] == "prepare":
-    out = {"inventory": inventory.read_routes(), "cases": []}
+    out = {"inventory": inventory.read_routes(), "cases": [], "rejected": []}
+    # Exact-binding rule: the ordinary route refuses any binding, the id route refuses none.
+    for route, bindings in (("/api/export", [{"parameter_name": "id", "fixture_id": "x-1"}]), ("/api/exports/{id}", [])):
+        try:
+            _mapping_record({"scenario_id": SCENARIO, "method": "GET", "route_template": route, "fixture_bindings": bindings})
+            out["rejected"].append(False)
+        except Exception:
+            out["rejected"].append(True)
     for case in request["cases"]:
         prepared = [prepare_action(action) for action in actions(case["method"], case["fixture_id"])]
         out["cases"].append([{"role": p.semantic_auth_role, "method": p.method, "route": p.route} for p in prepared])
@@ -427,18 +501,27 @@ test("canary-dependent paired read: the unchanged paired evaluator decides the w
     // No marker bound: a non-canary fixture id, or a different canary id, reaches only 404s.
     ["no marker", "vulnerable", "GET", "export-0001", FREE, PRO, { outcome: "inconclusive", protected: [null, null] }],
     ["other canary", "vulnerable", "GET", "heel-canary-export-0002", FREE, PRO, { outcome: "inconclusive", protected: [null, null] }],
+    // The ordinary markerless route (null = empty fixture bindings) is NOT canary-backed: the
+    // canary-dependent evaluator has no marker to look for and stays inconclusive in every
+    // mode. Ordinary plan-differential exposure on this route is decided by the comparator above.
+    ...MODES.flatMap((mode) => ["GET", "HEAD"].map((method) =>
+      [`ordinary ${method} ${mode}`, mode, method, null, FREE, PRO, { outcome: "inconclusive", protected: [null, null] }])),
   ];
   const prepared = paired({ phase: "prepare", openapi, cases: matrix.map(([, , method, fixture_id]) => ({ method, fixture_id })) });
   // The runner reads exactly the served inventory: one templated export route, GET and HEAD.
   assert.deepEqual(prepared.inventory, [
+    { method: "GET", route_template: "/api/export", operation_id: "getaccountexport", placeholders: [] },
+    { method: "HEAD", route_template: "/api/export", operation_id: "headaccountexport", placeholders: [] },
     { method: "GET", route_template: "/api/exports/{id}", operation_id: "getexport", placeholders: ["id"] },
     { method: "HEAD", route_template: "/api/exports/{id}", operation_id: "headexport", placeholders: ["id"] },
   ]);
+  assert.deepEqual(prepared.rejected, [true, true]);
   const cases = [];
   for (const [index, [label, mode, method, fixture_id, lowerToken, higherToken]] of matrix.entries()) {
     const actions = prepared.cases[index];
     assert.deepEqual(actions.map((a) => a.role), ["lower_plan", "higher_plan"], label);
-    assert.ok(actions.every((a) => a.method === method && a.route === `/api/exports/${fixture_id}`), label);
+    const route = fixture_id === null ? ORDINARY_PATH : `/api/exports/${fixture_id}`;
+    assert.ok(actions.every((a) => a.method === method && a.route === route), label);
     const config = env({ HEEL_TARGET_MODE: mode });
     const responses = [];
     for (const [action, token] of [[actions[0], lowerToken], [actions[1], higherToken]]) {

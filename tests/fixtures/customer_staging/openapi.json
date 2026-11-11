@@ -2,9 +2,27 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Heel controlled staging target API",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "paths": {
+    "/api/export": {
+      "get": {
+        "operationId": "getAccountExport",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "head": {
+        "operationId": "headAccountExport",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
+    },
     "/api/exports/{id}": {
       "parameters": [
         {
