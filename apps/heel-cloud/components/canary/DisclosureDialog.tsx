@@ -72,7 +72,7 @@ export function DisclosureDialog({
 
         <div className="disclosure-boundary-note">
           <strong>Metadata only</strong>
-          <p>The redacted summary signed by your paired runner: scenario outcomes, response status and body shape, finding text and recommended controls. Request and response bodies and secrets stay on the runner machine; evidence is referenced only by opaque ids.</p>
+          <p>The redacted summary signed by your paired runner: scenario outcomes, the rehearsed route methods and paths, response status and body shape, finding text and recommended controls. Request and response bodies and secrets stay on the runner machine; evidence is referenced only by opaque ids.</p>
         </div>
 
         <div className="dialog-actions">

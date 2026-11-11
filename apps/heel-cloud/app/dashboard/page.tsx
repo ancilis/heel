@@ -1007,7 +1007,7 @@ export default function Dashboard() {
         : disclosureDecisionOpen
           ? `The paired runner reported a redacted summary: ${disclosureState.projection.scenarioCount} ${disclosureState.projection.scenarioCount === 1 ? "scenario" : "scenarios"}, ${disclosureState.projection.findingCount} ${disclosureState.projection.findingCount === 1 ? "finding" : "findings"}. Nothing has been shared. Share it or keep it local.`
           : disclosureState.status === "permitted"
-            ? "Share approved. The paired runner uploads this exact summary within seconds while heel runner serve is running."
+            ? "Share approved. The paired runner uploads this exact summary when it next checks for approval, normally within a minute while heel runner serve is running."
             : disclosureState.status === "local_only"
               ? "Result kept local. No summary bytes were uploaded."
               : disclosureState.status === "expired"
@@ -1024,7 +1024,7 @@ export default function Dashboard() {
         <div className="dashboard-context"><span className="dashboard-workspace">{selectedProject ? selectedProject.name : "Workspace not connected"}</span><span className="dashboard-presence"><i aria-hidden="true" /> {context ? "Cloud connected" : "Local-first"}</span></div></header>
 
       <p className="runner-recovery">Supported validation: <Link href="/runner">export entitlement reference and local report viewer</Link>.</p>
-      <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified target setup</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Heel Cloud sends no requests to your target: approved read-only rehearsals run from a runner on your own machine, and credentials and raw evidence stay there.</p></div>
+      <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified target setup</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Heel Cloud only checks that ownership proof: approved read-only GET and HEAD rehearsals run from a runner on your own machine, and credentials and raw evidence stay there.</p></div>
         <aside className="preview-notice" aria-label="Connection status"><span className="preview-pulse" aria-hidden="true" /><div><strong>{connection.phase === "ready" ? "Ready for customer setup" : "Connect to begin"}</strong><p>{connection.phase === "checking" ? "Checking signed-in context · no request sent" : connection.phase === "ready" ? "Live account state · operational metadata only" : "No sample data is shown"}</p></div></aside></section>
 
       {connection.phase !== "ready" ? <section className="next-action" role="status"><span aria-hidden="true">↳</span><p><strong>{STATUS_TITLES[connection.phase]}</strong> {"message" in connection ? connection.message
@@ -1082,7 +1082,7 @@ export default function Dashboard() {
 
       <aside className="dashboard-rail" aria-label="Safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p>
         {showActivation ? <><h2>The paired runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status; a redacted summary only if you share it</dd></div></dl></>
-          : <><h2>Heel Cloud sends no requests to your target.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Ownership check</dt><dd>One proof file or DNS record</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>}</section>
+          : <><h2>Heel Cloud only verifies ownership; rehearsals run on your machine.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Ownership check</dt><dd>One proof file or DNS record</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>}</section>
          {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} /> : null}
          {observedRun && !observedRun.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
         {disclosureRunId !== null ? <section aria-label="Result sharing" aria-live="polite" className="disclosure-entry"><span>Result sharing</span>{disclosureStatusCopy}
