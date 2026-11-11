@@ -4239,9 +4239,9 @@ class RunnerRuntimeState:
 
         Read-only.  Pages are ordered by (retention, run hash) so a caller can walk every retained
         row without an unbounded read.  A row whose only staged call is its own metadata-only
-        ``poll-disclosure`` stays listed so the caller replays that exact sealed poll on its
-        cadence (the result chain admits at most one staged call); a row with any other staged
-        call is left to startup replay.
+        ``poll-disclosure`` or its sealed ``upload-findings`` stays listed so the caller replays
+        that exact sealed call on its cadence (the result chain admits at most one staged call);
+        a row with any other staged call is left to startup replay.
         """
         if type(limit) is not int or not 1 <= limit <= 16:
             raise RunnerRuntimeStateError("invalid runtime disclosure page limit")
@@ -4264,7 +4264,7 @@ class RunnerRuntimeState:
                     "AND NOT EXISTS ("
                     "SELECT 1 FROM pending_calls INDEXED BY idx_pending_calls_run_operation "
                     "WHERE pending_calls.run_hash=terminal_disclosures.run_hash "
-                    "AND pending_calls.operation!='poll-disclosure'"
+                    "AND pending_calls.operation NOT IN ('poll-disclosure','upload-findings')"
                     ") ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
                     (now_ms, cursor_retention, cursor_retention, cursor_hash, limit + 1),
                 ).fetchall()

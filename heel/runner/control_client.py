@@ -103,6 +103,17 @@ class RunnerControlRecoveryError(RuntimeError):
         super().__init__(message or self.code)
 
 
+class RunnerUploadDeferred(ValueError):
+    """A 502/503/504 answered a findings upload; the sealed upload stays staged unchanged.
+
+    Classified before the next-nonce header or any body is read.  Still a ``ValueError``, so
+    startup replay and every existing refusal path stay fail-closed exactly as before.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("invalid runner findings receipt")
+
+
 class RunnerAuthenticationRejected(RunnerControlRecoveryError):
     """A freshly signed resync was refused with the server's single 401 answer.
 
@@ -771,6 +782,8 @@ class RunnerControlClient:
                 raise _ClaimChainAuthorityLost(runtime_pending)
             # Run chains are outside this phase's recovery (T4a): the staged call is kept.
             raise RunnerChainRecoveryRequired(operation)
+        if operation == "upload-findings" and status in {502, 503, 504}:
+            raise RunnerUploadDeferred()
         next_nonce = headers.get("X-Heel-Runner-Next-Nonce")
         if not self._b64_32(next_nonce):
             raise ValueError("invalid runner control response")

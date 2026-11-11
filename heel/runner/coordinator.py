@@ -20,7 +20,7 @@ from heel.canary_contracts import (
     validate_operational_run,
 )
 from heel.crypto import verify_envelope
-from heel.runner.control_client import RunnerControlClient
+from heel.runner.control_client import RunnerControlClient, RunnerUploadDeferred
 from heel.runner.execution import (
     ExecutionBundle,
     ExecutionGate,
@@ -179,20 +179,7 @@ class RunnerCoordinator:
                     # Findings recovery remains lease/permit bound.  Re-enter
                     # the coordinator rather than allowing the client to infer
                     # disclosure authority from an available runtime row alone.
-                    try:
-                        request = json.loads(item.body.decode("utf-8"))
-                        if (
-                            canonical_bytes(request) != item.body
-                            or not isinstance(request, dict)
-                            or set(request) != {
-                                "schema_version", "run_id", "permit", "findings_projection",
-                            }
-                            or request["schema_version"] != "heel.runner-findings-upload.v1"
-                            or request["run_id"] != item.run_id
-                        ):
-                            raise ValueError
-                    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-                        raise RunnerStoreError("local findings replay authority is invalid") from None
+                    request = self._staged_upload_request(item)
                     self.upload_findings(
                         item.run_id, permit=request["permit"],
                         findings_projection=request["findings_projection"],
@@ -213,6 +200,25 @@ class RunnerCoordinator:
                     self._bindings.pop(run_id, None)
                     self._heartbeat_guards.pop(run_id, None)
             self._terminal_runs.intersection_update(active_ids)
+
+    @staticmethod
+    def _staged_upload_request(item: Any) -> dict[str, Any]:
+        """Decode one sealed findings upload (canonical, closed, same run) for any replay path."""
+        try:
+            request = json.loads(item.body.decode("utf-8"))
+            if (
+                canonical_bytes(request) != item.body
+                or not isinstance(request, dict)
+                or set(request) != {
+                    "schema_version", "run_id", "permit", "findings_projection",
+                }
+                or request["schema_version"] != "heel.runner-findings-upload.v1"
+                or request["run_id"] != item.run_id
+            ):
+                raise ValueError
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            raise RunnerStoreError("local findings replay authority is invalid") from None
+        return request
 
     def _inactive_claim_eligible(self, active: object, pending: tuple[object, ...], now_ms: int) -> bool:
         """POSTRESET §7.1 L2-L5 for one loaded (L1-valid) active row; L6 is construction order.
@@ -994,10 +1000,11 @@ class RunnerCoordinator:
             raise ValueError("invalid runner disclosure poll")
         return self.control.poll_disclosure(run_id=run_id, findings_projection=findings)
 
-    def _disclosure_due(self, state: Any, now: int) -> bool:
+    def _disclosure_due(self, state: Any, now: int, *, upload_staged: bool = False) -> bool:
         if state.run_id in self._disclosure_stopped or now >= state.retention_expires_at_ms:
             return False
-        if now < state.terminal_at_ms + DISCLOSURE_FAST_POLL_WINDOW_MS:
+        # A staged upload re-sends the full projection: slow cadence only, even when fast.
+        if not upload_staged and now < state.terminal_at_ms + DISCLOSURE_FAST_POLL_WINDOW_MS:
             return True
         last = self._disclosure_last_poll_ms.get(state.run_id)
         return last is None or now - last >= DISCLOSURE_SLOW_POLL_INTERVAL_MS
@@ -1023,19 +1030,31 @@ class RunnerCoordinator:
         permit or a non-200/unreadable answer leaves the run ``available`` and never uploads; a
         poll left staged by such an answer is replayed byte-identically (same path, headers and
         body through ``control.poll_disclosure``'s pending path) on the run's next due step,
-        within the same cadence and never at or after retention.  Any other staged call keeps
-        the row parked for startup replay.
+        within the same cadence and never at or after retention.  A findings upload left staged
+        by a 502/503/504 (``RunnerUploadDeferred``) is re-sent from its sealed bytes and permit
+        through the unchanged ``upload_findings``, at least 60 s apart and never polled over; any
+        other refusal, an unreadable answer or an expired permit stops it for this process.  Any
+        other staged call keeps the row parked for startup replay.
         """
         now = self._now_ms()
         retained: set[str] = set()
         due: list[str] = []
+        staged_uploads = {
+            item.run_id: item for item in self.control.runtime.load_pending_calls(limit=74)
+            if item.chain_operation == "result" and item.request_operation == "upload-findings"
+        }
         after = None
         while True:
             batch = self.control.runtime.load_available_disclosures(now_ms=now, after=after, limit=16)
             for state in batch.items:
                 retained.add(state.run_id)
                 with self._disclosure_lock:
-                    if self._disclosure_due(state, now) and len(due) < DISCLOSURE_POLLS_PER_STEP:
+                    if (
+                        self._disclosure_due(
+                            state, now, upload_staged=state.run_id in staged_uploads,
+                        )
+                        and len(due) < DISCLOSURE_POLLS_PER_STEP
+                    ):
                         due.append(state.run_id)
             if not batch.has_more or not batch.items:
                 break
@@ -1048,8 +1067,24 @@ class RunnerCoordinator:
             with self._disclosure_lock:
                 self._disclosure_last_poll_ms[run_id] = now
             try:
-                self._advance_one_disclosure(run_id)
+                if run_id in staged_uploads:
+                    request = self._staged_upload_request(staged_uploads[run_id])
+                    self.upload_findings(
+                        run_id, permit=request["permit"],
+                        findings_projection=request["findings_projection"],
+                    )
+                else:
+                    self._advance_one_disclosure(run_id)
+            except RunnerUploadDeferred:
+                continue
             except ValueError:
+                if run_id in staged_uploads or any(
+                    item.chain_operation == "result" and item.run_id == run_id
+                    and item.request_operation == "upload-findings"
+                    for item in self.control.runtime.load_pending_calls(limit=74)
+                ):
+                    with self._disclosure_lock:
+                        self._disclosure_stopped.add(run_id)
                 continue
         return len(due)
 

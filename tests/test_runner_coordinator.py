@@ -4126,9 +4126,101 @@ def test_a_staged_poll_the_server_refuses_on_replay_never_uploads_and_still_bloc
         h.build(h.client.runtime, nonce_byte=b"z")
 
 
-def test_a_staged_findings_upload_still_parks_the_row_until_startup_replay(tmp_path):
+# --------------------------------------------------------------------------- upload transient recovery
+#
+# Fable R1 Gate 2 (CONFIRMED): a 502/503/504 on the automatic findings upload parked the row until
+# ``heel runner serve`` restarted.  Only those three statuses are classified ``RunnerUploadDeferred``
+# (after the 401 authority check, before the next-nonce header and any body decode); the serve step
+# re-sends the exact sealed upload through the unchanged ``upload_findings`` on the slow cadence
+# only, and stops for the process on any other refusal, an unreadable answer or an expired permit.
+
+def _upload_tail(*answers):
     def tail(grant, findings, authority, coordinator, holder):
         permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        receipt = _handoff_receipt(grant, findings, permit)
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit))] + [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt) if answer == "receipt" else answer
+            for answer in answers
+        ]
+    return tail
+
+
+def _staged_upload(h):
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "upload-findings" and pending.run_id == h.grant["run_id"]
+    return pending
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_a_transient_upload_status_is_resent_byte_identically_on_the_slow_cadence_to_consumed(tmp_path, status):
+    h = _handoff_coordinator(tmp_path, _upload_tail((status, {}, {"error": "edge"}), "receipt"))
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    staged = h.transport.requests[-1]
+    _staged_upload(h)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+    h.clock[0] += 60_000  # same serve process, no restart
+    assert h.coordinator.advance_disclosures() == 1
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection", "result-projection"]
+    assert h.transport.requests[-1] == staged  # exact path, headers and sealed body
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == "consumed" and state.permit_id == h.holder["permit"]["permit_id"]
+    assert h.client.runtime.load_pending_calls() == ()
+    for _ in range(3):
+        h.clock[0] += 60_000
+        h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 3
+
+
+def test_a_headerless_upload_503_is_classified_deferred_before_the_nonce_header_and_body(tmp_path):
+    from heel.runner.control_client import RunnerUploadDeferred
+
+    h = _handoff_coordinator(tmp_path, lambda *_: [
+        (503, {}, b"<html>edge</html>"),
+        (504, {"X-Heel-Runner-Next-Nonce": "not-a-nonce"}, None),
+        (401, {}, {"code": "invalid_runner_auth"}),
+    ])
+    permit = _handoff_permit(h.authority, h.coordinator, h.grant, h.findings)
+    for _ in range(2):
+        with pytest.raises(RunnerUploadDeferred) as raised:
+            h.coordinator.upload_findings(h.grant["run_id"], permit=permit, findings_projection=h.findings)
+        assert isinstance(raised.value, ValueError)
+    # 401 still wins over the deferral classification.
+    with pytest.raises(RunnerChainRecoveryRequired):
+        h.coordinator.upload_findings(h.grant["run_id"], permit=permit, findings_projection=h.findings)
+    _staged_upload(h)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+@pytest.mark.parametrize("answer", [
+    (409, {}, {"schema_version": "heel.canary-error.v1", "code": "canary_state_conflict"}),
+    (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, {"malformed": True}),
+], ids=["refused-409", "unreadable-200"])
+def test_a_refused_or_unreadable_upload_answer_stops_in_process_and_startup_stays_closed(tmp_path, answer):
+    h = _handoff_coordinator(tmp_path, _upload_tail(answer))
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    for _ in range(4):
+        h.clock[0] += 60_000
+        h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 2
+    _staged_upload(h)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    # Pre-existing fail-closed startup policy (P4b) is unchanged.
+    h.transport.responses.append(answer)
+    with pytest.raises(ValueError):
+        h.build(h.client.runtime, nonce_byte=b"z")
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+def test_a_permit_that_expires_while_its_upload_is_staged_is_never_resent(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings, expires_at_ms=32_000)
         return [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
             (503, {}, {"error": "edge"}),
@@ -4137,10 +4229,59 @@ def test_a_staged_findings_upload_still_parks_the_row_until_startup_replay(tmp_p
     h = _handoff_coordinator(tmp_path, tail)
     start = len(h.transport.requests)
     h.coordinator.advance_disclosures()
-    (pending,) = h.client.runtime.load_pending_calls()
-    assert pending.request_operation == "upload-findings"
-    assert h.client.runtime.load_available_disclosures(now_ms=h.clock[0]).items == ()
-    for _ in range(3):
-        h.clock[0] += 2_000
-        assert h.coordinator.advance_disclosures() == 0
     assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    for _ in range(4):
+        h.clock[0] += 60_000
+        h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 2
+    _staged_upload(h)
+    with pytest.raises(ValueError, match="expired"):
+        h.build(h.client.runtime, nonce_byte=b"z")
+    assert len(h.transport.requests) - start == 2  # zero bytes on restart either
+
+
+def test_a_staged_upload_at_or_after_retention_is_never_resent_and_leaves_the_listing(tmp_path):
+    now = [2_000]
+    h = _handoff_coordinator(tmp_path, _upload_tail((503, {}, {"error": "edge"})), now=now)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    _staged_upload(h)
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    for at in (state.retention_expires_at_ms, state.retention_expires_at_ms + 120_000):
+        now[0] = at
+        assert h.coordinator.advance_disclosures() == 0
+        assert h.client.runtime.load_available_disclosures(now_ms=at).items == ()
+    assert len(h.transport.requests) - start == 2
+    _staged_upload(h)
+
+
+def test_a_staged_findings_upload_is_resent_and_never_polled_over(tmp_path):
+    edge = (503, {}, {"error": "edge"})
+    h = _handoff_coordinator(tmp_path, _upload_tail(edge, edge, edge, "receipt"))
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    assert h.client.runtime.load_available_disclosures(now_ms=h.clock[0]).items != ()
+    for _ in range(3):
+        h.clock[0] += 60_000
+        assert h.coordinator.advance_disclosures() == 1
+    assert _paths(h.transport, start) == ["disclosure-poll"] + ["result-projection"] * 4
+    assert all(request == staged for request in h.transport.requests[start + 1:])
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
+
+
+def test_a_staged_upload_is_not_resent_inside_sixty_seconds_even_in_the_fast_window(tmp_path):
+    h = _handoff_coordinator(tmp_path, _upload_tail((503, {}, {"error": "edge"}), "receipt"))
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    for step in (2_000, 30_000, 27_999):  # 59.999 s since the last attempt
+        h.clock[0] += step
+        assert h.clock[0] < state.terminal_at_ms + _TEN_MINUTES_MS
+        assert h.coordinator.advance_disclosures() == 0
+    assert len(h.transport.requests) - start == 2
+    h.clock[0] += 1
+    assert h.coordinator.advance_disclosures() == 1
+    assert h.transport.requests[-1] == staged
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
