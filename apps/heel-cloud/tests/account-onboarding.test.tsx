@@ -35,6 +35,11 @@ function json(value: unknown, status = 200): Response {
 }
 
 
+/** An obviously synthetic invitation in the control plane's exact shape (32 bytes, padded standard base64). */
+function syntheticInvitation(index: number): string {
+  return `SyntheticInvite+${String(index).padStart(4, "0")}/${"A".repeat(22)}=`;
+}
+
 function hex(value: number, length: number): string {
   return value.toString(16).padStart(length, "0");
 }
@@ -250,7 +255,7 @@ class FakeControlPlane {
       }
       if (pairingId === undefined) {
         if (method !== "POST" || body !== '{"schema_version":"heel.runner-pairing-invite.v1"}') return json({ error: "invalid", code: "invalid_runner_pairing" }, 400);
-        return json({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: `synthetic-invite-${this.next++}`, expires_at: this.invitationExpiresAt() }, 201);
+        return json({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: syntheticInvitation(this.next++), expires_at: this.invitationExpiresAt() }, 201);
       }
       const pairing = this.pairing;
       if (approve === undefined) {
@@ -2162,7 +2167,7 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
   }
 
   function expectTokenOnlyOnScreen(token: string): void {
-    expect(token).toMatch(/^synthetic-invite-/);
+    expect(token).toMatch(/^SyntheticInvite\+[0-9]{4}\/[A]{22}=$/);
     expect(globalThis.localStorage.length).toBe(0);
     expect(globalThis.sessionStorage.length).toBe(0);
     expect(nav.search).not.toContain(token);
