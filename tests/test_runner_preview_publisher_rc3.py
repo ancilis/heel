@@ -1858,13 +1858,17 @@ class DiffBoundTests(unittest.TestCase):
 
 
 class PinnedCandidateTests(unittest.TestCase):
-    def test_checkout_artifacts_and_version_sources_are_the_pinned_rc3_blobs(self):
-        self.assertEqual(sorted(os.listdir(ROOT / DOWNLOADS)), sorted(ACCEPTED_SHA256))
+    def test_fixture_artifacts_and_version_sources_are_the_pinned_rc3_blobs(self):
+        self.assertEqual(sorted(os.listdir(HISTORICAL_FIXTURE / "artifacts")), sorted(ACCEPTED_SHA256))
         for relative, blob in PINNED_BLOBS.items():
             with self.subTest(relative):
-                path = ROOT / relative
+                path = HISTORICAL_FIXTURE / FIXTURE_LAYOUT[relative]
                 self.assertFalse(path.is_symlink())
                 self.assertEqual(_git_blob_id(path.read_bytes()), blob)
+        for name in ACCEPTED_SHA256:
+            payload = (HISTORICAL_FIXTURE / "artifacts" / name).read_bytes()
+            self.assertEqual((hashlib.sha256(payload).hexdigest(), len(payload)),
+                             (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]))
         sources = {source: payload.decode("utf-8") for source, payload in CANDIDATE_SOURCES.items()}
         self.assertIn('version = "1.3.0rc3"', sources["pyproject.toml"])
         self.assertIn('requires-python = ">=3.11"', sources["pyproject.toml"])
