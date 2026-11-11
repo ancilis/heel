@@ -107,7 +107,7 @@ describe("canary activation dashboard", () => {
     render(<ActivationCard completedSteps={0} snapshot={LOCKED} />);
     expect(screen.getByText(/proof has not been checked yet/i)).toBeTruthy();
     expect(screen.getByText(/runner pairing starts after verification/i)).toBeTruthy();
-    expect(screen.getByText(/add two isolated test identities on this machine/i)).toBeTruthy();
+    expect(screen.getByText(/add two isolated test identities on the runner machine/i)).toBeTruthy();
 
     cleanup();
     render(<Runner />);
@@ -237,5 +237,79 @@ describe("active rehearsal controls", () => {
     expect(css).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)/);
     expect(css).toMatch(/@media\s*\(max-width:\s*760px\)/);
     expect(css).not.toMatch(/scroll-behavior:\s*smooth/);
+  });
+});
+
+
+// CUSTOMER-ONBOARDING-STATE: the observed journey had an active paired runner and an exact target authorization, yet
+// the card read "1/4 ready · Next action: pair runner · Ready to pair" and pointed at a runner companion that is not wired.
+describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual paired runner and authorization", () => {
+  const CLI = "./heel-rc3/bin/heel";
+
+  function stepState(activation: HTMLElement, title: string): string {
+    const step = within(activation).getAllByRole("listitem").find((item) => item.querySelector("h2")?.textContent === title);
+    return step?.querySelector(".step-state")?.textContent ?? "";
+  }
+
+  function expectNoDeadGuidance(): void {
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/companion/i);
+    expect(text).not.toMatch(/20 minutes/i);
+    expect(text).not.toMatch(/rc2/i);
+    expect(screen.queryByRole("link", { name: /open pairing guide|add access locally/i })).toBeNull();
+    expect(Array.from(document.querySelectorAll("a"), (link) => link.getAttribute("href"))).not.toContain("/runner#canary-access");
+  }
+
+  test("a paired runner authorized for the exact environment is never sent back to pairing", () => {
+    render(<ActivationCard completedSteps={2} environmentOrigin="https://staging.example.test"
+      snapshot={{ environment: "verified", runner: "paired", canaryAccess: "authorized", rehearsal: "locked" }} />);
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    expect(within(activation).getByText("2/4 ready")).toBeTruthy();
+    expect(stepState(activation, "Pair runner")).toBe("Paired");
+    expect(stepState(activation, "Add canary access")).toBe("Finish on runner");
+    const next = within(activation).getByRole("status").textContent ?? "";
+    expect(next).toMatch(/next action: finish local setup on the runner machine/i);
+    expect(next).not.toMatch(/pair runner/i);
+    expect(activation.textContent).not.toMatch(/ready to pair/i);
+    // The cloud cannot observe liveness or local credentials; it says what it knows and what the plan will confirm.
+    expect(activation.textContent).toMatch(/cannot see whether it is running right now/i);
+    expect(activation.textContent).not.toMatch(/pair (it )?again|re-pair/i);
+    expect(activation.textContent).toMatch(/Heel Cloud never receives them and cannot confirm them here/);
+    expect(activation.textContent).toMatch(/If the runner submits a valid signed plan, it appears here for review; nothing runs unless you approve it\./);
+    for (const command of [`${CLI} runner serve`, `${CLI} runner credential add --role lower_plan`, `${CLI} runner credential add --role higher_plan`,
+      `${CLI} runner import-openapi`, `${CLI} runner status`]) expect(activation.textContent).toContain(command);
+    expect(within(activation).getByText(/first useful run · 15-minute target/i)).toBeTruthy();
+    expectNoDeadGuidance();
+  });
+
+  test("a paired runner without an authorization is asked to authorize, not to pair", () => {
+    render(<ActivationCard completedSteps={2} environmentOrigin="https://staging.example.test"
+      snapshot={{ environment: "verified", runner: "paired", canaryAccess: "unauthorized", rehearsal: "locked" }} />);
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    expect(stepState(activation, "Pair runner")).toBe("Paired");
+    expect(stepState(activation, "Add canary access")).toBe("Authorize below");
+    expect(within(activation).getByRole("status").textContent).toMatch(/next action: authorize the paired runner below/i);
+    expect(activation.textContent).toMatch(/does not add or reveal any credential/i);
+    expectNoDeadGuidance();
+  });
+
+  test("an unpaired runner keeps the pairing next action without a dead guide link", () => {
+    render(<ActivationCard completedSteps={1} environmentOrigin="https://staging.example.test"
+      snapshot={{ environment: "verified", runner: "unpaired", canaryAccess: "locked", rehearsal: "locked" }} />);
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    expect(stepState(activation, "Pair runner")).toBe("Ready to pair");
+    expect(within(activation).getByRole("status").textContent).toMatch(/next action: pair runner/i);
+    expect(activation.textContent).toMatch(/create a one-time invitation on this page/i);
+    expectNoDeadGuidance();
+  });
+
+  test("legacy local-access states name the documented CLI instead of a companion", () => {
+    for (const canaryAccess of ["missing", "partial", "error"] as const) {
+      cleanup();
+      render(<ActivationCard completedSteps={2}
+        snapshot={{ environment: "verified", runner: "paired", canaryAccess, rehearsal: "locked" }} />);
+      expect(document.body.textContent, canaryAccess).toMatch(/runner (credential add|status)/);
+      expectNoDeadGuidance();
+    }
   });
 });

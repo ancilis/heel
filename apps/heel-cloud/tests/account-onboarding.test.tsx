@@ -35,6 +35,11 @@ function json(value: unknown, status = 200): Response {
 }
 
 
+/** An obviously synthetic invitation in the control plane's exact shape (32 bytes, padded standard base64). */
+function syntheticInvitation(index: number): string {
+  return `SyntheticInvite+${String(index).padStart(4, "0")}/${"A".repeat(22)}=`;
+}
+
 function hex(value: number, length: number): string {
   return value.toString(16).padStart(length, "0");
 }
@@ -75,6 +80,15 @@ class FakeControlPlane {
   readonly challenges = new Map<string, { token: string; generation: number; expired: boolean }>();
   /** Models the control plane's 15-minute owner/admin ceremony; a real login makes the session recent again. */
   recentAuth = true;
+  /** Active runners per workspace, as the binding dashboard lists them. */
+  readonly runners = new Map<string, Wire[]>();
+  /** Runner-context bindings per workspace, as the binding dashboard lists them. */
+  readonly bindings = new Map<string, Wire[]>();
+  /** One runner pairing as the real store keeps it after `heel runner pair` exchanged the invitation. */
+  pairing: { workspaceRef: string; pairingId: string; runnerId: string; phrase: string; fingerprint: string; expiresAt: number; status: "pending" | "approved" } | null = null;
+  invitationExpiresAt = () => Date.now() / 1000 + 600;
+  /** One runner-submitted rehearsal plan awaiting human approval, as the canary store keeps it; null lists none. */
+  plan: { ws: string; prj: string; runId: string; approvalId: string; hostname: string; status: string; grantId: string | null } | null = null;
 
   account(email: string, password: string, memberships: { role: Role; projects?: string[] }[]): Account {
     const account: Account = { userId: `usr_${hex(this.next++, 16)}`, email, password, memberships: [] };
@@ -222,10 +236,125 @@ class FakeControlPlane {
       }
       return json({ schema_version: "heel.verified-environment-check-result.v1", verified });
     }
-    if (method === "GET" && /\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/.test(route)) {
-      return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: [], bindings: [] });
+    const runnerRoute = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/(?:runner-pairings(?:\/(pending_[0-9a-f]{32})(\/approve)?)?|runners\/([A-Za-z0-9_-]{1,128})\/revoke)$/);
+    if (runnerRoute) {
+      const [, ws, pairingId, approve, runnerId] = runnerRoute;
+      const membership = this.session.memberships.find((item) => item.workspace_id === ws);
+      if (!this.recentAuth || membership === undefined || !["owner", "admin"].includes(membership.role)) {
+        return json({ error: "a recent owner or admin browser session is required", code: "recent_auth_required" }, 403);
+      }
+      if (runnerId !== undefined) {
+        const listed = this.runners.get(ws) ?? [];
+        const bound = this.bindings.get(ws) ?? [];
+        // Like the real store, an active runner is revocable whether or not the bindable-runner selector lists it.
+        const active = listed.some((item) => item.runner_id === runnerId)
+          || bound.some((item) => item.runner_id === runnerId && item.status === "active");
+        if (method !== "POST" || body !== '{"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}'
+          || !active) return json({ error: "invalid runner revocation", code: "invalid_runner_revocation" }, 400);
+        this.runners.set(ws, listed.filter((item) => item.runner_id !== runnerId));
+        this.bindings.set(ws, bound.map((item) => item.runner_id === runnerId ? { ...item, status: "revoked" } : item));
+        return json({ schema_version: "heel.runner-revoke-result.v1", revoked: true });
+      }
+      if (pairingId === undefined) {
+        if (method !== "POST" || body !== '{"schema_version":"heel.runner-pairing-invite.v1"}') return json({ error: "invalid", code: "invalid_runner_pairing" }, 400);
+        return json({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: syntheticInvitation(this.next++), expires_at: this.invitationExpiresAt() }, 201);
+      }
+      const pairing = this.pairing;
+      if (approve === undefined) {
+        if (method !== "GET" || pairing === null || pairing.pairingId !== pairingId || pairing.workspaceRef !== ws || pairing.status !== "pending") {
+          return json({ error: "runner pairing not found", code: "runner_pairing_not_found" }, 404);
+        }
+        return json({ schema_version: "heel.runner-pairing-view.v1", pairing_id: pairingId, runner_id: pairing.runnerId,
+          pairing_phrase: pairing.phrase, fingerprint: pairing.fingerprint, status: "pending", expires_at: pairing.expiresAt });
+      }
+      if (method !== "POST" || pairing === null || pairing.pairingId !== pairingId || pairing.workspaceRef !== ws || pairing.status !== "pending"
+        || data.pairing_phrase !== pairing.phrase || data.fingerprint !== pairing.fingerprint) {
+        return json({ error: "invalid runner pairing request", code: "invalid_runner_pairing" }, 400);
+      }
+      pairing.status = "approved";
+      return json({ schema_version: "heel.runner-pairing-approved.v1", status: "approved" });
+    }
+    const canary = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/(prj_[0-9a-f]{32})\/(?:canary-approval-requests|canary-runs\/(crun_[0-9a-f]{32})(\/approve)?)$/);
+    // Modeled only once a test seeds a plan; every other test keeps the earlier "not modeled" answer unchanged.
+    if (canary && this.plan !== null) {
+      const [, ws, prj, runId, approve] = canary;
+      const membership = this.session.memberships.find((item) => item.workspace_id === ws);
+      if (membership === undefined) return json({ error: "not a member" }, 403);
+      const plan = this.plan !== null && this.plan.ws === ws && this.plan.prj === prj ? this.plan : null;
+      if (runId === undefined) {
+        if (method !== "GET") return json({ error: "not found" }, 404);
+        return json({ schema_version: "heel.canary-approval-request-list.v1", server_time_ms: 1, has_more: false,
+          requests: plan === null || plan.status !== "awaiting_execution_approval" ? [] : [planRequestWire(plan)] });
+      }
+      if (plan === null || plan.runId !== runId) return json({ error: "run not found", code: "canary_run_not_found" }, 404);
+      if (approve === undefined) {
+        if (method !== "GET") return json({ error: "not found" }, 404);
+        return json(runDashboardWire(plan));
+      }
+      if (method !== "POST") return json({ error: "not found" }, 404);
+      // Like the real route: a valid but stale owner session is refused with the exact code; a role that may never
+      // approve is an ordinary denial without it. Neither changes the plan or issues a grant.
+      if (!["owner", "admin"].includes(membership.role)) return json({ error: "insufficient role" }, 403);
+      if (!this.recentAuth) return json({ error: "a recent owner or admin browser session is required", code: "recent_auth_required" }, 403);
+      if (plan.status !== "awaiting_execution_approval" || data.hostname_retype !== plan.hostname
+        || data.projection_digest !== "a".repeat(64)) return json({ error: "invalid approval", code: "invalid_canary_approval" }, 400);
+      plan.status = "running";
+      plan.grantId = `cgr_${"1".repeat(32)}`;
+      return json(approvedWire(plan, String(data.reason), this.session.userId), 201);
+    }
+    const bindingsRoute = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/);
+    if (method === "GET" && bindingsRoute) {
+      return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: this.runners.get(bindingsRoute[1]) ?? [], bindings: this.bindings.get(bindingsRoute[1]) ?? [] });
     }
     return json({ error: "not modeled" }, 503);
+  };
+}
+
+
+type PlanState = NonNullable<FakeControlPlane["plan"]>;
+
+/** The pending request list entry for a plan; its summary is what the approval dialog shows. */
+function planRequestWire(plan: PlanState): Wire {
+  return {
+    approval_id: plan.approvalId, run_id: plan.runId, projection_digest: "a".repeat(64), status: "awaiting_execution_approval",
+    submitted_at_ms: 1, expires_at_ms: 4_000_000_000_000, origin: `https://${plan.hostname}`, hostname: plan.hostname,
+    routes: ["GET /account"], scenarios: ["anonymous_read"], request_budget: 12, duration_seconds: 45, egress: `${plan.hostname}:443`,
+  };
+}
+
+function runDashboardWire(plan: PlanState): Wire {
+  return {
+    schema_version: "heel.canary-run-dashboard.v1", approval_control_generation: 3,
+    run: {
+      schema_version: "heel.canary-run-status.v1", run_id: plan.runId, approval_id: plan.approvalId, grant_id: plan.grantId,
+      status: plan.status, execution_disposition: null, error_category: "none", stop_reason: "none", source_event_sequence: -1,
+      quota_state: plan.grantId === null ? "unreserved" : "reserved", kill_switch_generation: 0, stop_generation: 0,
+      stop_deadline_ms: null, stop_acknowledged_at_ms: null, stop_ack_late: false,
+    },
+    progress: {
+      schema_version: "heel.canary-run-progress.v1", available: false, current_scenario_id: null, scenarios_completed: null,
+      scenarios_total: null, requests_started: null, requests_completed: null, remaining_requests: null, remaining_wall_ms: null,
+      retries_used: null, redaction_count: null, local_result_ready: false,
+    },
+  };
+}
+
+/** A synthetic `heel.execution-approved.v1` in the shape the client validates; never a real signed grant. */
+function approvedWire(plan: PlanState, reason: string, userId: string): Wire {
+  return {
+    schema_version: "heel.execution-approved.v1", run_id: plan.runId, grant_id: plan.grantId, reservation_id: `res_${"2".repeat(32)}`,
+    grant: {
+      schema_version: "heel.execution-grant.v1", grant_id: plan.grantId, run_id: plan.runId, workspace_id: plan.ws, project_id: plan.prj,
+      approval: { projection_id: plan.approvalId, projection_digest: "a".repeat(64), manifest_digest: "b".repeat(64) },
+      environment: { environment_id: `env_${"3".repeat(32)}`, origin: `https://${plan.hostname}`, environment_class: "staging", verification_record_digest: "c".repeat(64) },
+      runner_binding: { runner_id: "runner-a", runner_key_id: "key-a", public_key_digest: "d".repeat(64) },
+      approval_actor: { user_id: userId, role: "owner" }, approval_reason: reason, consented_at_ms: 1,
+      budgets: { maximum_requests: 12, maximum_concurrency: 1, action_timeout_ms: 5000, wall_timeout_ms: 45000, maximum_response_bytes: 262144 },
+      egress: { hostname: plan.hostname, port: 443, redirect_policy: "deny" },
+      retry_policy: { maximum_retries: 0, retryable_failure_codes: [] }, grant_nonce: "nonce_0123456789abcdef", kill_switch_generation: 0,
+      operational_receipt_policy: { schema_version: "heel.operational-run-projection.v1", maximum_bytes: 32768, allowed_error_categories: ["none"], allowed_stop_reasons: ["none"], allowed_containment_codes: ["admitted"] },
+      issued_at_ms: 1, expires_at_ms: 60_001, grant_digest: "e".repeat(64), signing_key_id: "cloud_0123456789abcdef", signature_b64: "A".repeat(86) + "==",
+    },
   };
 }
 
@@ -1692,7 +1821,9 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     alphaBetaBindings("create");
     render(<Dashboard />);
     await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
-    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent).toBe(BOUNDARY);
+    // An account with a private connector is told how authorization and local credentials differ, not that they are unavailable.
+    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent)
+      .toMatch(/^Target verified\. Managed scanning and discovery are not available in this build\. Target authorization is separate from test credentials:/);
     const activation = screen.getByRole("region", { name: /launch activation/i });
     expect(within(activation).getAllByRole("listitem").map((step) => step.querySelector("h2")?.textContent))
       .toEqual(["Verify staging", "Pair runner", "Add canary access", "Run first rehearsal"]);
@@ -2052,4 +2183,545 @@ describe("CUSTOMER-TRACK-UX-F1: a pending ownership proof survives a reload and 
       expectNoSecretLeak();
     });
   }
+});
+
+
+
+// SEAM (CUSTOMER-LOCAL-PAIRING-UI): the in-memory control plane models the existing invite/inspect/approve and runner
+// revoke routes with their exact bodies, the 15-minute owner/admin ceremony and the runner list. This is local
+// synthetic evidence of the dashboard state machine and its use of the real client, never deployed-journey proof.
+describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local runner from the dashboard", () => {
+  const TARGET = "https://staging.customer.example.test";
+  const PHRASE = "amber birch cedar delta ember frost";
+  const FINGERPRINT = "f".repeat(64);
+  const PAIRING_ID = `pending_${"1".repeat(32)}`;
+  const RECENT_AUTH = "For your security, pairing or revoking a runner needs an owner or admin sign-in from the last 15 minutes. Sign out, sign in again, then create a new invitation.";
+  const PAIRING_UNCONFIGURED = "Runner pairing is unavailable: this dashboard's public address is not configured, so no pair command can be shown. No invitation was created; contact your Heel operator.";
+  const GONE = "That pairing request is no longer available: it expired, was already used, or belongs to another workspace. Create a new invitation and run the pair command again.";
+
+  beforeEach(() => { vi.stubEnv("HEEL_PUBLIC_ORIGIN", "https://heel.example"); });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  function verifiedOwner(role: Role = "owner", projects = ["Customer staging"]): { ws: string; prj: string; prj2: string } {
+    const account = server.account(EMAIL, SECRET, [{ role, projects }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const listed = server.projects.get(ws) ?? [];
+    for (const project of listed) {
+      server.environments.set(`${ws}/${project.project_ref as string}`, [environmentWire(`env_${hex(server.next++, 32)}`, TARGET, "https-file", true)]);
+    }
+    nav.search = `workspace=${ws}&project=${listed[0].project_ref as string}`;
+    return { ws, prj: listed[0].project_ref as string, prj2: (listed[1]?.project_ref as string | undefined) ?? "" };
+  }
+
+  function runnerWire(n: string): Wire {
+    return { runner_id: `runner-${n}`, runner_key_id: `key-${n}`, display_name: `Laptop ${n}`, fingerprint: n.repeat(64), runner_version: "1.3.0rc2", adapter_versions: [], status: "active" };
+  }
+
+  function exchange(ws: string, expiresAt = Date.now() / 1000 + 600): void {
+    server.pairing = { workspaceRef: ws, pairingId: PAIRING_ID, runnerId: "runner-a", phrase: PHRASE, fingerprint: FINGERPRINT, expiresAt, status: "pending" };
+  }
+
+  function runnerCalls(mark: number): string[] {
+    return server.calls.slice(mark).filter((call) => /\/runner-pairings|\/runners\//.test(call.path))
+      .map((call) => `${call.method} ${call.path.replace(/^\/api\/control-plane\/v1\/workspaces\/ws_[0-9a-f]{16}/, "")} ${call.body}`.trim());
+  }
+
+  async function pairCard(): Promise<HTMLElement> {
+    return screen.findByRole("region", { name: "Pair a runner" });
+  }
+
+  async function createInvitation(): Promise<string> {
+    const card = await pairCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Create pairing invitation" }));
+    const group = await within(card).findByRole("group", { name: "Runner pairing invitation" });
+    const command = within(group).getByText(/heel runner pair --origin/).textContent ?? "";
+    return command.split("--invite ")[1] ?? "";
+  }
+
+  async function openPairing(): Promise<HTMLElement> {
+    const card = await pairCard();
+    fireEvent.change(within(card).getByRole("textbox", { name: "Pairing id from your terminal" }), { target: { value: ` ${PAIRING_ID} ` } });
+    fireEvent.click(within(card).getByRole("button", { name: "Open pairing request" }));
+    return within(card).findByRole("group", { name: "Pending runner pairing" });
+  }
+
+  function expectTokenOnlyOnScreen(token: string): void {
+    expect(token).toMatch(/^SyntheticInvite\+[0-9]{4}\/[A]{22}=$/);
+    expect(globalThis.localStorage.length).toBe(0);
+    expect(globalThis.sessionStorage.length).toBe(0);
+    expect(nav.search).not.toContain(token);
+    expect(nav.replace.mock.calls.flat().join(" ")).not.toContain(token);
+    expect(consoleOutput.join("\n")).not.toContain(token);
+  }
+
+  test("only an owner or admin with a verified target and no runner is offered pairing", async () => {
+    verifiedOwner("member");
+    render(<Dashboard />);
+    await screen.findByRole("region", { name: "Your target" });
+    await settle();
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+
+    cleanup();
+    server.session = server.account("unverified@example.test", SECRET, [{ role: "owner", projects: ["Fresh"] }]);
+    nav.search = "";
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Add target" });
+    await settle();
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    expect(document.body.textContent).not.toContain("No customer-target pairing command is available");
+  });
+
+  test("a verified owner creates a one-time invitation, compares the words and approves only on an explicit match", async () => {
+    const { ws } = verifiedOwner();
+    render(<Dashboard />);
+    const card = await pairCard();
+    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc3\/heel_sim-1\.3\.0rc3-py3-none-any\.whl#sha256=0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca' && \.\/heel-rc3\/bin\/heel --version$/)).toBeTruthy();
+    expect((within(card).getByRole("link", { name: "Heel 1.3.0rc3 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc3");
+    expect(within(card).queryByRole("textbox", { name: /credential|secret|password|token/i })).toBeNull();
+    const mark = server.calls.length;
+
+    const token = await createInvitation();
+    expect(within(card).getByText(`./heel-rc3/bin/heel runner pair --origin https://heel.example --invite ${token}`)).toBeTruthy();
+    expect(card.textContent).not.toContain("<dashboard-origin>");
+    expect(within(card).getByText(/before \d{1,2}:\d{2}/)).toBeTruthy();
+    expectTokenOnlyOnScreen(token);
+
+    exchange(ws);
+    const pending = await openPairing();
+    expect(within(pending).getByText(PHRASE)).toBeTruthy();
+    expect(within(pending).getByText(FINGERPRINT)).toBeTruthy();
+    // The invitation was consumed by the runner's exchange and is not shown again.
+    expect(document.body.textContent).not.toContain(token);
+
+    const approve = within(pending).getByRole("button", { name: "Approve this runner" }) as HTMLButtonElement;
+    const words = within(pending).getByRole("textbox", { name: "Type the six words shown in your terminal" });
+    const fingerprint = within(pending).getByRole("checkbox", { name: /fingerprint in my terminal/ });
+    expect(approve.disabled).toBe(true);
+    fireEvent.change(words, { target: { value: "amber birch cedar delta ember glade" } });
+    fireEvent.click(fingerprint);
+    expect(within(pending).getByRole("alert").textContent).toMatch(/do not match/);
+    expect(approve.disabled).toBe(true);
+    fireEvent.click(approve);
+    await settle();
+    fireEvent.change(words, { target: { value: ` AMBER birch  cedar delta ember frost ` } });
+    fireEvent.click(fingerprint);
+    expect(approve.disabled).toBe(true);
+    fireEvent.click(approve);
+    await settle();
+    expect(runnerCalls(mark).filter((call) => call.includes("/approve"))).toEqual([]);
+
+    fireEvent.click(fingerprint);
+    expect(approve.disabled).toBe(false);
+    fireEvent.click(approve);
+    await within(pending).findByText(/^Runner approved\./);
+    expect(runnerCalls(mark)).toEqual([
+      'POST /runner-pairings {"schema_version":"heel.runner-pairing-invite.v1"}',
+      `GET /runner-pairings/${PAIRING_ID}`,
+      `POST /runner-pairings/${PAIRING_ID}/approve {"fingerprint":"${FINGERPRINT}","pairing_phrase":"${PHRASE}","schema_version":"heel.runner-pairing-approve.v1"}`,
+    ]);
+    expect(server.pairing?.status).toBe("approved");
+
+    // The runner activates on its own machine; the existing context-binding flow then takes over.
+    server.runners.set(ws, [runnerWire("a")]);
+    fireEvent.click(within(pending).getByRole("button", { name: "Refresh paired runners" }));
+    await screen.findByRole("button", { name: "Authorize paired runner" });
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    expectTokenOnlyOnScreen(token);
+    expectNoSecretLeak();
+  });
+
+  test("an approval the server refuses, an unknown request and an expired request all fail closed", async () => {
+    const { ws } = verifiedOwner();
+    render(<Dashboard />);
+    await createInvitation();
+    let pending = await openPairing().catch(() => null);
+    expect(pending).toBeNull();
+    expect(await screen.findByText(GONE)).toBeTruthy();
+
+    exchange(ws);
+    pending = await openPairing();
+    server.pairing = { ...server.pairing!, phrase: "other other other other other other" };
+    fireEvent.change(within(pending).getByRole("textbox", { name: "Type the six words shown in your terminal" }), { target: { value: PHRASE } });
+    fireEvent.click(within(pending).getByRole("checkbox", { name: /fingerprint in my terminal/ }));
+    fireEvent.click(within(pending).getByRole("button", { name: "Approve this runner" }));
+    await screen.findByText(GONE);
+    expect(screen.queryByRole("group", { name: "Pending runner pairing" })).toBeNull();
+    expect(server.pairing?.status).toBe("pending");
+
+    exchange(ws, Date.now() / 1000 - 1);
+    const expired = await openPairing();
+    expect(within(expired).getByText(/This pairing request expired\./)).toBeTruthy();
+    expect(within(expired).queryByRole("button", { name: "Approve this runner" })).toBeNull();
+  });
+
+  test("an invitation that has already expired is never shown as runnable", async () => {
+    verifiedOwner();
+    server.invitationExpiresAt = () => Date.now() / 1000 - 1;
+    render(<Dashboard />);
+    const card = await pairCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Create pairing invitation" }));
+    await within(card).findByText(/This invitation expired/);
+    expect(within(card).queryByText(/--invite/)).toBeNull();
+    expect(within(card).getByRole("button", { name: "Create pairing invitation" })).toBeTruthy();
+  });
+
+  test("a session without a recent owner sign-in gets an actionable re-auth message and no command", async () => {
+    verifiedOwner();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    const card = await pairCard();
+    fireEvent.click(within(card).getByRole("button", { name: "Create pairing invitation" }));
+    await screen.findByText(RECENT_AUTH);
+    expect(within(card).queryByText(/--invite/)).toBeNull();
+  });
+
+  test("a lost session while opening a request signs out instead of showing pairing state", async () => {
+    const { ws } = verifiedOwner();
+    render(<Dashboard />);
+    await createInvitation();
+    exchange(ws);
+    server.session = null;
+    const card = await pairCard();
+    fireEvent.change(within(card).getByRole("textbox", { name: "Pairing id from your terminal" }), { target: { value: PAIRING_ID } });
+    fireEvent.click(within(card).getByRole("button", { name: "Open pairing request" }));
+    await screen.findByText("Sign in to continue.");
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    expect(document.body.textContent).not.toContain(PHRASE);
+  });
+
+  test("switching project clears the invitation and the opened request", async () => {
+    const { ws, prj2 } = verifiedOwner("owner", ["Customer staging", "Second staging"]);
+    render(<Dashboard />);
+    const token = await createInvitation();
+    exchange(ws);
+    await openPairing();
+    expect(document.body.textContent).toContain(PHRASE);
+    fireEvent.change(screen.getByRole("combobox", { name: /project/i }), { target: { value: prj2 } });
+    await waitFor(() => expect(nav.search).toContain(prj2));
+    const card = await pairCard();
+    await settle();
+    expect(document.body.textContent).not.toContain(PHRASE);
+    expect(document.body.textContent).not.toContain(token);
+    expect(within(card).queryByRole("group")).toBeNull();
+    expect((within(card).getByRole("textbox", { name: "Pairing id from your terminal" }) as HTMLInputElement).value).toBe("");
+  });
+
+  test("revoking a paired runner needs a second click, posts the exact route and refreshes the list", async () => {
+    const { ws } = verifiedOwner();
+    server.runners.set(ws, [runnerWire("a"), runnerWire("b")]);
+    render(<Dashboard />);
+    const list = await screen.findByRole("list", { name: "Paired runners" });
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    const mark = server.calls.length;
+    const first = within(list).getAllByRole("listitem")[0];
+    fireEvent.click(within(first).getByRole("button", { name: "Revoke runner" }));
+    fireEvent.click(within(first).getByRole("button", { name: "Keep runner" }));
+    await settle();
+    expect(runnerCalls(mark)).toEqual([]);
+    fireEvent.click(within(first).getByRole("button", { name: "Revoke runner" }));
+    fireEvent.click(within(first).getByRole("button", { name: "Confirm revoke Laptop a" }));
+    await screen.findByText(/^Runner revoked\./);
+    expect(runnerCalls(mark)).toEqual([
+      'POST /runners/runner-a/revoke {"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}',
+    ]);
+    expect(within(screen.getByRole("list", { name: "Paired runners" })).getAllByRole("listitem").map((item) => item.querySelector("span")?.textContent))
+      .toEqual([`Laptop b · ${"b".repeat(12)}`]);
+
+    const second = within(screen.getByRole("list", { name: "Paired runners" })).getAllByRole("listitem")[0];
+    fireEvent.click(within(second).getByRole("button", { name: "Revoke runner" }));
+    fireEvent.click(within(second).getByRole("button", { name: "Confirm revoke Laptop b" }));
+    // With no runner left, the workspace can pair a fresh one.
+    await pairCard();
+  });
+
+  function bindingWire(n: string, runnerId: string, status: "active" | "revoked" | "expired", expiresAtMs = Date.now() + 3_600_000): Wire {
+    return { binding_id: `rcb_${n.repeat(32)}`, binding_digest: n.repeat(64), environment_id: `env_${n.repeat(32)}`, origin: TARGET,
+      environment_class: "staging", verification_record_digest: "a".repeat(64), runner_id: runnerId, runner_key_id: `key-${runnerId}`,
+      status, issued_at_ms: 1, expires_at_ms: expiresAtMs, first_claimed_at_ms: null };
+  }
+
+  function revokeTarget(ws: string, prj: string): void {
+    const [record] = server.environments.get(`${ws}/${prj}`) ?? [];
+    server.environments.set(`${ws}/${prj}`, [{ ...record, status: "revoked", revoked_at: 2, is_executable: false }]);
+  }
+
+  async function revokeBoundRunner(ws: string): Promise<void> {
+    const list = await screen.findByRole("list", { name: "Paired runners" });
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    const mark = server.calls.length;
+    const [item] = within(list).getAllByRole("listitem");
+    expect(item.querySelector("span")?.textContent).toBe("runner-a");
+    fireEvent.click(within(item).getByRole("button", { name: "Revoke runner" }));
+    fireEvent.click(within(item).getByRole("button", { name: "Confirm revoke runner-a" }));
+    await screen.findByText(/^Runner revoked\./);
+    expect(runnerCalls(mark)).toEqual([
+      'POST /runners/runner-a/revoke {"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}',
+    ]);
+    // The list was refreshed from the server: the binding is now revoked and no runner remains to revoke.
+    expect(server.calls.slice(mark).filter((call) => call.method === "GET" && call.path.endsWith("/runner-context-bindings")).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("list", { name: "Paired runners" })).toBeNull();
+    expect((server.bindings.get(ws) ?? []).map((item) => item.status)).toEqual(["revoked"]);
+  }
+
+  test("R1 D2 (i): a runner hidden from the bindable list by its active binding stays revocable and blocks a second pairing", async () => {
+    const { ws } = verifiedOwner();
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "active")]);
+    render(<Dashboard />);
+    await revokeBoundRunner(ws);
+    // With the only runner revoked, the workspace can pair a fresh one.
+    await pairCard();
+  });
+
+  test("R1 D2 (ii): runner revoke stays reachable when the project has no executable target", async () => {
+    const { ws, prj } = verifiedOwner();
+    revokeTarget(ws, prj);
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "active")]);
+    render(<Dashboard />);
+    await screen.findByText("Ready for customer setup");
+    await settle();
+    expect(screen.queryByRole("button", { name: "Authorize paired runner" })).toBeNull();
+    await revokeBoundRunner(ws);
+    // Pairing still needs a verified target.
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+  });
+
+  test("R1 D2 (iii): only revoked or expired bindings offer pairing and no runner revoke", async () => {
+    const { ws } = verifiedOwner();
+    server.bindings.set(ws, [
+      bindingWire("1", "runner-a", "revoked"),
+      bindingWire("2", "runner-b", "expired"),
+      bindingWire("3", "runner-c", "active", Date.now() - 1),
+    ]);
+    render(<Dashboard />);
+    await pairCard();
+    await settle();
+    expect(screen.queryByRole("list", { name: "Paired runners" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Revoke runner" })).toBeNull();
+  });
+
+  test("R1 origin: with no valid configured public origin no pair command or invitation is offered", async () => {
+    for (const configured of ["", "http://heel.example", "https://heel.example/", "https://localhost"]) {
+      cleanup();
+      server = new FakeControlPlane();
+      vi.stubGlobal("fetch", server.fetch);
+      vi.stubEnv("HEEL_PUBLIC_ORIGIN", configured);
+      verifiedOwner();
+      render(<Dashboard />);
+      const card = await pairCard();
+      const mark = server.calls.length;
+      expect(within(card).getByRole("status").textContent, configured).toBe(PAIRING_UNCONFIGURED);
+      expect(within(card).queryByRole("button", { name: "Create pairing invitation" }), configured).toBeNull();
+      expect(card.textContent, configured).not.toMatch(/--origin|--invite|<dashboard-origin>/);
+      await settle();
+      expect(runnerCalls(mark), configured).toEqual([]);
+    }
+  });
+
+  // CUSTOMER-ONBOARDING-STATE: the live journey's state. The bound runner is absent from the bindable list (the
+  // server omits a runner while it is bound); its active binding names the project's exact verified environment.
+  const CONNECTOR_BOUNDARY = "Target verified. Managed scanning and discovery are not available in this build. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
+
+  function exactEnvironment(ws: string, prj: string, n: string): void {
+    server.environments.set(`${ws}/${prj}`, [environmentWire(`env_${n.repeat(32)}`, TARGET, "https-file", true)]);
+  }
+
+  async function activationState(): Promise<{ meter: string; next: string; runner: string; access: string; text: string }> {
+    const activation = await screen.findByRole("region", { name: /launch activation/i });
+    await settle();
+    const state = (title: string) => within(activation).getAllByRole("listitem")
+      .find((item) => item.querySelector("h2")?.textContent === title)?.querySelector(".step-state")?.textContent ?? "";
+    return {
+      meter: activation.querySelector(".activation-meter")?.getAttribute("aria-label") ?? "",
+      next: within(activation).getByRole("status").textContent ?? "",
+      runner: state("Pair runner"), access: state("Add canary access"), text: activation.textContent ?? "",
+    };
+  }
+
+  test("ONBOARDING-STATE: a bound runner and its exact active binding read paired and authorized, never pair runner", async () => {
+    const { ws, prj } = verifiedOwner();
+    exactEnvironment(ws, prj, "1");
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "active")]);
+    render(<Dashboard />);
+    const state = await activationState();
+    expect(state.meter).toBe("2 of 4 setup steps complete");
+    expect(state.runner).toBe("Paired");
+    expect(state.access).toBe("Finish on runner");
+    expect(state.next).toMatch(/next action: finish local setup on the runner machine/i);
+    expect(state.next).not.toMatch(/pair runner/i);
+    expect(state.text).not.toMatch(/ready to pair|companion|20 minutes|rc2/i);
+    // Local credential readiness is never asserted by the cloud.
+    expect(state.text).not.toMatch(/credentials (are )?ready|access is ready/i);
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent).toBe(CONNECTOR_BOUNDARY);
+    expect(screen.getByText(/already authorized and listed below/i)).toBeTruthy();
+    // Revocation and the authorization controls are unchanged.
+    expect(screen.getByRole("button", { name: "Authorize paired runner" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke runner" })).toBeTruthy();
+  });
+
+  test("ONBOARDING-STATE: a paired runner without an authorization is asked to authorize, not to pair", async () => {
+    const { ws, prj } = verifiedOwner();
+    exactEnvironment(ws, prj, "1");
+    server.runners.set(ws, [runnerWire("a")]);
+    render(<Dashboard />);
+    const state = await activationState();
+    expect(state.meter).toBe("2 of 4 setup steps complete");
+    expect(state.runner).toBe("Paired");
+    expect(state.access).toBe("Authorize below");
+    expect(state.next).toMatch(/next action: authorize the paired runner below/i);
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+  });
+
+  test("ONBOARDING-STATE: an active binding for another environment or proof does not count as this target's authorization", async () => {
+    for (const binding of [bindingWire("2", "runner-a", "active"), { ...bindingWire("1", "runner-a", "active"), verification_record_digest: "b".repeat(64) }]) {
+      cleanup();
+      server = new FakeControlPlane();
+      vi.stubGlobal("fetch", server.fetch);
+      const { ws, prj } = verifiedOwner();
+      exactEnvironment(ws, prj, "1");
+      server.bindings.set(ws, [binding]);
+      render(<Dashboard />);
+      const state = await activationState();
+      expect(state.runner).toBe("Paired");
+      expect(state.access).toBe("Authorize below");
+      expect(state.next).toMatch(/next action: authorize the paired runner below/i);
+    }
+  });
+
+  test("ONBOARDING-STATE: only revoked or expired bindings read unpaired with the pairing next action", async () => {
+    const { ws, prj } = verifiedOwner();
+    exactEnvironment(ws, prj, "1");
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "revoked"), bindingWire("1", "runner-b", "expired"),
+      bindingWire("1", "runner-c", "active", Date.now() - 1)]);
+    render(<Dashboard />);
+    const state = await activationState();
+    expect(state.meter).toBe("1 of 4 setup steps complete");
+    expect(state.runner).toBe("Ready to pair");
+    expect(state.access).toBe("After pairing");
+    expect(state.next).toMatch(/next action: pair runner/i);
+    await pairCard();
+  });
+});
+
+
+// SEAM (CUSTOMER-RECENT-AUTH-RECOVERY): the in-memory control plane models the pending approval list, run status and
+// approve route with the real 15-minute owner/admin ceremony. Local synthetic evidence of the dashboard's recovery from
+// an exact `recent_auth_required` refusal, never deployed-journey proof; the server-side guard itself is unchanged.
+describe("CUSTOMER-RECENT-AUTH-RECOVERY: a stale sign-in at rehearsal approval gets an actionable re-auth path", () => {
+  const HOST = "staging.customer.example.test";
+  const RUN = `crun_${"7".repeat(32)}`;
+  const RECENT_AUTH = "For your security, approving a rehearsal needs an owner or admin sign-in from the last 15 minutes. Nothing was approved or run, and the plan is kept on the server: sign in again, then review the exact plan and approve it.";
+  const REAUTH_SIGN_IN = "Sign in again to return to this project. Nothing was approved or run; review the exact plan again before approving it.";
+
+  function ownerWithPlan(role: Role = "owner"): { ws: string; prj: string; prj2: string } {
+    const account = server.account(EMAIL, SECRET, [{ role, projects: ["First staging", "Customer staging"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const listed = server.projects.get(ws) ?? [];
+    const prj = listed[1].project_ref as string;
+    server.environments.set(`${ws}/${prj}`, [environmentWire(`env_${hex(server.next++, 32)}`, `https://${HOST}`, "https-file", true)]);
+    server.plan = { ws, prj, runId: RUN, approvalId: `cap_${"4".repeat(32)}`, hostname: HOST, status: "awaiting_execution_approval", grantId: null };
+    // The plan belongs to the second project, so landing back on it after re-auth is the restored context, not a default.
+    nav.search = `workspace=${ws}&project=${prj}`;
+    return { ws, prj, prj2: listed[0].project_ref as string };
+  }
+
+  function approvals(mark = 0): string[] {
+    return server.calls.slice(mark).filter((call) => call.method === "POST" && call.path.endsWith("/approve")).map((call) => call.path);
+  }
+
+  async function reviewAndApprove(reason: string): Promise<void> {
+    fireEvent.click(await screen.findByRole("button", { name: "Review exact plan" }));
+    const dialog = await screen.findByRole("dialog", { name: /approve one rehearsal/i });
+    fireEvent.change(within(dialog).getByLabelText(/retype exact hostname/i), { target: { value: HOST } });
+    fireEvent.change(within(dialog).getByLabelText(/reason for this rehearsal/i), { target: { value: reason } });
+    fireEvent.click(within(dialog).getByRole("button", { name: /approve and run/i }));
+  }
+
+  test("the exact recent_auth_required refusal explains re-auth, keeps the plan pending and approves nothing", async () => {
+    ownerWithPlan();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await screen.findByText(RECENT_AUTH);
+    expect(approvals()).toHaveLength(1);
+    expect(screen.queryByRole("dialog", { name: /approve one rehearsal/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Sign in again" })).toBeTruthy();
+    // Still signed in on the same project; the server guard was not satisfied or refreshed silently.
+    expect(server.session).not.toBeNull();
+    expect(server.recentAuth).toBe(false);
+    expect(server.plan).toMatchObject({ status: "awaiting_execution_approval", grantId: null });
+    await settle();
+    // The notice survives rediscovery of the still-pending plan; nothing is retried on its own.
+    expect(screen.getByText(RECENT_AUTH)).toBeTruthy();
+    expect(approvals()).toHaveLength(1);
+    expectNoSecretLeak();
+  });
+
+  test("an ordinary 403 denial at approval is not presented as an expired sign-in", async () => {
+    ownerWithPlan("member");
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await waitFor(() => expect(approvals()).toHaveLength(1));
+    await settle();
+    expect(screen.queryByText(RECENT_AUTH)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+    expect(screen.queryByText(REAUTH_SIGN_IN)).toBeNull();
+    expect(server.session).not.toBeNull();
+    expect(server.plan).toMatchObject({ status: "awaiting_execution_approval", grantId: null });
+  });
+
+  test("signing in again restores the project and plan but approval needs a fresh explicit review", async () => {
+    const { ws, prj } = ownerWithPlan();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await screen.findByText(RECENT_AUTH);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+    await screen.findByText(REAUTH_SIGN_IN);
+    expect(server.session).toBeNull();
+    expect(nav.search).toBe("");
+    await signInFromSignedOut(EMAIL, SECRET);
+    // The same workspace and project are back from the normal read models, with the plan still pending.
+    await waitFor(() => expect(nav.search).toBe(`workspace=${ws}&project=${prj}`));
+    expect(projectSelect().value).toBe(prj);
+    const mark = server.calls.length;
+    await screen.findByRole("button", { name: "Review exact plan" });
+    await settle();
+    // No automatic re-approval: the dialog is closed, nothing was posted and the run has no grant.
+    expect(screen.queryByRole("dialog", { name: /approve one rehearsal/i })).toBeNull();
+    expect(approvals(mark)).toEqual([]);
+    expect(server.plan).toMatchObject({ status: "awaiting_execution_approval", grantId: null });
+
+    // The reopened dialog starts empty: the hostname and reason must be given again.
+    fireEvent.click(screen.getByRole("button", { name: "Review exact plan" }));
+    const dialog = await screen.findByRole("dialog", { name: /approve one rehearsal/i });
+    expect((within(dialog).getByLabelText(/retype exact hostname/i) as HTMLInputElement).value).toBe("");
+    expect((within(dialog).getByLabelText(/reason for this rehearsal/i) as HTMLTextAreaElement).value).toBe("");
+    expect((within(dialog).getByRole("button", { name: /approve and run/i }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await reviewAndApprove("Second, reviewed approval");
+    await waitFor(() => expect(server.plan?.status).toBe("running"));
+    expect(approvals(mark)).toEqual([`/api/control-plane/v1/workspaces/${ws}/projects/${prj}/canary-runs/${RUN}/approve`]);
+    const sent = server.calls.filter((call) => call.method === "POST" && call.path.endsWith("/approve")).at(-1);
+    expect(JSON.parse(sent?.body ?? "{}")).toMatchObject({ hostname_retype: HOST, reason: "Second, reviewed approval" });
+    expect(screen.queryByText(RECENT_AUTH)).toBeNull();
+    expectNoSecretLeak();
+  });
+
+  test("an ordinary sign-out after the recovery offer does not carry the project into the next sign-in", async () => {
+    const { prj, prj2 } = ownerWithPlan();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await screen.findByText(RECENT_AUTH);
+    fireEvent.click(signOutButton());
+    await screen.findByText(/You signed out\. Sign in again to continue\./);
+    await signInFromSignedOut(EMAIL, SECRET);
+    await waitFor(() => expect(nav.search).toContain(prj2));
+    expect(projectSelect().value).not.toBe(prj);
+  });
 });

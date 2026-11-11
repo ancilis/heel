@@ -145,6 +145,14 @@ const RUNBOOK_INSTALL = readFileSync(
   resolve(process.cwd(), "../../docs/RUNNER_PREVIEW_RELEASE_RC2.md"),
   "utf8",
 ).match(/## Customer install command[\s\S]*?```sh\n(.*)\n```/)?.[1];
+// The final 1.3.0rc3 runner install for the paired-runner surfaces (/runner and the dashboard pairing card), verbatim
+// from docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca. That runbook is not in this tree, and its command may be deployed
+// only after the release owner's anonymous verify-public for v1.3.0rc3 passes. /agent and the docs above stay on rc2.
+const RC3_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc3";
+const RC3_INSTALL =
+  "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install " +
+  "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256=0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca'" +
+  " && ./heel-rc3/bin/heel --version";
 const STALE_GITHUB_CLAIMS =
   /unreleased 1\.3\.0rc1|1\.3\.0rc1[^.]*(unreleased|not yet published)|planned but not yet published|prerelease URL is not publicly verified/i;
 // Claims that the now-public 1.3.0rc2 prerelease is unpublished, or that a one-command install is
@@ -186,6 +194,13 @@ describe("Heel anonymous launch review", () => {
 
     expect(container.textContent).toMatch(/product description stays in this browser/i);
     expect(container.textContent).not.toMatch(/sign up to review|customer count|accuracy rate|testimonial/i);
+  });
+
+  test("offers a plain account entry to verified staging setup, separate from the local static review", () => {
+    render(<Home />);
+    const entry = screen.getByRole("link", { name: "create an account or sign in" });
+    expect(entry.getAttribute("href")).toBe("/dashboard");
+    expect(entry.closest("p")?.textContent).toBe("The review above is static analysis in this browser and never contacts your product. To verify a staging target you own and pair a local runner, create an account or sign in.");
   });
 
   test("runs the committed sample through the background browser client", async () => {
@@ -309,16 +324,18 @@ describe("Heel anonymous launch review", () => {
     render(<Runner />);
     const text = document.body.textContent ?? "";
 
-    expect(text).toContain(PUBLIC_INSTALL);
+    expect(text).toContain(RC3_INSTALL);
+    expect(text).not.toContain(PUBLIC_INSTALL);
+    expect(text).not.toContain("heel-rc2/");
     expect(text).toContain('export HEEL_HOME="$(pwd -P)/.heel"');
     expect(text).not.toContain('"$PWD/.heel"');
-    expect(text).toContain("./heel-rc2/bin/heel scope create --target reference:export");
+    expect(text).toContain("./heel-rc3/bin/heel scope create --target reference:export");
     expect(text).toContain("--case vulnerable --attempt 11111111111111111111111111111111");
     expect(text).toContain("--case public --attempt 22222222222222222222222222222222");
     expect(text).not.toContain("--case hardened");
     expect(text).toMatch(/invariant_held with regression_passed=true for the public case/);
-    expect(screen.getByRole("link", { name: /releases\/tag\/v1\.3\.0rc2/i }).getAttribute("href"))
-      .toBe(PUBLIC_RELEASE);
+    expect(screen.getByRole("link", { name: /releases\/tag\/v1\.3\.0rc3/i }).getAttribute("href"))
+      .toBe(RC3_RELEASE);
     expect(text).not.toMatch(STALE_GITHUB_CLAIMS);
     expect(text).toMatch(/pypi publication is not yet available/i);
     expect(text).toMatch(/not a step in the default heel journey/i);
@@ -339,10 +356,10 @@ describe("Heel anonymous launch review", () => {
     expect(text).toMatch(/no source checkout or manual wheel download is needed/i);
     expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*error_envelope[^.]*invariant_held with regression_passed=true/i);
     expect(text).toMatch(/That result is inconclusive, not a pass/);
-    expect(text).toMatch(/1\.3\.0rc2 reports it as inconclusive with regression_passed=false\./);
+    expect(text).toMatch(/1\.3\.0rc2 and 1\.3\.0rc3 report it as inconclusive with regression_passed=false\./);
     // The hardened case answers with an HTTP 403 error envelope: an rc1 erratum, never a repair.
     expect(text).toMatch(/1\.3\.0rc1 erratum[^.]*hardened case, an HTTP 403 error response, as invariant_held with regression_passed=true/i);
-    expect(text).toMatch(/1\.3\.0rc2 reports the hardened case as inconclusive with regression_passed=false/);
+    expect(text).toMatch(/1\.3\.0rc2 and 1\.3\.0rc3 report the hardened case as inconclusive with regression_passed=false/);
     expect(text).not.toMatch(/hardened case[^.]*HTTP 200/i);
     expect(text).not.toMatch(/repeat with the hardened/i);
     expect(text).not.toMatch(STALE_RC2_CLAIMS);

@@ -113,7 +113,7 @@ function containsSensitiveInput(node) {
 // H0X: the private control-plane sink lives only in this module, pinned by bytes (S3) and
 // checked by lexical and token facts (S1, S2). None of these checks claims to model dataflow.
 const CONTROL_PLANE_DISPATCH_PATH = "worker/control-plane-dispatch.ts";
-const CONTROL_PLANE_DISPATCH_SHA256 = "cbebaa836f6ab880ecc5ed93bceb0a8670e72b9bc1aee0983692881b0df711a9";
+const CONTROL_PLANE_DISPATCH_SHA256 = "ac084b9677132c3cc3e518c2d85679b2540793ee5c0d8784eb555a953f632a11";
 const dispatchModuleImport = 'import { canonicalPublicOrigin } from "../build/deployment-config";';
 const dispatchBindingGuard = `if (
     input.binding === undefined
@@ -153,6 +153,7 @@ const dispatchImport = 'import { dispatchControlPlane } from "./control-plane-di
 const dispatchCallSite = `const outcome = await dispatchControlPlane({
     binding: env.CONTROL_PLANE,
     publicOrigin: env.PUBLIC_ORIGIN,
+    privateTransport: env.CONTROL_PLANE_TRANSPORT,
     upstreamPath,
     method: request.method,
     headers: requestContract.headers,
@@ -362,9 +363,21 @@ function analyzeSource(fileName, text) {
   function validateControlPlaneProxyContract() {
     const sourceText = parsed.getFullText();
     if (!serverWorker || !sourceText.includes("CONTROL_PLANE")) return;
-    const routeContract = `function controlPlaneRoute(method: string, pathname: string): string | null {
+    const routeContract = `function isRunnerMachineRoute(upstreamPath: string): boolean {
+  return upstreamPath === RUNNER_PAIRING_EXCHANGE
+    || RUNNER_PAIRING_ACTIVATE.test(upstreamPath)
+    || RUNNER_ROTATION_PUBLIC.test(upstreamPath)
+    || RUNNER_CONTROL.test(upstreamPath)
+    || RUNNER_CONTEXT_CONTROL.test(upstreamPath)
+    || RUNNER_RESULT_PROJECTION.test(upstreamPath)
+    || RUNNER_RESYNC.test(upstreamPath)
+    || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
+}
+
+function controlPlaneRoute(method: string, pathname: string): string | null {
   if (pathname !== CONTROL_PLANE_PREFIX && !pathname.startsWith(\`\${CONTROL_PLANE_PREFIX}/\`)) {
-    return null;
+    if (!isRunnerMachineRoute(pathname)) return null;
+    return method === "POST" ? pathname : "";
   }
   const upstreamPath = pathname.slice(CONTROL_PLANE_PREFIX.length);
   if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)

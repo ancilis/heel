@@ -2170,10 +2170,43 @@ def _assert_no_secret_left_the_target(bridge):
         assert token.encode() not in sent and token.encode() not in finals
 
 
+def _bridge_run_diagnostic(bridge, resolver, sockets, timeline, started):
+    """Allowlisted operational facts, rendered only when the bridge assertion fails.
+
+    Enumerated projection fields (re-validated by the store), integer counters, the closed
+    control operation names with monotonic millisecond offsets, and resolver/socket call counts
+    with deadline offsets. No body, header, credential, handle, run id, digest or signature.
+    """
+    facts = {
+        "resolver_calls": len(resolver.calls),
+        "resolver_deadline_offsets_ms": [int((call[1] - started) * 1000) for call in resolver.calls],
+        "socket_calls": len(sockets.calls),
+        "control_ms": [(op, ms) for op, ms in list(timeline)],
+    }
+    try:
+        facts["run_state"] = bridge.store.load_run(bridge.grant["run_id"])["state"]
+        operational = bridge.store.load_final_projections(bridge.grant["run_id"])["operational_projection"]
+        facts.update({key: operational[key] for key in (
+            "execution_disposition", "error_category", "stop_reason", "containment_codes", "counters")})
+    except Exception as exc:  # the facts must never replace the original assertion failure
+        facts["projection_unavailable"] = type(exc).__name__
+    return facts
+
+
 def test_serve_execution_bridge_runs_a_signed_lease_through_the_real_target_client(tmp_path):
     from tests.test_runner_http_transport import PUBLIC, TLS, Resolver, Sockets, TLSSocket
 
     bridge = _bridge(tmp_path)
+    started = time.monotonic()
+    timeline = []
+    scripted_post = bridge.control.post
+
+    def timed_post(path, *, headers, body):
+        answer = scripted_post(path, headers=headers, body=body)
+        timeline.append((path.rsplit("/", 1)[1], int((time.monotonic() - started) * 1000)))
+        return answer
+
+    bridge.control.post = timed_post
     resolver = Resolver([[PUBLIC]])
     tls_sockets = [TLSSocket(answer) for answer in _target_answers()]
     sockets = Sockets(tls_sockets)
@@ -2181,7 +2214,9 @@ def test_serve_execution_bridge_runs_a_signed_lease_through_the_real_target_clie
     assert service.run_once() is True
     owner.close()
     # One preflight plus one recheck per attempt, all for the signed manifest origin's host only.
-    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"] * 5
+    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"] * 5, json.dumps(_bridge_run_diagnostic(
+        bridge, resolver, sockets, timeline, started,
+    ), sort_keys=True)
     assert [call[0] for call in sockets.calls] == [(PUBLIC, 443)] * 4
     requests = [b"".join(item.sent) for item in tls_sockets]
     assert [line.split(b"\r\n", 1)[0] for line in requests] == [

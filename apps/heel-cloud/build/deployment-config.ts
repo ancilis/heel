@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
-const VPC_SERVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VPC_SERVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // WHATWG URL parses a host whose last label looks numeric (decimal or 0x hex) as IPv4.
 const NUMERIC_LABEL = /^(?:[0-9]+|0x[0-9a-f]*)$/;
@@ -36,6 +36,15 @@ export function deploymentConfig(env: Record<string, string | undefined>, comman
   const origin = env.HEEL_PUBLIC_ORIGIN;
   if (!['full', 'local_review'].includes(mode)) throw new Error('Unknown Heel deployment mode');
   if (mode === 'local_review' && service) throw new Error('Local review cannot bind a private control plane');
+  // The scheme the Worker uses on the fixed private VPC service: missing means https; http selects
+  // the service's private HTTP port inside its Tunnel. It never changes the public origin.
+  const transport = env.HEEL_CONTROL_PLANE_TRANSPORT;
+  if (transport !== undefined && transport !== 'http' && transport !== 'https') {
+    throw new Error('HEEL_CONTROL_PLANE_TRANSPORT must be exactly http or https');
+  }
+  if (mode === 'local_review' && transport !== undefined) {
+    throw new Error('Local review cannot bind a private control plane transport');
+  }
   if (command === 'build') {
     if (mode === 'full' && !VPC_SERVICE_ID.test(service ?? '')) {
       throw new Error('HEEL_CONTROL_PLANE_VPC_SERVICE_ID must be a Cloudflare VPC service UUID for production builds');
@@ -46,6 +55,8 @@ export function deploymentConfig(env: Record<string, string | undefined>, comman
   }
   const vars: Record<string, string> = {};
   if (origin !== undefined) vars.PUBLIC_ORIGIN = origin;
+  // Only an explicit private HTTP selection is emitted, so the default configuration shape is unchanged.
+  if (transport === 'http') vars.CONTROL_PLANE_TRANSPORT = transport;
   return {
     vars,
     vpc_services: mode === 'local_review' || service === undefined

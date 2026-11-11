@@ -47,6 +47,90 @@ it("uses closed create list revoke routes for browser context authorization", as
   ]);
 });
 
+// Obviously synthetic, but in the control plane's exact shape: 32 bytes as padded standard base64.
+const SYNTHETIC_INVITATION = `SyntheticInvite+Test/Only${"A".repeat(18)}=`;
+
+it("accepts only the runner's exact invitation token grammar from the pairing invitation response", async () => {
+  expect(SYNTHETIC_INVITATION).toHaveLength(44);
+  const respond = (token: unknown) => new CanaryApi({ transport: async () => jsonResponse({
+    schema_version: "heel.runner-pairing-invitation.v1", invitation_token: token, expires_at: 1_900_000_000.5 }, 201) });
+  await expect(respond(SYNTHETIC_INVITATION).createRunnerPairingInvitation(workspace))
+    .resolves.toEqual({ invitationToken: SYNTHETIC_INVITATION, expiresAt: 1_900_000_000.5 });
+  const malformed: unknown[] = [
+    "invite-1",                                    // the old identifier grammar: never minted, runner refuses it
+    SYNTHETIC_INVITATION.slice(0, -1),             // unpadded
+    `${SYNTHETIC_INVITATION.slice(0, -2)}==`,      // 31-byte padding
+    `${SYNTHETIC_INVITATION}A`,                    // too long
+    `A${SYNTHETIC_INVITATION}`,
+    SYNTHETIC_INVITATION.replace("+", "-"),        // url-safe alphabet
+    SYNTHETIC_INVITATION.replace("/", "_"),
+    `${SYNTHETIC_INVITATION}\n`,
+    ` ${SYNTHETIC_INVITATION.slice(1)}`,
+    "", 44, null, [SYNTHETIC_INVITATION],
+  ];
+  for (const token of malformed) {
+    await expect(respond(token).createRunnerPairingInvitation(workspace)).rejects.toMatchObject({ code: "invalid_response", status: 502 });
+  }
+});
+
+it("pairs and revokes runners only through the closed workspace routes and exact bodies", async () => {
+  const pairing = `pending_${"1".repeat(32)}`;
+  const calls: string[] = [];
+  const api = new CanaryApi({ transport: async (path, init) => {
+    calls.push(`${init.method}:${path}:${typeof init.body === "string" ? init.body : ""}`);
+    if (String(path).endsWith("/runner-pairings")) return jsonResponse({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: SYNTHETIC_INVITATION, expires_at: 1_900_000_000.5 }, 201);
+    if (String(path).endsWith("/approve")) return jsonResponse({ schema_version: "heel.runner-pairing-approved.v1", status: "approved" });
+    if (String(path).endsWith("/revoke")) return jsonResponse({ schema_version: "heel.runner-revoke-result.v1", revoked: true });
+    return jsonResponse({ schema_version: "heel.runner-pairing-view.v1", pairing_id: pairing, runner_id: "runner-a", pairing_phrase: "a b c d e f", fingerprint: digest, status: "pending", expires_at: 1_900_000_000.5 });
+  }});
+  assert.deepEqual(await api.createRunnerPairingInvitation(workspace), { invitationToken: SYNTHETIC_INVITATION, expiresAt: 1_900_000_000.5 });
+  assert.deepEqual(await api.inspectRunnerPairing(workspace, pairing), { pairingId: pairing, runnerId: "runner-a", pairingPhrase: "a b c d e f", fingerprint: digest, status: "pending", expiresAt: 1_900_000_000.5 });
+  await api.approveRunnerPairing(workspace, pairing, "a b c d e f", digest);
+  await api.revokeRunner(workspace, "runner-a");
+  assert.deepEqual(calls, [
+    `POST:/api/control-plane/v1/workspaces/${workspace}/runner-pairings:{"schema_version":"heel.runner-pairing-invite.v1"}`,
+    `GET:/api/control-plane/v1/workspaces/${workspace}/runner-pairings/${pairing}:`,
+    `POST:/api/control-plane/v1/workspaces/${workspace}/runner-pairings/${pairing}/approve:{"fingerprint":"${digest}","pairing_phrase":"a b c d e f","schema_version":"heel.runner-pairing-approve.v1"}`,
+    `POST:/api/control-plane/v1/workspaces/${workspace}/runners/runner-a/revoke:{"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}`,
+  ]);
+  for (const runnerId of ["", "runner/a", "runner.a", "../x", "a".repeat(129)]) {
+    await expect(api.revokeRunner(workspace, runnerId)).rejects.toMatchObject({ code: "invalid_request" });
+  }
+  assert.equal(calls.length, 4);
+});
+
+it("rejects a runner revoke result outside the typed contract and names the refusal", async () => {
+  for (const body of [{ schema_version: "heel.runner-revoke-result.v1", revoked: false }, { schema_version: "heel.runner-revoke-result.v1", revoked: true, extra: 1 }, { schema_version: "heel.runner-revoked.v1", revoked: true }]) {
+    const api = new CanaryApi({ transport: async () => jsonResponse(body) });
+    await expect(api.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_response" });
+  }
+  const refused = new CanaryApi({ transport: async () => jsonResponse({ error: "invalid runner revocation", code: "invalid_runner_revocation" }, 400) });
+  await expect(refused.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_runner_revocation", status: 400 });
+});
+
+// The final 1.3.0rc3 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca
+// ("Customer install command"), pinned to the reviewed final rc3 wheel (source 4b68c2f, 2769936 bytes), pinned here
+// rather than read from the runbook. The /agent MCP quickstart deliberately stays on its published rc2 public install;
+// its only rc3 mentions are the same-origin 1.3.0rc3 candidate downloads from main. Only the paired-runner surfaces
+// install the public rc3 release.
+const RC3_WHEEL_SHA256 = "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca";
+const RC3_RUNBOOK_INSTALL = "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "
+  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256=${RC3_WHEEL_SHA256}'`
+  + " && ./heel-rc3/bin/heel --version";
+
+it("the dashboard pairing card and /runner show the exact final rc3 runbook install line", async () => {
+  const { RUNNER_RC3_INSTALL, RUNNER_RC3_CLI, RUNNER_RC3_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
+  assert.equal(RUNNER_RC3_INSTALL, RC3_RUNBOOK_INSTALL);
+  assert.equal(RUNNER_RC3_CLI, "./heel-rc3/bin/heel");
+  assert.equal(RUNNER_RC3_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc3");
+  const runner = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
+  assert.ok(runner.includes(RC3_RUNBOOK_INSTALL));
+  assert.doesNotMatch(runner, /heel-rc2\/|releases\/(tag|download)\/v1\.3\.0rc2/);
+  const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
+  assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc3|heel-rc3/);
+  assert.match(agent, /releases\/download\/v1\.3\.0rc2\/heel_sim-1\.3\.0rc2-py3-none-any\.whl#sha256=/);
+});
+
 it("discovers only a closed pending approval summary", async () => {
   const api = new CanaryApi({ transport: async () => jsonResponse({
     schema_version: "heel.canary-approval-request-list.v1", server_time_ms: 1, has_more: false,

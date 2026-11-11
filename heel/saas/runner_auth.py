@@ -1571,6 +1571,13 @@ class RunnerAuthStore:
                 "AND status IN ('invited','pending','approved','expired') AND expires_at<?",
                 (workspace_id, instant),
             )
+            # A fresh invitation supersedes this workspace's unused one in the same write
+            # transaction.  Only unexchanged rows are removed: a claimed pairing carries its
+            # runner ID, attribution and any activation receipt, and is never touched here.
+            self.conn.execute(
+                "DELETE FROM canary_runner_pairings WHERE workspace_id=? AND status='invited' AND runner_id=''",
+                (workspace_id,),
+            )
             self.conn.execute(
                 "INSERT INTO canary_runner_pairings(pairing_id,workspace_id,runner_id,invitation_hash,status,created_at,expires_at,display_name) VALUES(?,?,?,?,?,?,?,?)",
                 ("pending_" + secrets.token_hex(16), workspace_id, "", self._hash("invitation", token), "invited", instant, instant + PAIRING_TTL, "Pending runner"),
