@@ -33,7 +33,11 @@ export function ActivationCard({ snapshot, completedSteps, environmentOrigin, sc
         ? "authorize the paired runner below"
         : snapshot.canaryAccess !== "ready"
           ? "finish local setup on the runner machine"
-          : "review the exact rehearsal";
+          : snapshot.rehearsal === "complete"
+            ? "review the detailed result on the runner machine"
+            : snapshot.rehearsal === "running"
+              ? "follow the approved rehearsal or stop it"
+              : "review the exact rehearsal";
 
   return (
     <section aria-label="Launch activation" className="activation-card">

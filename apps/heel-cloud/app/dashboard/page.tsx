@@ -128,6 +128,9 @@ function idempotencyKey(): `ca1-${string}` {
   return `ca1-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
+/** Run statuses after which the control plane changes nothing the dashboard shows; a settled run is not re-read. */
+const SETTLED_RUN_STATUSES: ReadonlySet<string> = new Set(["terminal", "cancelled", "expired"]);
+
 function approvalRequestKey(workspaceRef: string, projectRef: string, approval: CanaryApprovalSummary): string {
   return `${workspaceRef}\0${projectRef}\0${approval.approvalId}\0${approval.runId}\0${approval.projectionDigest}`;
 }
@@ -418,6 +421,38 @@ export default function Dashboard() {
     return () => { cancelled = true; clearInterval(timer); };
   }, [clearPendingApproval, connect, connection, pendingApproval, sessionEnded]);
 
+  // An approved run leaves the pending list, so nothing above reads it again. Follow that run's own status until the
+  // control plane reports it settled; the counters shown are only what its read model returns.
+  const followedRunId = observedRun !== null && pendingApproval === null && !SETTLED_RUN_STATUSES.has(observedRun.run.status)
+    ? observedRun.run.runId : null;
+  useEffect(() => {
+    if (connection.phase !== "ready" || followedRunId === null) return;
+    const ticket = generation.current;
+    let cancelled = false;
+    let inFlight = false;
+    let controller: AbortController | null = null;
+    const follow = async (): Promise<void> => {
+      if (cancelled || inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const next = await canaryApi.getRun(connection.context.workspaceRef, connection.context.project.projectRef, followedRunId, controller.signal);
+        if (cancelled || ticket !== generation.current) return;
+        setObservedRun((current) => current?.run.runId === followedRunId ? next : current);
+      } catch (error) {
+        if (cancelled || ticket !== generation.current) return;
+        if (isSessionLoss(error)) sessionEnded();
+        else if (error instanceof CanaryApiError && error.status === 403) void connect(connectionSelection(connection));
+        else if (error instanceof CanaryApiError && error.status === 404) setObservedRun((current) => current?.run.runId === followedRunId ? null : current);
+        else if (!(error instanceof CanaryApiError && error.code === "unavailable")) setNotice(messageOf(error));
+      } finally { inFlight = false; controller = null; }
+    };
+    const visibility = () => { if (document.visibilityState === "visible") void follow(); };
+    const timer = setInterval(() => void follow(), 1_000);
+    document.addEventListener("visibilitychange", visibility);
+    return () => { cancelled = true; controller?.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", visibility); };
+  }, [connect, connection, followedRunId, sessionEnded]);
+
   // Expiry is re-evaluated while a pairing ceremony is open; the server still decides.
   useEffect(() => {
     if (pairingSession === null) return;
@@ -446,14 +481,20 @@ export default function Dashboard() {
   const authorizedForTarget = connection.phase === "ready" && executable !== undefined
     && connection.context.contextBindings.bindings.some((item) => item.status === "active" && item.expiresAtMs > nowSeconds * 1000
       && item.environmentId === executable.environmentId && item.verificationRecordDigest === executable.verificationRecordDigest);
+  // A run the control plane holds past approval proves its runner submitted a signed plan with canary access ready;
+  // only a terminal, completed run counts as a finished rehearsal.
+  const executedStatus = observedRun !== null && pendingApproval === null && !["prepared", "awaiting_execution_approval"].includes(observedRun.run.status)
+    ? observedRun.run.status : null;
+  const rehearsalComplete = executedStatus === "terminal" && observedRun?.run.executionDisposition === "completed";
+  const rehearsalRunning = executedStatus !== null && !SETTLED_RUN_STATUSES.has(executedStatus);
   const snapshot: ActivationSnapshot = {
     environment: executable ? "verified" : proofChallenge ? "checking" : "unverified",
     runner: executable ? (hasPlan ? "online" : pairedRunners.length > 0 ? "paired" : "unpaired") : "locked",
-    canaryAccess: hasPlan ? "ready" : !executable || pairedRunners.length === 0 ? "locked" : authorizedForTarget ? "authorized" : "unauthorized",
-    rehearsal: hasPlan ? "awaiting_approval" : "locked",
+    canaryAccess: hasPlan || rehearsalComplete || rehearsalRunning ? "ready" : !executable || pairedRunners.length === 0 ? "locked" : authorizedForTarget ? "authorized" : "unauthorized",
+    rehearsal: hasPlan ? "awaiting_approval" : rehearsalComplete ? "complete" : rehearsalRunning ? "running" : "locked",
   };
   const completedSteps = [snapshot.environment === "verified", snapshot.runner === "paired" || snapshot.runner === "online",
-    snapshot.canaryAccess === "ready", hasPlan].filter(Boolean).length;
+    snapshot.canaryAccess === "ready", hasPlan || rehearsalComplete].filter(Boolean).length;
 
   const runPhase: RunPhase | null = useMemo(() => {
     if (observedRun === null) return null;
@@ -880,7 +921,7 @@ export default function Dashboard() {
       <aside className="dashboard-rail" aria-label="Safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p>
         {showActivation ? <><h2>The paired runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>
           : <><h2>No scan traffic is sent in this build.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Ownership check</dt><dd>One proof file or DNS record</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>}</section>
-         {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} localResultUrl={progress.localResultReady && observedRun ? `http://127.0.0.1:7331/runs/${observedRun.run.runId}` : undefined} /> : null}
+         {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} /> : null}
          {observedRun && !observedRun.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
         {progress?.localResultReady ? <label className="disclosure-entry"><span>Optional history</span><strong>Load local summary to review separate sharing →</strong><input accept="application/json,.json" hidden onChange={(event) => void loadDisclosurePreview(event.target.files?.[0])} type="file" /></label> : null}
       </aside></div>
