@@ -9402,6 +9402,92 @@ class RunnerStore:
             raise RunnerStoreError("local containment summary does not match signed events")
         return result
 
+    # Saved regression definitions: data derived from verified terminal finals, never authority.
+
+    def _bound_saved_regressions_locked(
+        self, context_fd: int, records: Any,
+    ) -> list[dict[str, Any]]:
+        from heel.runner.regressions import (
+            MAX_SAVED_REGRESSIONS, SavedRegressionError, validate_saved_regression,
+        )
+
+        if not isinstance(records, list) or len(records) > MAX_SAVED_REGRESSIONS:
+            raise RunnerStoreError("invalid saved regressions")
+        try:
+            result = [validate_saved_regression(item) for item in records]
+        except SavedRegressionError:
+            raise RunnerStoreError("invalid saved regressions") from None
+        ids = [item["regression_id"] for item in result]
+        if ids != sorted(ids) or len(set(ids)) != len(ids):
+            raise RunnerStoreError("saved regressions are not canonical")
+        binding = self._binding_locked(context_fd)
+        context = _context_from_dict(binding["context"])
+        expected = {
+            "workspace_id": context.workspace_id,
+            "project_id": context.project_id,
+            "environment_id": context.environment_id,
+            "origin": context.origin,
+            "runner_id": binding["identity"]["runner_id"],
+            "runner_key_id": binding["identity"]["runner_key_id"],
+        }
+        if any(item[key] != value for item in result for key, value in expected.items()):
+            raise RunnerStoreError("saved regression context mismatch")
+        return result
+
+    def _saved_regressions_locked(self, context_fd: int) -> list[dict[str, Any]]:
+        from heel.runner.regressions import SAVED_REGRESSIONS_SCHEMA
+
+        raw = _read_json(context_fd, "regressions.json", None)
+        if raw is None:
+            return []
+        records = self._validate_envelope(
+            context_fd, raw, schema=SAVED_REGRESSIONS_SCHEMA, payload_field="regressions",
+        )
+        return self._bound_saved_regressions_locked(context_fd, records)
+
+    def list_saved_regressions(self) -> list[dict[str, Any]]:
+        with self._transaction(exclusive=False) as context_fd:
+            return self._saved_regressions_locked(context_fd)
+
+    def add_saved_regression(
+        self, *, run_id: str, scenario_id: str, name: str, now_ms: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one definition derived only from this context's verified terminal finals.
+
+        Returns ``(record, created)``. Re-adding the same source with the same name returns
+        the stored record unchanged without writing; any other collision, the bound, or any
+        verification failure raises and leaves ``regressions.json`` untouched.
+        """
+        from heel.runner.regressions import (
+            MAX_SAVED_REGRESSIONS, SAVED_REGRESSIONS_SCHEMA, derive_saved_regression, same_source,
+        )
+
+        record = derive_saved_regression(
+            self, run_id=run_id, scenario_id=scenario_id, name=name, now_ms=now_ms,
+        )
+        with self._transaction(exclusive=True) as context_fd:
+            records = self._saved_regressions_locked(context_fd)
+            existing = next(
+                (item for item in records if item["regression_id"] == record["regression_id"]),
+                None,
+            )
+            if existing is not None:
+                if not same_source(existing, record):
+                    raise RunnerStoreError("saved regression already exists")
+                return existing, False
+            if len(records) >= MAX_SAVED_REGRESSIONS:
+                raise RunnerStoreError("saved regression limit reached")
+            # Rebind the derived record to the binding held under the exclusive lock.
+            updated = self._bound_saved_regressions_locked(
+                context_fd,
+                sorted([*records, record], key=lambda item: item["regression_id"]),
+            )
+            envelope = self._envelope(
+                context_fd, SAVED_REGRESSIONS_SCHEMA, "regressions", updated,
+            )
+            _write_json(context_fd, "regressions.json", envelope)
+        return record, True
+
     def store_response_evidence(
         self,
         run_id: str,

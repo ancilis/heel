@@ -40,6 +40,9 @@ _SAFE_RUNNER_CREDENTIAL_FAILURE = "Heel runner credential could not be stored sa
 _SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
 _SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
 _SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
+_SAFE_RUNNER_FINDINGS_FAILURE = "Heel runner findings are unavailable."
+_SAFE_RUNNER_REGRESSION_ADD_FAILURE = "Heel runner regression could not be saved safely."
+_SAFE_RUNNER_REGRESSION_LIST_FAILURE = "Heel runner regressions are unavailable."
 _SAFE_RUNNER_PAIRING_FAILURE = "Heel runner pairing failed: {}."
 _SAFE_RUNNER_SERVE_FAILURE = "Heel runner serve stopped: {}."
 _OPENAPI_READ_FLAGS = (
@@ -390,6 +393,49 @@ def _runner_map(args) -> int:
         "mapping_count": len(mappings),
         "scenario_ids": [item["scenario_id"] for item in mappings],
     }, sort_keys=True))
+    return 0
+
+
+def _runner_findings(args) -> int:
+    """Print only the store-verified signed redacted local view of one terminal run."""
+    from .runner.regressions import load_terminal_local_view
+
+    try:
+        rendered = json.dumps(
+            load_terminal_local_view(_runner_store(), args.run), sort_keys=True,
+        )
+    except Exception:
+        print(_SAFE_RUNNER_FINDINGS_FAILURE, file=sys.stderr)
+        return 2
+    print(rendered)
+    return 0
+
+
+def _runner_regress_add(args) -> int:
+    """Save one local regression definition; never prepares, submits or replays."""
+    try:
+        record, created = _runner_store().add_saved_regression(
+            run_id=args.run, scenario_id=args.scenario, name=args.name,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        rendered = json.dumps({"created": created, "regression": record}, sort_keys=True)
+    except Exception:
+        print(_SAFE_RUNNER_REGRESSION_ADD_FAILURE, file=sys.stderr)
+        return 2
+    print(rendered)
+    return 0
+
+
+def _runner_regress_list(_args) -> int:
+    try:
+        records = _runner_store().list_saved_regressions()
+        rendered = json.dumps(
+            {"regression_count": len(records), "regressions": records}, sort_keys=True,
+        )
+    except Exception:
+        print(_SAFE_RUNNER_REGRESSION_LIST_FAILURE, file=sys.stderr)
+        return 2
+    print(rendered)
     return 0
 
 
@@ -1240,6 +1286,23 @@ def main(argv=None):
         "prepare", help="review readiness or compile one local immutable rehearsal",
     )
     runner_prepare.add_argument("--live", action="store_true")
+    runner_findings = runner_sub.add_parser(
+        "findings", help="show the verified signed redacted local result of one terminal run",
+    )
+    runner_findings.add_argument("--run", required=True, metavar="RUN_ID")
+    runner_regress = runner_sub.add_parser(
+        "regress", help="save local regression definitions from verified observed findings",
+    )
+    runner_regress_sub = runner_regress.add_subparsers(
+        dest="runnerregresscmd", required=True, parser_class=_RunnerArgumentParser,
+    )
+    runner_regress_add = runner_regress_sub.add_parser(
+        "add", help="save one observed finding as a local regression definition (no replay)",
+    )
+    runner_regress_add.add_argument("--run", required=True, metavar="RUN_ID")
+    runner_regress_add.add_argument("--scenario", required=True, metavar="SCENARIO_ID")
+    runner_regress_add.add_argument("--name", required=True, metavar="NAME")
+    runner_regress_sub.add_parser("list", help="list saved local regression definitions")
     runner_run = runner_sub.add_parser(
         "run", help="replay imported GET/HEAD reads as two canary plans under a signed scope",
     )
@@ -1441,6 +1504,12 @@ def main(argv=None):
             return _runner_map(args)
         if args.runnercmd == "prepare":
             return _runner_prepare(args)
+        if args.runnercmd == "findings":
+            return _runner_findings(args)
+        if args.runnercmd == "regress" and args.runnerregresscmd == "add":
+            return _runner_regress_add(args)
+        if args.runnercmd == "regress" and args.runnerregresscmd == "list":
+            return _runner_regress_list(args)
         if args.runnercmd == "run":
             return _runner_run(args)
     if args.cmd == "cloud":
