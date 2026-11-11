@@ -41,6 +41,29 @@ from heel.runner.store import RunnerStore, RunnerStoreError
 from heel.runner.vault import EphemeralVault, VaultUnavailable, validate_credential_secret
 
 
+_PLAN_SCENARIO = "plan_entitlement_read"
+
+
+def _plan_differential_finding() -> dict[str, str]:
+    """Finding copy for a markerless row-6 result: key-path coverage, never equal values."""
+    from heel.runner.plan_differential import _RECOMMENDED_CONTROL
+
+    return {
+        "title": "Lower-plan read covered every key path of the higher-plan response",
+        "reachability_rationale": (
+            "On the same approved read, the lower-plan identity's response contained every "
+            "key path of the higher-plan identity's response, populated wherever the "
+            "higher-plan response was populated, and the higher-plan control succeeded. Key "
+            "paths were compared; values were not compared and no marker was bound. Heel "
+            "holds no declaration that this read is plan-gated, so a read that is not "
+            "plan-gated by design is reported too. Only this read was tested."
+        ),
+        "confidence": "medium",
+        "recommended_control": _RECOMMENDED_CONTROL,
+        "regression_suggestion": "Repeat this exact catalog scenario with a new one-shot grant.",
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionGate:
     active: bool
@@ -950,6 +973,80 @@ class LocalCanaryExecutor:
         }
         return validate_operational_run(_sign_projection(unsigned, self.signer, "projection_digest"))
 
+    def _plan_differential_outcome(
+        self,
+        run_id: str,
+        actions: list[Mapping[str, Any]],
+        observations: list[Mapping[str, Any]],
+        references: list[str],
+    ) -> str:
+        """The existing markerless plan comparator over this scenario's own stored evidence.
+
+        Consulted only after the canary adapter returned ``inconclusive`` for a completed
+        ``plan_entitlement_read`` pair. A pair with any bound ``heel-canary-`` fixture stays
+        with the canary decision. Exactly this scenario's lower/higher action ordinals select
+        the two stored, redacted bodies; no request is made and nothing leaves the runner.
+        Row 6 (``body_superset``) is ``observed``, row 7 (``lower_denied``) is ``blocked``,
+        and every other row, refusal or error is ``inconclusive``.
+        """
+        try:
+            from heel.runner.plan_differential import (
+                ExecutorOutcome,
+                evaluate_plan_pair,
+                load_plan_pair_observations,
+            )
+
+            if (
+                len(actions) != 2
+                or len(observations) != 2
+                or len(references) != 2
+                or any(
+                    binding["fixture_id"].startswith("heel-canary-")
+                    for action in actions for binding in action["fixture_bindings"]
+                )
+            ):
+                return "inconclusive"
+            by_role = {action["semantic_auth_role"]: action for action in actions}
+            method = actions[0]["method"]
+            if (
+                set(by_role) != {"lower_plan", "higher_plan"}
+                or method not in {"GET", "HEAD"}
+                or any(
+                    action["method"] != method
+                    or action["route_template"] != actions[0]["route_template"]
+                    for action in actions
+                )
+            ):
+                return "inconclusive"
+            lower, higher = load_plan_pair_observations(
+                self.store, run_id, references,
+                lower_ordinal=by_role["lower_plan"]["ordinal"],
+                higher_ordinal=by_role["higher_plan"]["ordinal"],
+                now_ms=self.clock_ms(),
+            )
+            statuses = {item["semantic_role"]: item["status_code"] for item in observations}
+            if (
+                lower is None
+                or higher is None
+                or statuses != {"lower_plan": lower.status, "higher_plan": higher.status}
+            ):
+                return "inconclusive"
+            verdict = evaluate_plan_pair(
+                lower, higher, method=method, marker=None,
+                executor_outcome=ExecutorOutcome("completed", "inconclusive"),
+            )
+        except Exception:
+            return "inconclusive"
+        if (verdict.row, verdict.verdict, verdict.evidence_state, verdict.predicate) == (
+            6, "finding", "observed", "body_superset",
+        ):
+            return "observed"
+        if (verdict.row, verdict.verdict, verdict.predicate, verdict.reason) == (
+            7, "held", "status_parity", "lower_denied",
+        ):
+            return "blocked"
+        return "inconclusive"
+
     def _finalize(
         self,
         manifest,
@@ -988,6 +1085,7 @@ class LocalCanaryExecutor:
             scenario_id = scenario["scenario_id"]
             scenario_observations = observations[scenario_id]
             source_actions = actions_by_scenario[scenario_id]
+            plan_differential = False
             if systemic_failure or len(scenario_observations) != len(source_actions):
                 outcome = "inconclusive"
             else:
@@ -1002,12 +1100,20 @@ class LocalCanaryExecutor:
                     second_protected=scenario_observations[1].get("_protected"),
                 )
                 outcome = pair.outcome
+                if outcome == "inconclusive" and scenario_id == _PLAN_SCENARIO:
+                    outcome = self._plan_differential_outcome(
+                        grant["run_id"], source_actions, scenario_observations,
+                        scenario_evidence[scenario_id],
+                    )
+                    plan_differential = True
             # The local content predicate is not part of the disclosure schema.
             for observation in scenario_observations:
                 observation.pop("_protected", None)
             outcomes.append(outcome)
             finding = None
-            if outcome == "observed":
+            if outcome == "observed" and plan_differential:
+                finding = _plan_differential_finding()
+            elif outcome == "observed":
                 finding = {
                     "title": "Canary authorization boundary was crossed",
                     "reachability_rationale": "Both isolated canary roles received the exact approved protected marker; the entitled positive control succeeded. Only this read was tested.",

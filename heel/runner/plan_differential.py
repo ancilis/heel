@@ -1268,6 +1268,51 @@ class _PairOutcome:
         }
 
 
+def load_plan_pair_observations(
+    store: RunnerStore,
+    runner_run_id: str,
+    references: Sequence[str],
+    *,
+    lower_ordinal: int,
+    higher_ordinal: int,
+    now_ms: int,
+) -> tuple[PlanObservation | None, PlanObservation | None]:
+    """Stored bodies of exactly one lower/higher action pair, or ``(None, None)``.
+
+    Shared by the CLI runner and the paired executor. Each reference must resolve, inside the
+    retention window, to evidence whose recorded action ordinal is one of the two given ordinals,
+    each ordinal exactly once. Anything else (an unrelated action, a duplicate, a missing,
+    expired or malformed record) fails closed.
+    """
+    try:
+        if (
+            any(isinstance(value, bool) or not isinstance(value, int)
+                for value in (lower_ordinal, higher_ordinal))
+            or lower_ordinal == higher_ordinal
+            or len(references) > 2
+        ):
+            return None, None
+        by_ordinal: dict[int, PlanObservation] = {}
+        for reference in references:
+            # References are unordered in projections. Match by the action ordinal the
+            # executor wrote into bounded evidence metadata, never by body vocabulary.
+            metadata = json.loads(
+                (store.run_path(runner_run_id) / "evidence" / (reference + ".meta")).read_text()
+            )
+            _, body = store.load_response_evidence(runner_run_id, reference, now_ms=now_ms)
+            ordinal = metadata["action_ordinal"]
+            if (
+                metadata["reference"] != reference
+                or ordinal in by_ordinal
+                or ordinal not in {lower_ordinal, higher_ordinal}
+            ):
+                return None, None
+            by_ordinal[ordinal] = PlanObservation(metadata["status_code"], body, reference)
+        return by_ordinal.get(lower_ordinal), by_ordinal.get(higher_ordinal)
+    except Exception:
+        return None, None
+
+
 def _load_observations(
     store: RunnerStore, runner_run_id: str, result: Any,
 ) -> tuple[PlanObservation | None, PlanObservation | None]:
@@ -1275,23 +1320,13 @@ def _load_observations(
         scenarios = result.findings_projection["scenario_results"]
         if len(scenarios) != 1:
             return None, None
-        by_ordinal: dict[int, PlanObservation] = {}
-        for reference in scenarios[0]["local_evidence_refs"]:
-            # References are unordered in projections. Match by the action ordinal the
-            # executor wrote into bounded evidence metadata, never by body vocabulary.
-            metadata = json.loads(
-                (store.run_path(runner_run_id) / "evidence" / (reference + ".meta")).read_text()
-            )
-            _, body = store.load_response_evidence(
-                runner_run_id, reference, now_ms=int(time.time() * 1000),
-            )
-            ordinal = metadata["action_ordinal"]
-            if ordinal in by_ordinal or ordinal not in {0, 1}:
-                return None, None
-            by_ordinal[ordinal] = PlanObservation(metadata["status_code"], body, reference)
-        return by_ordinal.get(0), by_ordinal.get(1)
+        references = scenarios[0]["local_evidence_refs"]
     except Exception:
         return None, None
+    return load_plan_pair_observations(
+        store, runner_run_id, references, lower_ordinal=0, higher_ordinal=1,
+        now_ms=int(time.time() * 1000),
+    )
 
 
 def _failure_reason(disposition: str, error_category: str, transport: _ScopedTransport) -> str | None:
