@@ -1,9 +1,9 @@
 name: CodeQL
 on:
   push:
-    branches: [main, codex/heel-feedback-launch]
+    branches: [main]
   pull_request:
-    branches: [main, codex/heel-feedback-launch]
+    branches: [main]
   schedule:
     - cron: '24 7 * * 1'
   workflow_dispatch: {}
