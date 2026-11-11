@@ -73,6 +73,7 @@ def test_origin_form_target_refuses_every_escape_form(target):
 def _raw_request(edge, target: str) -> int:
     """Send ``GET <target>`` exactly as given (no client-side normalization) through the front."""
     context = ssl.create_default_context(cafile=str(edge.ca.ca_path))
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     with socket.create_connection(("127.0.0.1", edge.port), timeout=30) as raw:
         with context.wrap_socket(raw, server_hostname="localhost") as tls:
             tls.sendall(f"GET {target} HTTP/1.1\r\nHost: localhost:{edge.port}\r\n\r\n".encode("latin-1"))
@@ -83,6 +84,31 @@ def _raw_request(edge, target: str) -> int:
                     break
                 data += chunk
     return int(data.split(b" ", 2)[1])
+
+
+def test_raw_request_client_context_pins_tls_floor_and_keeps_verification(tmp_path, monkeypatch):
+    created: list[ssl.SSLContext] = []
+    real = ssl.create_default_context
+
+    def recording(*args, **kwargs):
+        # Start below the floor so only the helper's own explicit setting can satisfy the assertion
+        # (the interpreter default alone would already read TLSv1_2).
+        context = real(*args, **kwargs)
+        context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        created.append(context)
+        return context
+
+    monkeypatch.setattr(ssl, "create_default_context", recording)
+    with socket.socket() as probe:  # a loopback port with no listener: the connect is refused
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    edge = type("Edge", (), {"ca": EphemeralCA(tmp_path / "tls"), "port": port})()
+    with pytest.raises(OSError):
+        _raw_request(edge, "/v1/health")
+    [context] = created
+    assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
 
 
 @needs_workerd

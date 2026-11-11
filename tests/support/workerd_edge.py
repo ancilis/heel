@@ -62,7 +62,7 @@ _HOP_BY_HOP = frozenset({
 # Non-secret Worker text bindings, fixed by construction; the edge secret is never one of them.
 _TEXT_BINDINGS = (("PUBLIC_ORIGIN", PUBLIC_ORIGIN), ("CONTROL_PLANE_TRANSPORT", "http"))
 # The environment variable workerd reads for the ``CONTROL_PLANE_EDGE_SECRET`` binding.
-EDGE_SECRET_ENVIRONMENT = "HEEL_WORKERD_CONTROL_PLANE_EDGE_SECRET"
+EDGE_BINDING_ENVIRONMENT_VARIABLE = "HEEL_WORKERD_CONTROL_PLANE_EDGE_SECRET"
 # Origin-form request target (RFC 9112 §3.2.1) restricted to the characters the Worker's control
 # plane routes use: "/" segments of unreserved/sub-delims/":" and an optional query. No "@", "%",
 # "\\", "#", whitespace or non-ASCII; empty segments ("//") and dot segments are refused below.
@@ -235,7 +235,7 @@ const edge :Workerd.Worker = (
   compatibilityFlags = ["nodejs_compat"],
   bindings = [
     (name = "CONTROL_PLANE", service = "control-plane"), {text_bindings},
-    (name = "CONTROL_PLANE_EDGE_SECRET", fromEnvironment = "{EDGE_SECRET_ENVIRONMENT}"),
+    (name = "CONTROL_PLANE_EDGE_SECRET", fromEnvironment = "{EDGE_BINDING_ENVIRONMENT_VARIABLE}"),
   ],
 );
 """)
@@ -244,7 +244,7 @@ const edge :Workerd.Worker = (
         self._workerd = subprocess.Popen(
             [str(_APP / "node_modules" / ".bin" / "workerd"), "serve", str(config)],
             stdout=log, stderr=subprocess.STDOUT, cwd=self.root,
-            env={**os.environ, EDGE_SECRET_ENVIRONMENT: self.edge_secret},
+            env={**os.environ, EDGE_BINDING_ENVIRONMENT_VARIABLE: self.edge_secret},
         )
         log.close()
         self._threads = [_start(self._backend)]
@@ -323,5 +323,5 @@ const edge :Workerd.Worker = (
         self.close()
 
 
-__all__ = ["EDGE_SECRET_ENVIRONMENT", "PUBLIC_ORIGIN", "WorkerdEdgeHarness", "origin_form_target",
-           "workerd_available"]
+__all__ = ["EDGE_BINDING_ENVIRONMENT_VARIABLE", "PUBLIC_ORIGIN", "WorkerdEdgeHarness",
+           "origin_form_target", "workerd_available"]
