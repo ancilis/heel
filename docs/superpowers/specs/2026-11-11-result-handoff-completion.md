@@ -179,7 +179,7 @@ status ∈ {`synchronized`, `local_only`}. Render by status:
 |---|---|
 | 404 | "Waiting for the paired runner to report the local result." |
 | `local_result_ready` / `awaiting_disclosure_approval` | existing `DisclosureDialog` opened from server metadata (scenario count, finding count, byte count); `outcomeCounts` becomes optional. "Share redacted summary" → existing `createDisclosurePermit` with the server's metadata; "Keep local" → existing `markDisclosureLocalOnly` |
-| `permitted` | "Permit issued. The paired runner uploads the exact summary within seconds while `heel runner serve` is running." (no permit bytes shown) |
+| `permitted` | "Share approved. The paired runner uploads this exact summary when it next checks for approval, normally within a minute while heel runner serve is running." (as shipped in `dashboard/page.tsx`; no permit bytes shown) |
 | `synchronized` | `getFindings` (existing) → new `FindingsCard`: per scenario the route, `assessment_outcome`, `finding.confidence`, `finding.title`, `recommended_control`, `reachability_rationale`, `regression_suggestion`, observations as `status_code` + `body_shape`, evidence refs as opaque ids. Nothing is derived client-side. |
 | `local_only` | "Result kept local. No summary bytes were uploaded." (existing copy) |
 

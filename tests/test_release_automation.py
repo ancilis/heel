@@ -13,32 +13,37 @@ PUBLISH = ROOT / ".github/workflows/publish.yml"
 WHEEL = "heel_sim-1.3.0rc4-py3-none-any.whl"
 SDIST = "heel_sim-1.3.0rc4.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
-# The published GitHub prerelease customer copy installs; its bytes are the historical rc2 fixture.
-PUBLIC_VERSION = "1.3.0rc2"
+# The public GitHub prerelease that every self-serve install surface names: README, the MCP quickstart,
+# the export demo, the plan-differential guide, /agent, /runner and the dashboard RunnerPairingCard.
+# This literal is copied from the "Customer install command" block of
+# docs/RUNNER_PREVIEW_RELEASE_RC4.md and pinned here rather than derived from the product source; the
+# test below also checks it against that runbook and the bundled manifest. The copy may be deployed
+# only after the release owner's anonymous verify-public for v1.3.0rc4 passes.
+PUBLIC_VERSION = "1.3.0rc4"
 PUBLIC_WHEEL = f"heel_sim-{PUBLIC_VERSION}-py3-none-any.whl"
-PUBLIC_MANIFEST = ROOT / "tests/fixtures/runner_preview_rc2/artifacts" / MANIFEST
-# The paired-runner surfaces (/runner and the dashboard RunnerPairingCard) carry the final rc3
-# install line of the published v1.3.0rc3 release while the MCP quickstart, README, export demo
-# and /agent stay on the published rc2. This literal is copied from the "Customer install command"
-# block of docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca (the reviewed final rc3 wheel). It is
-# pinned here rather than derived from the product source, and the paired-runner test also checks
-# it against that runbook and the published rc3 manifest, kept byte for byte as the historical rc3
-# publisher fixture now that the bundled files are the 1.3.0rc4 candidate.
-PAIRED_RUNNER_RC3_INSTALL = (
-    "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "
-    "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/"
-    "heel_sim-1.3.0rc3-py3-none-any.whl"
-    "#sha256=0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca'"
-    " && ./heel-rc3/bin/heel --version"
+PUBLIC_WHEEL_SHA256 = "27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af"
+PUBLIC_INSTALL = (
+    "python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install "
+    "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/"
+    "heel_sim-1.3.0rc4-py3-none-any.whl"
+    f"#sha256={PUBLIC_WHEEL_SHA256}'"
+    " && ./heel-rc4/bin/heel --version"
 )
-PAIRED_RUNNER_RC3_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc3"
-PAIRED_RUNNER_RC3_CLI = "./heel-rc3/bin/heel "
-PAIRED_RUNNER_RC3_WHEEL = "heel_sim-1.3.0rc3-py3-none-any.whl"
-PAIRED_RUNNER_RC3_MANIFEST = ROOT / "tests/fixtures/runner_preview_rc3/artifacts" / MANIFEST
+PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc4"
+PUBLIC_CLI = "./heel-rc4/bin/heel "
+BUNDLED_MANIFEST = ROOT / "apps/heel-cloud/public/downloads" / MANIFEST
+INSTALL_DOCS = (
+    "README.md",
+    "docs/MCP_QUICKSTART.md",
+    "docs/EXPORT_DEMO.md",
+    "docs/PLAN_DIFFERENTIAL_RUNNER.md",
+)
 PAIRED_RUNNER_SURFACES = (
     "apps/heel-cloud/app/runner/page.tsx",
     "apps/heel-cloud/components/canary/RunnerPairingCard.tsx",
 )
+# Once promoted, copy must not call the public rc4 release an unpublished candidate.
+STALE_RC4 = r"(?i)1\.3\.0rc4 candidate|unpublished 1\.3\.0rc4|1\.3\.0rc4[^.]*not yet published"
 RELEASE_REQUIREMENTS = ROOT / "release/requirements-release.txt"
 
 
@@ -164,9 +169,10 @@ class ReleaseAutomationContractTests(unittest.TestCase):
 
         self.assertIn(f"/downloads/{WHEEL}", combined)
         for path, source in documents.items():
-            # Same-origin downloads are the 1.3.0rc4 candidate and are named as not yet published.
+            # Same-origin downloads are named as the bundled 1.3.0rc4 artifacts, never as unpublished.
             if "/downloads/heel_sim-" in source:
-                self.assertRegex(" ".join(source.split()), r"1\.3\.0rc4 candidate[^.]*not yet published", path)
+                self.assertRegex(" ".join(source.split()), r"bundled 1\.3\.0rc4 (?:files|artifacts|wheel)", path)
+            self.assertNotRegex(" ".join(source.split()), STALE_RC4, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc3", source, path)
         self.assertRegex(combined, r"(?i)not yet (?:available|published) (?:on|to) PyPI")
@@ -185,105 +191,57 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertIn("python3.13 -m pip --isolated install", source)
             self.assertIn("--require-hashes --only-binary=:all:", source)
 
-    def test_customer_install_is_the_runbook_command_for_the_published_release(self):
+    def test_every_install_surface_shows_the_one_rc4_runbook_command(self):
         import json
 
-        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC2.md").read_text(encoding="utf-8")
+        command = PUBLIC_INSTALL
+        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC4.md").read_text(encoding="utf-8")
         section = runbook[runbook.index("## Customer install command"):]
-        command = re.search(r"```sh\n(.*)\n```", section).group(1)
-        manifest = json.loads(PUBLIC_MANIFEST.read_text(encoding="utf-8"))
-        version = manifest["version"]
-        self.assertEqual(version, PUBLIC_VERSION)
-        wheel_sha = next(a["sha256"] for a in manifest["artifacts"] if a["name"] == PUBLIC_WHEEL)
-        # The public command installs exactly the published rc2 wheel from its own release, never
-        # the checked-in 1.3.0rc4 candidate, which is not yet published.
-        self.assertIn(
-            f"releases/download/v{version}/{PUBLIC_WHEEL}#sha256={wheel_sha}'", command,
-        )
-        bundled = json.loads(
-            (ROOT / "apps/heel-cloud/public/downloads" / MANIFEST).read_text(encoding="utf-8")
-        )
-        self.assertEqual(bundled["version"], "1.3.0rc4")
-        self.assertNotIn("1.3.0rc4", command)
-        self.assertTrue(command.startswith("python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install "))
-        self.assertTrue(command.endswith(" && ./heel-rc2/bin/heel --version"))
-        release = f"https://github.com/ancilis/heel/releases/tag/v{version}"
-        # The paired-runner surfaces are on rc3 and are pinned by the paired-runner test below.
-        for path in ("README.md", "docs/MCP_QUICKSTART.md", "docs/EXPORT_DEMO.md"):
+        self.assertEqual(re.search(r"```sh\n(.*)\n```", section).group(1), command)
+        bundled = json.loads(BUNDLED_MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(bundled["version"], PUBLIC_VERSION)
+        bundled_sha = next(a["sha256"] for a in bundled["artifacts"] if a["name"] == PUBLIC_WHEEL)
+        # The public command and the same-origin download name the same wheel bytes.
+        self.assertEqual(bundled_sha, PUBLIC_WHEEL_SHA256)
+        self.assertIn(f"releases/download/v{PUBLIC_VERSION}/{PUBLIC_WHEEL}#sha256={bundled_sha}'", command)
+        self.assertTrue(command.startswith("python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install "))
+        self.assertTrue(command.endswith(" && ./heel-rc4/bin/heel --version"))
+        for path in INSTALL_DOCS + PAIRED_RUNNER_SURFACES:
             source = (ROOT / path).read_text(encoding="utf-8")
             unwrapped = " ".join(source.split())
             self.assertIn(command, source, path)
-            self.assertIn(release, source, path)
-            self.assertIn("./heel-rc2/bin/heel ", source, path)
-            self.assertIn("Intel macOS is unsupported", unwrapped, path)
-            self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped, path)
-            self.assertIn("Python 3.11 or newer", unwrapped, path)
-            self.assertNotRegex(unwrapped, r"(?i)unpublished 1\.3\.0rc2|no public 1\.3\.0rc2 download", path)
-            # No copy advertises the candidate as published; any same-origin download names it
-            # as the not-yet-published 1.3.0rc4 candidate.
-            self.assertNotIn("releases/tag/v1.3.0rc4", source, path)
-            self.assertNotIn("releases/download/v1.3.0rc4", source, path)
+            self.assertIn(PUBLIC_RELEASE, source, path)
+            self.assertIn("./heel-rc4/bin/", source, path)
+            self.assertNotRegex(unwrapped, STALE_RC4, path)
+            # No current surface installs an earlier preview or names more than one wheel digest.
+            self.assertNotRegex(source, r"releases/download/v1\.3\.0rc[123]/|heel-rc[123]/", path)
+            self.assertEqual(
+                set(re.findall(r"heel_sim-1\.3\.0rc\d-py3-none-any\.whl#sha256=([0-9a-f]{64})", source)),
+                {PUBLIC_WHEEL_SHA256},
+                path,
+            )
             self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc3", source, path)
             if "/downloads/heel_sim-" in source:
-                self.assertRegex(unwrapped, r"1\.3\.0rc4 candidate[^.]*not yet published", path)
+                self.assertRegex(unwrapped, r"bundled 1\.3\.0rc4 (?:files|artifacts|wheel)", path)
+        for path in INSTALL_DOCS + PAIRED_RUNNER_SURFACES[:1]:
+            unwrapped = " ".join((ROOT / path).read_text(encoding="utf-8").split())
+            self.assertIn("Intel macOS is unsupported", unwrapped, path)
+            self.assertIn("Python 3.11 or newer", unwrapped, path)
+            self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped, path)
+            # No clean-room result is claimed for the rc4 command before its evidence exists.
+            self.assertNotRegex(unwrapped, r"passed on Apple silicon macOS with Python", path)
+        self.assertIn(PUBLIC_CLI, (ROOT / PAIRED_RUNNER_SURFACES[0]).read_text(encoding="utf-8"))
         page = (ROOT / "apps/heel-cloud/app/agent/page.tsx").read_text(encoding="utf-8")
         digest = re.search(r'const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";', page).group(1)
         template = re.search(r"const INSTALL_PUBLIC_AGENT = `([^`]*)`;", page).group(1)
         self.assertEqual(template.replace("${PUBLIC_WHEEL_SHA256}", digest), command)
+        self.assertNotRegex(page, r"releases/(?:tag|download)/v1\.3\.0rc[123]|heel-rc[123]\b")
+        # The internal launch record keeps naming the earlier public rc2 history and stays undeployed.
         launch = " ".join((ROOT / "docs/saas/LAUNCH.md").read_text(encoding="utf-8").split())
-        self.assertIn(release, launch)
+        self.assertIn("https://github.com/ancilis/heel/releases/tag/v1.3.0rc2", launch)
         self.assertNotIn("later work", launch)
         self.assertIn("not publicly deployed", launch)
-        for path in PAIRED_RUNNER_SURFACES:
-            source = (ROOT / path).read_text(encoding="utf-8")
-            self.assertNotIn(command, source, path)
-            self.assertNotIn("./heel-rc2/bin/heel", source, path)
-
-    def test_paired_runner_install_is_the_reviewed_rc3_runbook_command(self):
-        import json
-
-        command = PAIRED_RUNNER_RC3_INSTALL
-        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC3.md").read_text(encoding="utf-8")
-        section = runbook[runbook.index("## Customer install command"):]
-        self.assertEqual(re.search(r"```sh\n(.*)\n```", section).group(1), command)
-        published = json.loads(PAIRED_RUNNER_RC3_MANIFEST.read_text(encoding="utf-8"))
-        self.assertEqual(published["version"], "1.3.0rc3")
-        published_sha = next(
-            a["sha256"] for a in published["artifacts"] if a["name"] == PAIRED_RUNNER_RC3_WHEEL
-        )
-        self.assertIn(f"{PAIRED_RUNNER_RC3_WHEEL}#sha256={published_sha}'", command)
-        # The paired-runner install never names the unpublished bundled candidate.
-        self.assertNotIn("1.3.0rc4", command)
-        self.assertIn(
-            "releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256="
-            "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca'",
-            command,
-        )
-        self.assertTrue(command.startswith("python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "))
-        self.assertTrue(command.endswith(" && ./heel-rc3/bin/heel --version"))
-        for path in PAIRED_RUNNER_SURFACES:
-            source = (ROOT / path).read_text(encoding="utf-8")
-            self.assertIn(command, source, path)
-            self.assertIn(PAIRED_RUNNER_RC3_RELEASE, source, path)
-            self.assertIn("./heel-rc3/bin/heel", source, path)
-            self.assertNotIn("releases/download/v1.3.0rc2/", source, path)
-            self.assertNotIn("releases/tag/v1.3.0rc2", source, path)
-            self.assertNotIn("heel-rc2", source, path)
-            # Exactly one rc3 wheel digest is named, and it is the reviewed final one.
-            self.assertEqual(
-                set(re.findall(r"heel_sim-1\.3\.0rc3-py3-none-any\.whl#sha256=([0-9a-f]{64})", source)),
-                {"0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca"},
-                path,
-            )
-        page = (ROOT / PAIRED_RUNNER_SURFACES[0]).read_text(encoding="utf-8")
-        unwrapped = " ".join(page.split())
-        self.assertIn(PAIRED_RUNNER_RC3_CLI, page)
-        self.assertIn("Intel macOS is unsupported", unwrapped)
-        self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped)
-        self.assertIn("Python 3.11 or newer", unwrapped)
-        self.assertNotRegex(unwrapped, r"(?i)unpublished 1\.3\.0rc3|no public 1\.3\.0rc3 download")
-
 
 if __name__ == "__main__":
     unittest.main()

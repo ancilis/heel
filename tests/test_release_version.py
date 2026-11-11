@@ -17,15 +17,17 @@ VERSION = "1.3.0rc4"
 # npm metadata needs SemVer; this is the single normalization mapping, not a second version.
 NPM_VERSION = "1.3.0-rc.4"
 LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1", "1.3.0rc2", "1.3.0rc3"})
-# The public GitHub prerelease that customer copy installs from its pinned release URL. 1.3.0rc1
-# stays a published prerelease, named in copy only as erratum history.
-PUBLIC_VERSION = "1.3.0rc2"
+# The public GitHub prerelease that every customer install surface installs from its pinned release URL,
+# once the release owner's anonymous verify-public for it passes. Earlier previews stay published and are
+# named in copy only as history.
+PUBLIC_VERSION = "1.3.0rc4"
 PREVIOUS_PREVIEW_VERSION = "1.3.0rc1"
+EARLIER_PUBLIC_VERSIONS = ("1.3.0rc1", "1.3.0rc2", "1.3.0rc3")
 PUBLIC_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{PUBLIC_VERSION}"
-# Only the paired-runner surfaces carry the published v1.3.0rc3 runner release; every other customer
-# surface stays on PUBLIC_VERSION. Pinned literally so a later version move cannot carry it along.
+# Historical release records the CHANGELOG keeps.
 PAIRED_RUNNER_VERSION = "1.3.0rc3"
 PAIRED_RUNNER_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{PAIRED_RUNNER_VERSION}"
+RC2_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc2"
 PUBLIC_WHEEL_URL = (
     f"https://github.com/ancilis/heel/releases/download/v{PUBLIC_VERSION}/"
     f"heel_sim-{PUBLIC_VERSION}-py3-none-any.whl"
@@ -110,39 +112,35 @@ class ReleaseVersionContractTests(unittest.TestCase):
         combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
         self.assertIn(AGENT_WHEEL, combined)
         self.assertIn(AGENT_SDIST, combined)
-        # The only older wheel name allowed is the published rc2 wheel inside its own release URL.
-        without_public_install = combined.replace(PUBLIC_WHEEL_URL, "")
+        # No older wheel name appears; the current wheel is installed from its own release URL.
         for legacy_version in LEGACY_VERSIONS:
-            self.assertNotIn(f"heel_sim-{legacy_version}", without_public_install)
-        # Customer copy installs the published rc2 from its own public release, never from an older
-        # release's download URL, and claims no public release for the unpublished candidate. The
-        # paired-runner page is checked separately below.
-        customer = paths[:4] + [ROOT / "docs/EXPORT_DEMO.md"]
+            self.assertNotIn(f"heel_sim-{legacy_version}", combined)
+        # Every customer install surface installs the current version from its own public release and
+        # never from an earlier preview's download URL.
+        customer = paths[:4] + [
+            ROOT / "docs/EXPORT_DEMO.md",
+            ROOT / "docs/PLAN_DIFFERENTIAL_RUNNER.md",
+            ROOT / "apps/heel-cloud/app/runner/page.tsx",
+        ]
         for path in customer:
             text = path.read_text(encoding="utf-8")
             self.assertIn(f"releases/tag/v{PUBLIC_VERSION}", text, path)
-            self.assertNotIn(f"releases/download/v{PREVIOUS_PREVIEW_VERSION}", text, path)
+            for earlier in EARLIER_PUBLIC_VERSIONS:
+                self.assertNotIn(f"releases/download/v{earlier}", text, path)
             self.assertNotRegex(text, rf"{PUBLIC_VERSION}[^.]*not yet published as a GitHub release", path)
-            self.assertNotIn(f"releases/tag/v{VERSION}", text, path)
-            self.assertNotIn(f"releases/download/v{VERSION}", text, path)
-        # The paired-runner page installs the reviewed rc3 runner from its own public release
-        # (pinned exactly in test_release_automation) and never from rc1 or rc2.
-        runner = (ROOT / "apps/heel-cloud/app/runner/page.tsx").read_text(encoding="utf-8")
-        self.assertIn(f"releases/tag/v{PAIRED_RUNNER_VERSION}", runner)
-        for older in (PREVIOUS_PREVIEW_VERSION, PUBLIC_VERSION):
-            self.assertNotIn(f"releases/download/v{older}", runner)
-            self.assertNotIn(f"releases/tag/v{older}", runner)
-        self.assertNotRegex(runner, rf"{PAIRED_RUNNER_VERSION}[^.]*not yet published as a GitHub release")
-        for path in customer[:2] + customer[4:5]:
+            self.assertNotRegex(text, rf"{PUBLIC_VERSION} candidate", path)
+        for path in customer[:2] + customer[4:]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        # The CHANGELOG records the publication only after it happens: its date and release URL are
+        # added by the release owner after verify-public, not by this customer-copy change.
         self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
         self.assertEqual(changelog.count("unpublished candidate"), 1)
         self.assertNotIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
         self.assertIn(f"## [{PAIRED_RUNNER_VERSION}]: 2026-11-11", changelog)
         self.assertIn(PAIRED_RUNNER_RELEASE_URL, changelog)
-        self.assertIn(f"## [{PUBLIC_VERSION}]: 2026-11-10", changelog)
-        self.assertIn(PUBLIC_RELEASE_URL, changelog)
+        self.assertIn("## [1.3.0rc2]: 2026-11-10", changelog)
+        self.assertIn(RC2_RELEASE_URL, changelog)
         self.assertIn(f"## [{PREVIOUS_PREVIEW_VERSION}]: 2026-10-23", changelog)
         self.assertIn(
             f"https://github.com/ancilis/heel/releases/tag/v{PREVIOUS_PREVIEW_VERSION}", changelog,
