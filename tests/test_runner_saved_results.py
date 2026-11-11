@@ -303,7 +303,9 @@ def test_add_persists_a_bounded_context_bound_definition_across_reopen(
     assert reopened.list_saved_regressions() == [record]
     code, output, error = invoke("runner", "regress", "list")
     assert (code, error) == (0, "")
-    assert json.loads(output) == {"regression_count": 1, "regressions": [record]}
+    assert json.loads(output) == {
+        "regression_count": 1, "regressions": [record], "result_count": 0, "results": [],
+    }
 
 
 def test_duplicate_add_is_deterministic_and_never_rewrites(tmp_path, monkeypatch, no_network):
@@ -597,7 +599,9 @@ def test_list_on_a_fresh_bound_store_is_empty(tmp_path, monkeypatch, no_network)
     use_home(monkeypatch, tmp_path)
     code, output, error = invoke("runner", "regress", "list")
     assert (code, error) == (0, "")
-    assert json.loads(output) == {"regression_count": 0, "regressions": []}
+    assert json.loads(output) == {
+        "regression_count": 0, "regressions": [], "result_count": 0, "results": [],
+    }
 
 
 def test_saved_definition_is_data_with_no_authority_fields(tmp_path):
