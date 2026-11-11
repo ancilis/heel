@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import { canonicalPublicOrigin } from "../../build/deployment-config";
 import type { RunnerPairingView } from "../../lib/canary-api";
 
 
@@ -9,6 +10,15 @@ import type { RunnerPairingView } from "../../lib/canary-api";
 export const RUNNER_RC2_INSTALL = "python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc2/heel_sim-1.3.0rc2-py3-none-any.whl#sha256=f8698204e1d38aa80b8ca31dedd743c3d42e28d02c5153bddb4f02b44ecdf01c' && ./heel-rc2/bin/heel --version";
 export const RUNNER_RC2_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc2";
 const PAIRING_ID_SHAPE = /^pending_[0-9a-f]{32}$/;
+export const PAIRING_UNCONFIGURED = "Runner pairing is unavailable: this dashboard's public address is not configured, so no pair command can be shown. No invitation was created; contact your Heel operator.";
+
+/**
+ * The runner's `--origin`: the deployment's one canonical public origin, inlined at build time from the validated
+ * HEEL_PUBLIC_ORIGIN (next.config.ts) and checked again here. Anything else yields no command.
+ */
+function runnerOrigin(): string | null {
+  return canonicalPublicOrigin(process.env.HEEL_PUBLIC_ORIGIN);
+}
 
 /** The words the person typed from their terminal, compared case- and spacing-insensitively to the server's phrase. */
 export function pairingPhraseMatches(typed: string, phrase: string): boolean {
@@ -47,6 +57,7 @@ export function RunnerPairingCard({
   const [pairingId, setPairingId] = useState("");
   const invitationExpired = invitation !== null && nowSeconds >= invitation.expiresAt;
   const candidateId = pairingId.trim();
+  const origin = runnerOrigin();
 
   return (
     <section className="runner-recovery" aria-labelledby="pair-runner-title"><p className="canary-kicker">Local runner</p><h2 id="pair-runner-title">Pair a runner</h2>
@@ -54,9 +65,9 @@ export function RunnerPairingCard({
       <p>1. Install the public preview runner (<a href={RUNNER_RC2_RELEASE_URL}>Heel 1.3.0rc2 release</a>):</p>
       <p><code>{RUNNER_RC2_INSTALL}</code></p>
       <p>2. Create a one-time invitation. It expires after 10 minutes and is shown only here, once.</p>
-      {invitation !== null && !invitationExpired ? <div role="group" aria-label="Runner pairing invitation">
-        <p>Run this on the runner machine before {clock(invitation.expiresAt)}, replacing <code>{"<dashboard-origin>"}</code> with this dashboard&apos;s exact https:// address without a path. It prints a pairing id, six words and a fingerprint:</p>
-        <p><code>{`./heel-rc2/bin/heel runner pair --origin <dashboard-origin> --invite ${invitation.token}`}</code></p>
+      {origin === null ? <p role="status">{PAIRING_UNCONFIGURED}</p> : invitation !== null && !invitationExpired ? <div role="group" aria-label="Runner pairing invitation">
+        <p>Run this on the runner machine before {clock(invitation.expiresAt)}. It prints a pairing id, six words and a fingerprint:</p>
+        <p><code>{`./heel-rc2/bin/heel runner pair --origin ${origin} --invite ${invitation.token}`}</code></p>
       </div> : <>
         {invitationExpired ? <p role="status">This invitation expired unused or unopened. Create a new one.</p> : null}
         <button className="button button-primary" disabled={busy} onClick={onCreateInvitation} type="button">Create pairing invitation</button>

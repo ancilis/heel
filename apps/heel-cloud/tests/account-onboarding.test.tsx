@@ -77,6 +77,8 @@ class FakeControlPlane {
   recentAuth = true;
   /** Active runners per workspace, as the binding dashboard lists them. */
   readonly runners = new Map<string, Wire[]>();
+  /** Runner-context bindings per workspace, as the binding dashboard lists them. */
+  readonly bindings = new Map<string, Wire[]>();
   /** One runner pairing as the real store keeps it after `heel runner pair` exchanged the invitation. */
   pairing: { workspaceRef: string; pairingId: string; runnerId: string; phrase: string; fingerprint: string; expiresAt: number; status: "pending" | "approved" } | null = null;
   invitationExpiresAt = () => Date.now() / 1000 + 600;
@@ -236,9 +238,14 @@ class FakeControlPlane {
       }
       if (runnerId !== undefined) {
         const listed = this.runners.get(ws) ?? [];
+        const bound = this.bindings.get(ws) ?? [];
+        // Like the real store, an active runner is revocable whether or not the bindable-runner selector lists it.
+        const active = listed.some((item) => item.runner_id === runnerId)
+          || bound.some((item) => item.runner_id === runnerId && item.status === "active");
         if (method !== "POST" || body !== '{"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}'
-          || !listed.some((item) => item.runner_id === runnerId)) return json({ error: "invalid runner revocation", code: "invalid_runner_revocation" }, 400);
+          || !active) return json({ error: "invalid runner revocation", code: "invalid_runner_revocation" }, 400);
         this.runners.set(ws, listed.filter((item) => item.runner_id !== runnerId));
+        this.bindings.set(ws, bound.map((item) => item.runner_id === runnerId ? { ...item, status: "revoked" } : item));
         return json({ schema_version: "heel.runner-revoke-result.v1", revoked: true });
       }
       if (pairingId === undefined) {
@@ -262,7 +269,7 @@ class FakeControlPlane {
     }
     const bindingsRoute = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/);
     if (method === "GET" && bindingsRoute) {
-      return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: this.runners.get(bindingsRoute[1]) ?? [], bindings: [] });
+      return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: this.runners.get(bindingsRoute[1]) ?? [], bindings: this.bindings.get(bindingsRoute[1]) ?? [] });
     }
     return json({ error: "not modeled" }, 503);
   };
@@ -2104,7 +2111,11 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
   const FINGERPRINT = "f".repeat(64);
   const PAIRING_ID = `pending_${"1".repeat(32)}`;
   const RECENT_AUTH = "For your security, pairing or revoking a runner needs an owner or admin sign-in from the last 15 minutes. Sign out, sign in again, then create a new invitation.";
+  const PAIRING_UNCONFIGURED = "Runner pairing is unavailable: this dashboard's public address is not configured, so no pair command can be shown. No invitation was created; contact your Heel operator.";
   const GONE = "That pairing request is no longer available: it expired, was already used, or belongs to another workspace. Create a new invitation and run the pair command again.";
+
+  beforeEach(() => { vi.stubEnv("HEEL_PUBLIC_ORIGIN", "https://heel.example"); });
+  afterEach(() => { vi.unstubAllEnvs(); });
 
   function verifiedOwner(role: Role = "owner", projects = ["Customer staging"]): { ws: string; prj: string; prj2: string } {
     const account = server.account(EMAIL, SECRET, [{ role, projects }]);
@@ -2186,7 +2197,8 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     const mark = server.calls.length;
 
     const token = await createInvitation();
-    expect(within(card).getByText(`./heel-rc2/bin/heel runner pair --origin <dashboard-origin> --invite ${token}`)).toBeTruthy();
+    expect(within(card).getByText(`./heel-rc2/bin/heel runner pair --origin https://heel.example --invite ${token}`)).toBeTruthy();
+    expect(card.textContent).not.toContain("<dashboard-origin>");
     expect(within(card).getByText(/before \d{1,2}:\d{2}/)).toBeTruthy();
     expectTokenOnlyOnScreen(token);
 
@@ -2336,5 +2348,88 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     fireEvent.click(within(second).getByRole("button", { name: "Confirm revoke Laptop b" }));
     // With no runner left, the workspace can pair a fresh one.
     await pairCard();
+  });
+
+  function bindingWire(n: string, runnerId: string, status: "active" | "revoked" | "expired", expiresAtMs = Date.now() + 3_600_000): Wire {
+    return { binding_id: `rcb_${n.repeat(32)}`, binding_digest: n.repeat(64), environment_id: `env_${n.repeat(32)}`, origin: TARGET,
+      environment_class: "staging", verification_record_digest: "a".repeat(64), runner_id: runnerId, runner_key_id: `key-${runnerId}`,
+      status, issued_at_ms: 1, expires_at_ms: expiresAtMs, first_claimed_at_ms: null };
+  }
+
+  function revokeTarget(ws: string, prj: string): void {
+    const [record] = server.environments.get(`${ws}/${prj}`) ?? [];
+    server.environments.set(`${ws}/${prj}`, [{ ...record, status: "revoked", revoked_at: 2, is_executable: false }]);
+  }
+
+  async function revokeBoundRunner(ws: string): Promise<void> {
+    const list = await screen.findByRole("list", { name: "Paired runners" });
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    const mark = server.calls.length;
+    const [item] = within(list).getAllByRole("listitem");
+    expect(item.querySelector("span")?.textContent).toBe("runner-a");
+    fireEvent.click(within(item).getByRole("button", { name: "Revoke runner" }));
+    fireEvent.click(within(item).getByRole("button", { name: "Confirm revoke runner-a" }));
+    await screen.findByText(/^Runner revoked\./);
+    expect(runnerCalls(mark)).toEqual([
+      'POST /runners/runner-a/revoke {"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}',
+    ]);
+    // The list was refreshed from the server: the binding is now revoked and no runner remains to revoke.
+    expect(server.calls.slice(mark).filter((call) => call.method === "GET" && call.path.endsWith("/runner-context-bindings")).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("list", { name: "Paired runners" })).toBeNull();
+    expect((server.bindings.get(ws) ?? []).map((item) => item.status)).toEqual(["revoked"]);
+  }
+
+  test("R1 D2 (i): a runner hidden from the bindable list by its active binding stays revocable and blocks a second pairing", async () => {
+    const { ws } = verifiedOwner();
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "active")]);
+    render(<Dashboard />);
+    await revokeBoundRunner(ws);
+    // With the only runner revoked, the workspace can pair a fresh one.
+    await pairCard();
+  });
+
+  test("R1 D2 (ii): runner revoke stays reachable when the project has no executable target", async () => {
+    const { ws, prj } = verifiedOwner();
+    revokeTarget(ws, prj);
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "active")]);
+    render(<Dashboard />);
+    await screen.findByText("Ready for customer setup");
+    await settle();
+    expect(screen.queryByRole("button", { name: "Authorize paired runner" })).toBeNull();
+    await revokeBoundRunner(ws);
+    // Pairing still needs a verified target.
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+  });
+
+  test("R1 D2 (iii): only revoked or expired bindings offer pairing and no runner revoke", async () => {
+    const { ws } = verifiedOwner();
+    server.bindings.set(ws, [
+      bindingWire("1", "runner-a", "revoked"),
+      bindingWire("2", "runner-b", "expired"),
+      bindingWire("3", "runner-c", "active", Date.now() - 1),
+    ]);
+    render(<Dashboard />);
+    await pairCard();
+    await settle();
+    expect(screen.queryByRole("list", { name: "Paired runners" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Revoke runner" })).toBeNull();
+  });
+
+  test("R1 origin: with no valid configured public origin no pair command or invitation is offered", async () => {
+    for (const configured of ["", "http://heel.example", "https://heel.example/", "https://localhost"]) {
+      cleanup();
+      server = new FakeControlPlane();
+      vi.stubGlobal("fetch", server.fetch);
+      vi.stubEnv("HEEL_PUBLIC_ORIGIN", configured);
+      verifiedOwner();
+      render(<Dashboard />);
+      const card = await pairCard();
+      const mark = server.calls.length;
+      expect(within(card).getByRole("status").textContent, configured).toBe(PAIRING_UNCONFIGURED);
+      expect(within(card).queryByRole("button", { name: "Create pairing invitation" }), configured).toBeNull();
+      expect(card.textContent, configured).not.toMatch(/--origin|--invite|<dashboard-origin>/);
+      await settle();
+      expect(runnerCalls(mark), configured).toEqual([]);
+    }
   });
 });
