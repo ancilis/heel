@@ -150,6 +150,7 @@ const RUNNER_NEXT_NONCE = /^[A-Za-z0-9+/]{43}=$/;
 const RUNNER_PAIRING_EXCHANGE = "/v1/runner-pairings/exchange";
 const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/pending_[0-9a-f]{32}\/(?:activate|activation-abort)$/;
 const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/pending_[0-9a-f]{32}(?:/approve)?)?$`);
+const RUNNER_PAIRING_INSPECT = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings/pending_[0-9a-f]{32}$`);
 const RUNNER_ROTATION_START = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotate$`);
 const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotations/rotation_[0-9a-f]{32}/approve$`);
 const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/revoke$`);
@@ -216,16 +217,18 @@ function withSecurityHeaders(response: Response, csp: string, noStore = false): 
 class InvalidControlPlaneRequest extends Error {}
 
 function singletonHeader(source: Headers, name: string): string | null {
-  // Cloudflare Headers preserves duplicate fields through getAll.  The web-test
-  // implementation merges them, for which a comma is invalid for every runner
-  // proof field and therefore remains fail-closed.
-  const cloudflare = source as Headers & { getAll?: (header: string) => string[] };
-  if (typeof cloudflare.getAll === "function") {
-    const values = cloudflare.getAll(name);
-    return values.length === 1 ? values[0] : null;
-  }
+  // Fetch Headers (workerd included) merges duplicate fields into one ", "-joined value; workerd's
+  // non-standard getAll throws a TypeError for every name except Set-Cookie, so it is never used.
+  // A comma is invalid in every field read here, so a duplicated field stays fail-closed.
   const value = source.get(name);
   return value === null || value.includes(",") ? null : value;
+}
+
+// Cloudflare hands the Worker every request with `Connection: Keep-Alive` (any client value is
+// overwritten). It is hop-by-hop and never forwarded: upstream headers are rebuilt from scratch.
+function edgeConnectionHeader(source: Headers): boolean {
+  const value = source.get("Connection");
+  return value === null || /^keep-alive$/i.test(value);
 }
 
 function controlPlaneCredentials(source: Headers): Headers {
@@ -280,7 +283,7 @@ function controlPlaneRequestHeaders(
     // Runner proof headers are an isolated protocol: a caller cannot nominate a
     // hop-by-hop/header-smuggling field or impersonate an edge-derived origin.
     if (method !== "POST" || source.has("Authorization") || source.has("Cookie")
-      || source.has("Connection") || source.has("TE") || source.has("Transfer-Encoding")
+      || !edgeConnectionHeader(source) || source.has("TE") || source.has("Transfer-Encoding")
       || source.has("Content-Encoding") || source.has("X-Heel-Internal-Origin")) throw new InvalidControlPlaneRequest();
     headers = new Headers();
     for (const name of RUNNER_HEADERS) {
@@ -316,12 +319,17 @@ function controlPlaneRequestHeaders(
       headers.set("Origin", origin);
     }
   } else if (runnerPairingHuman) {
-    const origin = source.get("Origin") ?? "";
-    if (origin !== configuredPublicOrigin || source.get("Sec-Fetch-Site") !== "same-origin") throw new InvalidControlPlaneRequest();
+    // A browser sends no Origin on a same-origin GET (Fetch: "append a request Origin header"), so the
+    // read-only pairing inspect proves same-origin by fetch metadata alone; an Origin it does carry
+    // must still be exact. Every state-changing pairing method keeps the exact Origin requirement.
+    const origin = source.get("Origin");
+    const browserRead = method === "GET" && RUNNER_PAIRING_INSPECT.test(upstreamPath) && origin === null;
+    if (configuredPublicOrigin === undefined || (!browserRead && origin !== configuredPublicOrigin)
+      || source.get("Sec-Fetch-Site") !== "same-origin") throw new InvalidControlPlaneRequest();
     headers = controlPlaneCredentials(source);
     if (!headers.has("Cookie") || headers.has("Authorization")) throw new InvalidControlPlaneRequest();
     headers.set("X-Heel-Internal-Origin", "same-origin");
-    headers.set("Origin", origin);
+    headers.set("Origin", configuredPublicOrigin);
   } else
   if (
     upstreamPath === SIGNUP_ROUTE
