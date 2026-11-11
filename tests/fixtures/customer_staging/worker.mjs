@@ -1,9 +1,9 @@
 // Controlled synthetic acceptance target for the Heel customer journey.
 //
 // A standalone Cloudflare Worker with no bindings, storage, outbound fetch, redirect or
-// dependency. It serves one ownership-proof file, one plan-gated export route, one health
-// route and its own static OpenAPI inventory. All data is static and fake. Nothing here is
-// Heel product code.
+// dependency. It serves one ownership-proof file, two plan-gated export routes (an ordinary
+// markerless one and a canary-bound one), one health route and its own static OpenAPI
+// inventory. All data is static and fake. Nothing here is Heel product code.
 //
 // Operator configuration (never request-controlled):
 //   HEEL_TARGET_MODE       var:    vulnerable | patched | error_envelope
@@ -14,24 +14,31 @@
 // Missing, malformed or equal digests, or an unknown mode, fail closed with 503.
 
 // The one approved synthetic canary fixture id (tests/plan_differential_support.py MARKER).
-// Heel's paired runner learns a marker only from a route fixture binding, so the export
-// lives at /api/exports/{id} and is served only for this exact id; the protected export
-// body carries it in the top-level protected_canary field. It is public and not a secret.
+// Heel's paired runner learns a marker only from a route fixture binding, so the canary
+// export lives at /api/exports/{id} and is served only for this exact id; that body carries
+// it in the top-level protected_canary field. It is public and not a secret.
 export const CANARY_ID = "heel-canary-export-0001";
-// The same fake export payload as tests/plan_differential_support.py EXPORT, plus the marker.
+// Ordinary export at /api/export: the same fake payload as tests/plan_differential_support.py
+// EXPORT, with no marker (97 bytes, unchanged from the original 47ab432 fixture).
 const EXPORT = Object.freeze({
   account_id: "acct_canary",
   format: "csv",
   rows: [{ id: "row_1", amount_cents: 1200 }],
   total: 1,
-  protected_canary: CANARY_ID,
 });
+// Canary export at /api/exports/heel-canary-export-0001: the same payload plus the marker.
+const CANARY_EXPORT = Object.freeze({ ...EXPORT, protected_canary: CANARY_ID });
 // Served verbatim at /openapi.json; byte-for-byte equal to openapi.json beside this file.
-// Ordinary path parameter only: no marker value, plan, finding or extension annotation.
+// Two export paths; the id route has an ordinary path parameter only. No marker value,
+// example, plan, finding or extension annotation.
 const OPENAPI = JSON.stringify({
   openapi: "3.1.0",
-  info: { title: "Heel controlled staging target API", version: "1.1.0" },
+  info: { title: "Heel controlled staging target API", version: "1.2.0" },
   paths: {
+    "/api/export": {
+      get: { operationId: "getAccountExport", responses: { 200: { description: "ok" } } },
+      head: { operationId: "headAccountExport", responses: { 200: { description: "ok" } } },
+    },
     "/api/exports/{id}": {
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
       get: { operationId: "getExport", responses: { 200: { description: "ok" } } },
@@ -46,6 +53,7 @@ export const MODES = Object.freeze(["vulnerable", "patched", "error_envelope"]);
 // Exact concrete paths only: any other export id is an unknown path (404, never reflected).
 export const ROUTES = Object.freeze({
   "/.well-known/heel-verify.txt": "/.well-known/heel-verify.txt",
+  "/api/export": "/api/export",
   [`/api/exports/${CANARY_ID}`]: "/api/exports/{id}",
   "/healthz": "/healthz",
   "/openapi.json": "/openapi.json",
@@ -116,8 +124,9 @@ function json(status, value) {
   return { status, type: "application/json", body: encoder.encode(JSON.stringify(value)) };
 }
 
-function exportResponse(mode, plan) {
-  if (plan === "pro" || mode === "vulnerable") return json(200, EXPORT);
+// Both export routes share the same auth and modes; only the served payload differs.
+function exportResponse(route, mode, plan) {
+  if (plan === "pro" || mode === "vulnerable") return json(200, route === "/api/export" ? EXPORT : CANARY_EXPORT);
   if (mode === "patched") return { status: 403, type: null, body: new Uint8Array(0) };
   return json(403, DENIAL_ENVELOPE);
 }
@@ -150,7 +159,7 @@ async function decide(request, env, method, route) {
   if (plan !== "free" && plan !== "pro") {
     return { role: plan, ...json(401, { error: "unauthenticated" }), authenticate: true };
   }
-  return { role: plan, ...exportResponse(config.mode, plan) };
+  return { role: plan, ...exportResponse(route, config.mode, plan) };
 }
 
 async function handle(request, env) {
