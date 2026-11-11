@@ -239,6 +239,10 @@ class RunnerService:
             submit_pending()
         lease = self.coordinator.claim()
         if lease is None:
+            # Idle step: advance the metadata-only result handoff (H2 §3.3) at the claim cadence.
+            advance = getattr(self.coordinator, "advance_disclosures", None)
+            if advance is not None:
+                advance()
             return False
         if not isinstance(lease, ClaimLease) or type(lease.run_id) is not str or not lease.run_id:
             raise ValueError("coordinator returned an invalid claim lease")

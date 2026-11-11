@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from heel.canary_contracts import (
+    DISCLOSURE_PERMIT_SCHEMA,
     OPERATIONAL_RUN_SCHEMA,
     canonical_bytes,
     canonical_digest,
@@ -62,6 +63,15 @@ class RunnerMaintenanceResult:
 
     processed: int
     has_more: bool
+
+
+# Result handoff (H2 §3.3): poll every idle step (the service paces steps at >= 2 s) for ten
+# minutes after a run's terminal time, then at most once per minute until retention expiry.
+DISCLOSURE_FAST_POLL_WINDOW_MS = 10 * 60 * 1000
+DISCLOSURE_SLOW_POLL_INTERVAL_MS = 60 * 1000
+# Network polls one serve step may send; local index pages are walked to the end.
+DISCLOSURE_POLLS_PER_STEP = 16
+_DISCLOSURE_STOP_STATES = frozenset({"local_only", "synchronized"})
 
 
 class RunnerCoordinator:
@@ -120,6 +130,12 @@ class RunnerCoordinator:
         # can never lose a race to an older coordinator snapshot.
         self._heartbeat_guards: dict[str, threading.Lock] = {}
         self._maintenance_lock = threading.Lock()
+        # Process-local disclosure polling state (CONTROLLER-LOCAL-STOP-DECISION): the stop set is
+        # never persisted, holds only retained ``available`` runs and is pruned at retention or
+        # removal; a restarted process may send one idempotent metadata-only poll per run.
+        self._disclosure_lock = threading.Lock()
+        self._disclosure_stopped: set[str] = set()
+        self._disclosure_last_poll_ms: dict[str, int] = {}
         self._pending_result_replay_verifier = store.pending_result_replay_verifier(control.runtime)
         try:
             self._recover_terminal_runtime_state()
@@ -152,6 +168,13 @@ class RunnerCoordinator:
                 )
                 break
             for item in pending:
+                if item.request_operation == "poll-disclosure":
+                    # Replay the sealed metadata-only poll byte-identically; its answer is a read
+                    # the next serve step repeats, so it is never acted on here.
+                    self.poll_disclosure(
+                        item.run_id, findings_projection=self._local_findings(item.run_id),
+                    )
+                    continue
                 if item.request_operation == "upload-findings":
                     # Findings recovery remains lease/permit bound.  Re-enter
                     # the coordinator rather than allowing the client to infer
@@ -936,6 +959,95 @@ class RunnerCoordinator:
             run_id=run_id, permit=permit_value, findings_projection=findings,
         )
         return receipt
+
+
+    def _local_findings(self, run_id: str) -> dict[str, Any]:
+        """The exact store-verified local findings projection ``heel runner findings`` prints."""
+        try:
+            finals = self.store.load_final_projections(run_id)
+            return validate_canary_findings(finals["local_view"]["findings_projection"])
+        except (RunnerStoreError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("local findings projection is unavailable") from exc
+
+    def poll_disclosure(self, run_id: str, *, findings_projection: object) -> dict[str, Any]:
+        """Send only digest/bytes/counts of the local findings on the terminal result chain."""
+        if type(run_id) is not str or not run_id:
+            raise ValueError("active runner claim is required")
+        try:
+            findings = validate_canary_findings(findings_projection)
+            runtime_terminal = self.control.runtime.load_terminal_state(run_id)
+            if runtime_terminal is None:
+                raise RunnerStoreError("local terminal disclosure authority is unavailable")
+            anchor = self.store.load_terminal_disclosure_anchor(
+                run_id, runtime=self.control.runtime,
+                expected_runtime_state_digest=runtime_terminal.state_digest,
+            )
+        except (RunnerStoreError, TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        if (
+            findings["workspace_id"] != self.identity.workspace_id
+            or findings["run_id"] != run_id
+            or findings["project_id"] != anchor["project_id"]
+            or findings["grant_id"] != anchor["grant_id"]
+            or findings["approval_projection_digest"] != anchor["approval_projection_digest"]
+        ):
+            raise ValueError("invalid runner disclosure poll")
+        return self.control.poll_disclosure(run_id=run_id, findings_projection=findings)
+
+    def _disclosure_due(self, state: Any, now: int) -> bool:
+        if state.run_id in self._disclosure_stopped or now >= state.retention_expires_at_ms:
+            return False
+        if now < state.terminal_at_ms + DISCLOSURE_FAST_POLL_WINDOW_MS:
+            return True
+        last = self._disclosure_last_poll_ms.get(state.run_id)
+        return last is None or now - last >= DISCLOSURE_SLOW_POLL_INTERVAL_MS
+
+    def _advance_one_disclosure(self, run_id: str) -> None:
+        findings = self._local_findings(run_id)
+        answer = self.poll_disclosure(run_id, findings_projection=findings)
+        if answer.get("schema_version") == DISCLOSURE_PERMIT_SCHEMA:
+            # The explicit human permit is re-verified (binding, window, authority) by
+            # ``upload_findings`` before any byte leaves; it then commits ``consumed``.
+            self.upload_findings(run_id, permit=answer, findings_projection=findings)
+            return
+        if answer["status"] in _DISCLOSURE_STOP_STATES:
+            with self._disclosure_lock:
+                self._disclosure_stopped.add(run_id)
+
+    def advance_disclosures(self) -> int:
+        """One bounded serve step of the result handoff; returns the polls sent.
+
+        Walks the retained, unexpired, zero-pending ``available`` disclosures; polls those due;
+        uploads the exact local projection once on a human permit; stops for this process on
+        ``local_only``/``synchronized``.  A locally refused permit or an unreadable answer leaves
+        the run ``available`` (a staged call is replayed on restart) and never uploads.
+        """
+        now = self._now_ms()
+        retained: set[str] = set()
+        due: list[str] = []
+        after = None
+        while True:
+            batch = self.control.runtime.load_available_disclosures(now_ms=now, after=after, limit=16)
+            for state in batch.items:
+                retained.add(state.run_id)
+                with self._disclosure_lock:
+                    if self._disclosure_due(state, now) and len(due) < DISCLOSURE_POLLS_PER_STEP:
+                        due.append(state.run_id)
+            if not batch.has_more or not batch.items:
+                break
+            after = (batch.items[-1].retention_expires_at_ms, batch.items[-1].run_hash)
+        with self._disclosure_lock:
+            self._disclosure_stopped.intersection_update(retained)
+            for run_id in set(self._disclosure_last_poll_ms) - retained:
+                self._disclosure_last_poll_ms.pop(run_id, None)
+        for run_id in due:
+            with self._disclosure_lock:
+                self._disclosure_last_poll_ms[run_id] = now
+            try:
+                self._advance_one_disclosure(run_id)
+            except ValueError:
+                continue
+        return len(due)
 
 
 class RunnerExecutionAdapter:

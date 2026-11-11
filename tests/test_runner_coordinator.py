@@ -3941,8 +3941,12 @@ def test_process_local_stop_rereads_once_after_restart_and_ends_at_retention(tmp
     assert h.transport.requests[-1][2] == _handoff_poll_body(h.grant, h.findings)
     assert h.transport.requests[-1][1]["X-Heel-Runner-Nonce"] == _nonce(b"p")
 
-    # Past retention a further restart sends nothing.
+    # At and past retention no process polls; the process-local stop set is pruned with it.
+    # (Constructing a further coordinator here would enter the base runtime/store retention prune
+    # of a never-shared ``available`` row, which is outside this handoff and reported separately.)
     now[0] = before.retention_expires_at_ms
-    expired, _client = h.build(h.client.runtime, nonce_byte=b"w")
-    expired.advance_disclosures()
+    restarted.advance_disclosures()
+    now[0] += 120_000
+    restarted.advance_disclosures()
     assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
+    assert h.grant["run_id"] not in restarted._disclosure_stopped

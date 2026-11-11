@@ -58,6 +58,8 @@ _RUNNER_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/revoke$")
 _RUNNER_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}(?:/claim|/runs/{_RUNNER}/(?:heartbeat|progress|result|stop-ack))$")
 _RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections))$")
 _RUNNER_RESULT_PROJECTION = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/result-projection$")
+# ``index.ts`` ``RUNNER_DISCLOSURE_POLL``: the metadata-only result-handoff poll, runner-proof family.
+_RUNNER_DISCLOSURE_POLL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/disclosure-poll$")
 _RUNNER_RESYNC = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/resync/(?:start|complete)$")
 # ``index.ts`` ``RUNNER_INACTIVE_CLAIM_ATTESTATION``: classified exactly like the resync family.
 _RUNNER_INACTIVE_CLAIM_ATTESTATION = re.compile(
@@ -127,7 +129,8 @@ def _edge_route(method: str, path: str) -> bool:
     if _RUNNER_ROTATION_START.match(path) or _RUNNER_ROTATION_APPROVE.match(path) or _RUNNER_REVOKE.match(path):
         return method == "POST"
     if (_RUNNER_CONTROL.match(path) or _RUNNER_CONTEXT_CONTROL.match(path)
-            or _RUNNER_RESULT_PROJECTION.match(path) or _resync_family(path)):
+            or _RUNNER_RESULT_PROJECTION.match(path) or _RUNNER_DISCLOSURE_POLL.match(path)
+            or _resync_family(path)):
         return method == "POST"
     return False
 
@@ -142,6 +145,8 @@ def _body_cap(path: str) -> int:
         return 16 * 1024
     if _RUNNER_RESULT_PROJECTION.match(path):
         return 272 * 1024
+    if _RUNNER_DISCLOSURE_POLL.match(path):
+        return 2 * 1024
     if _RUNNER_CONTEXT_CONTROL.match(path):
         if path.endswith("/contexts/list"):
             return 128
@@ -297,7 +302,8 @@ class EdgeTLSHarness:
                 method = self.command
                 has = lambda name: self.headers.get(name) is not None  # noqa: E731
                 runner_control = bool(_RUNNER_CONTROL.match(path) or _RUNNER_CONTEXT_CONTROL.match(path)
-                                      or _RUNNER_RESULT_PROJECTION.match(path))
+                                      or _RUNNER_RESULT_PROJECTION.match(path)
+                                      or _RUNNER_DISCLOSURE_POLL.match(path))
                 public = bool(path == _RUNNER_PAIRING_EXCHANGE or _RUNNER_PAIRING_ACTIVATE.match(path)
                               or _RUNNER_ROTATION_PUBLIC.match(path))
                 human = bool(_RUNNER_PAIRING_MANAGE.match(path) or _RUNNER_ROTATION_START.match(path)
