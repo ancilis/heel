@@ -1689,7 +1689,7 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
 // journey: no target is contacted and no proof is published anywhere.
 describe("CUSTOMER-TRACK-UX: a new customer registers one target through the existing ownership-proof contract", () => {
   const TARGET = "https://staging.customer.example.test";
-  const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+  const BOUNDARY = "Target verified. Heel Cloud never sends requests to it. Rehearsals run only from a runner on your own machine, using the read-only GET and HEAD requests of a plan you approve; credentials and raw evidence stay on that machine.";
   const FORBIDDEN = /credential|identit|secret|discover|scan|crawl|pairing|install|openapi|route-inventory|plan|finding/i;
 
   function selection(): { ws: string; prj: string } {
@@ -1832,7 +1832,7 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
     // An account with a private connector is told how authorization and local credentials differ, not that they are unavailable.
     expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent)
-      .toMatch(/^Target verified\. Managed scanning and discovery are not available in this build\. Target authorization is separate from test credentials:/);
+      .toMatch(/^Target verified\. Heel Cloud never sends requests to it; your paired runner sends only the read-only GET and HEAD requests of a plan you approve\. Target authorization is separate from test credentials:/);
     const activation = screen.getByRole("region", { name: /launch activation/i });
     expect(within(activation).getAllByRole("listitem").map((step) => step.querySelector("h2")?.textContent))
       .toEqual(["Verify staging", "Pair runner", "Add canary access", "Run first rehearsal"]);
@@ -1845,7 +1845,7 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
 
 // SEAM (CUSTOMER-TRACK-UX-F1): the same in-memory control plane; `/v1/me` is held to observe the loading state.
 describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before a private connector exists", () => {
-  const INTRO = "Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Managed scanning is not available in this build.";
+  const INTRO = "Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Heel Cloud sends no requests to your target: approved read-only rehearsals run from a runner on your own machine, and credentials and raw evidence stay there.";
 
   function expectNoRunnerFunnel(): void {
     expect(screen.queryByRole("region", { name: /launch activation/i })).toBeNull();
@@ -1860,7 +1860,7 @@ describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before
     expect(intro?.textContent).toContain(INTRO);
     expect(intro?.textContent).not.toMatch(/runner onboarding|canary rehearsal/i);
     const rail = screen.getByRole("complementary", { name: "Safety boundaries" });
-    expect(rail.textContent).toMatch(/No scan traffic is sent in this build\./);
+    expect(rail.textContent).toMatch(/Heel Cloud sends no requests to your target\./);
     expect(rail.textContent).toMatch(/Ownership check.*One proof file or DNS record/);
     expect(rail.textContent).toMatch(/Operational status only/);
     expect(rail.textContent).not.toMatch(/runner owns target traffic|GET \+ HEAD|:443/i);
@@ -1931,7 +1931,7 @@ describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before
 describe("CUSTOMER-TRACK-UX-F1: a pending ownership proof survives a reload and is resumed explicitly", () => {
   const TARGET = "https://staging.customer.example.test";
   const OTHER = "https://sandbox.customer.example.test";
-  const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+  const BOUNDARY = "Target verified. Heel Cloud never sends requests to it. Rehearsals run only from a runner on your own machine, using the read-only GET and HEAD requests of a plan you approve; credentials and raw evidence stay on that machine.";
   const EXPIRED = "This pending proof expired. Issue a replacement proof for the same target.";
   const RECENT_AUTH = "For your security, showing or replacing a pending proof needs a sign-in from the last 15 minutes. The proof is kept on the server: sign out, sign in again, then resume it.";
 
@@ -2529,7 +2529,7 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
 
   // CUSTOMER-ONBOARDING-STATE: the live journey's state. The bound runner is absent from the bindable list (the
   // server omits a runner while it is bound); its active binding names the project's exact verified environment.
-  const CONNECTOR_BOUNDARY = "Target verified. Managed scanning and discovery are not available in this build. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
+  const CONNECTOR_BOUNDARY = "Target verified. Heel Cloud never sends requests to it; your paired runner sends only the read-only GET and HEAD requests of a plan you approve. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
 
   function exactEnvironment(ws: string, prj: string, n: string): void {
     server.environments.set(`${ws}/${prj}`, [environmentWire(`env_${n.repeat(32)}`, TARGET, "https-file", true)]);

@@ -17,9 +17,9 @@ export interface PendingTarget {
   proofMethod: OwnershipProofMethod;
 }
 
-export const TARGET_UNAVAILABLE_BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+export const TARGET_UNAVAILABLE_BOUNDARY = "Target verified. Heel Cloud never sends requests to it. Rehearsals run only from a runner on your own machine, using the read-only GET and HEAD requests of a plan you approve; credentials and raw evidence stay on that machine.";
 /** The same boundary for an account that operates a paired private runner, which keeps its credentials locally. */
-export const TARGET_CONNECTOR_BOUNDARY = "Target verified. Managed scanning and discovery are not available in this build. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
+export const TARGET_CONNECTOR_BOUNDARY = "Target verified. Heel Cloud never sends requests to it; your paired runner sends only the read-only GET and HEAD requests of a plan you approve. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
 
 export interface TargetRegistrationCardProps {
   /** True when the account already operates a paired private runner or authorization for this project. */

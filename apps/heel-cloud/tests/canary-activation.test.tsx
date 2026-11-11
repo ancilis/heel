@@ -101,7 +101,10 @@ describe("canary activation dashboard", () => {
 
     const content = document.body.textContent?.toLowerCase() ?? "";
     expect(content).toMatch(/operational status only/i);
-    expect(content).not.toMatch(/raw evidence|credential|fixture id|openapi|authorization header|access token/i);
+    // The one boundary statement that credentials and raw evidence stay on the runner machine names them; nothing else may.
+    const boundary = "and credentials and raw evidence stay there.";
+    expect(content.split(boundary).length - 1).toBe(1);
+    expect(content.replace(boundary, "")).not.toMatch(/raw evidence|credential|fixture id|openapi|authorization header|access token/i);
     expect(screen.queryByText(/finding|vulnerab/i)).toBeNull();
   });
 
