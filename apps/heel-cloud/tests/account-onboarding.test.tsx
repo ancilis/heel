@@ -1743,7 +1743,9 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     alphaBetaBindings("create");
     render(<Dashboard />);
     await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
-    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent).toBe(BOUNDARY);
+    // An account with a private connector is told how authorization and local credentials differ, not that they are unavailable.
+    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent)
+      .toMatch(/^Target verified\. Managed scanning and discovery are not available in this build\. Target authorization is separate from test credentials:/);
     const activation = screen.getByRole("region", { name: /launch activation/i });
     expect(within(activation).getAllByRole("listitem").map((step) => step.querySelector("h2")?.textContent))
       .toEqual(["Verify staging", "Pair runner", "Add canary access", "Run first rehearsal"]);
@@ -2436,5 +2438,91 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
       await settle();
       expect(runnerCalls(mark), configured).toEqual([]);
     }
+  });
+
+  // CUSTOMER-ONBOARDING-STATE: the live journey's state. The bound runner is absent from the bindable list (the
+  // server omits a runner while it is bound); its active binding names the project's exact verified environment.
+  const CONNECTOR_BOUNDARY = "Target verified. Managed scanning and discovery are not available in this build. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
+
+  function exactEnvironment(ws: string, prj: string, n: string): void {
+    server.environments.set(`${ws}/${prj}`, [environmentWire(`env_${n.repeat(32)}`, TARGET, "https-file", true)]);
+  }
+
+  async function activationState(): Promise<{ meter: string; next: string; runner: string; access: string; text: string }> {
+    const activation = await screen.findByRole("region", { name: /launch activation/i });
+    await settle();
+    const state = (title: string) => within(activation).getAllByRole("listitem")
+      .find((item) => item.querySelector("h2")?.textContent === title)?.querySelector(".step-state")?.textContent ?? "";
+    return {
+      meter: activation.querySelector(".activation-meter")?.getAttribute("aria-label") ?? "",
+      next: within(activation).getByRole("status").textContent ?? "",
+      runner: state("Pair runner"), access: state("Add canary access"), text: activation.textContent ?? "",
+    };
+  }
+
+  test("ONBOARDING-STATE: a bound runner and its exact active binding read paired and authorized, never pair runner", async () => {
+    const { ws, prj } = verifiedOwner();
+    exactEnvironment(ws, prj, "1");
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "active")]);
+    render(<Dashboard />);
+    const state = await activationState();
+    expect(state.meter).toBe("2 of 4 setup steps complete");
+    expect(state.runner).toBe("Paired");
+    expect(state.access).toBe("Finish on runner");
+    expect(state.next).toMatch(/next action: finish local setup on the runner machine/i);
+    expect(state.next).not.toMatch(/pair runner/i);
+    expect(state.text).not.toMatch(/ready to pair|companion|20 minutes|rc3/i);
+    // Local credential readiness is never asserted by the cloud.
+    expect(state.text).not.toMatch(/credentials (are )?ready|access is ready/i);
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+    expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent).toBe(CONNECTOR_BOUNDARY);
+    expect(screen.getByText(/already authorized and listed below/i)).toBeTruthy();
+    // Revocation and the authorization controls are unchanged.
+    expect(screen.getByRole("button", { name: "Authorize paired runner" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke runner" })).toBeTruthy();
+  });
+
+  test("ONBOARDING-STATE: a paired runner without an authorization is asked to authorize, not to pair", async () => {
+    const { ws, prj } = verifiedOwner();
+    exactEnvironment(ws, prj, "1");
+    server.runners.set(ws, [runnerWire("a")]);
+    render(<Dashboard />);
+    const state = await activationState();
+    expect(state.meter).toBe("2 of 4 setup steps complete");
+    expect(state.runner).toBe("Paired");
+    expect(state.access).toBe("Authorize below");
+    expect(state.next).toMatch(/next action: authorize the paired runner below/i);
+    expect(screen.queryByRole("region", { name: "Pair a runner" })).toBeNull();
+  });
+
+  test("ONBOARDING-STATE: an active binding for another environment or proof does not count as this target's authorization", async () => {
+    for (const binding of [bindingWire("2", "runner-a", "active"), { ...bindingWire("1", "runner-a", "active"), verification_record_digest: "b".repeat(64) }]) {
+      cleanup();
+      server = new FakeControlPlane();
+      vi.stubGlobal("fetch", server.fetch);
+      const { ws, prj } = verifiedOwner();
+      exactEnvironment(ws, prj, "1");
+      server.bindings.set(ws, [binding]);
+      render(<Dashboard />);
+      const state = await activationState();
+      expect(state.runner).toBe("Paired");
+      expect(state.access).toBe("Authorize below");
+      expect(state.next).toMatch(/next action: authorize the paired runner below/i);
+    }
+  });
+
+  test("ONBOARDING-STATE: only revoked or expired bindings read unpaired with the pairing next action", async () => {
+    const { ws, prj } = verifiedOwner();
+    exactEnvironment(ws, prj, "1");
+    server.bindings.set(ws, [bindingWire("1", "runner-a", "revoked"), bindingWire("1", "runner-b", "expired"),
+      bindingWire("1", "runner-c", "active", Date.now() - 1)]);
+    render(<Dashboard />);
+    const state = await activationState();
+    expect(state.meter).toBe("1 of 4 setup steps complete");
+    expect(state.runner).toBe("Ready to pair");
+    expect(state.access).toBe("After pairing");
+    expect(state.next).toMatch(/next action: pair runner/i);
+    await pairCard();
   });
 });

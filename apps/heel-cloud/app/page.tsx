@@ -30,6 +30,10 @@ export default function Home() {
             Open local MCP setup
           </a>.
         </p>
+        <p>
+          The review above is static analysis in this browser and never contacts your product. To verify a staging
+          target you own and pair a local runner, <a href="/dashboard">create an account or sign in</a>.
+        </p>
       </section>
 
       <section className="availability" id="availability" aria-labelledby="availability-title">
