@@ -249,7 +249,7 @@ describe("active rehearsal controls", () => {
 // CUSTOMER-ONBOARDING-STATE: the observed journey had an active paired runner and an exact target authorization, yet
 // the card read "1/4 ready · Next action: pair runner · Ready to pair" and pointed at a runner companion that is not wired.
 describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual paired runner and authorization", () => {
-  const CLI = "./heel-rc3/bin/heel";
+  const CLI = "./heel-rc4/bin/heel";
 
   function stepState(activation: HTMLElement, title: string): string {
     const step = within(activation).getAllByRole("listitem").find((item) => item.querySelector("h2")?.textContent === title);

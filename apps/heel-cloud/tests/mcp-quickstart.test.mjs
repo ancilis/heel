@@ -24,10 +24,10 @@ test("both install variants and every later step use one environment", async () 
   const source = await readFile(pageUrl, "utf8");
   const created = createdEnvironments(source);
   assert.equal(created.length, 2, "the public and bundled installs each create an environment");
-  assert.deepEqual(new Set(created), new Set(["heel-rc2"]));
+  assert.deepEqual(new Set(created), new Set(["heel-rc4"]));
   const references = executableReferences(source);
   assert.ok(references.length >= 7, JSON.stringify(references));
-  for (const reference of references) assert.equal(reference.environment, "heel-rc2", JSON.stringify(reference));
+  for (const reference of references) assert.equal(reference.environment, "heel-rc4", JSON.stringify(reference));
   assert.doesNotMatch(source, /\.venv\b/);
 });
 
@@ -42,9 +42,9 @@ test("the displayed install and verification perform a real handshake against th
   const displayedVerify = verifyMatch[1].replaceAll("\\\\", "\\");
   assert.equal(
     displayedInstall,
-    "python3 -m venv heel-rc2\n./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl",
+    "python3 -m venv heel-rc4\n./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl",
   );
-  assert.match(displayedVerify, /\| \.\/heel-rc2\/bin\/heel-mcp$/);
+  assert.match(displayedVerify, /\| \.\/heel-rc4\/bin\/heel-mcp$/);
   const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc4-py3-none-any.whl");
   const workingDirectory = await mkdtemp(join(await realpath(repoRoot), ".heel-mcp-quickstart-"));
   const currentInstall = displayedInstall.replace(

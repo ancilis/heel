@@ -1,10 +1,11 @@
 # Replaying a saved runner regression
 
-Status: included in the `1.3.0rc3` runner candidate, which is **not yet published**. These
-commands are **not** in the published `1.3.0rc2` runner preview and are not described by its
-release guide. Customers can use them only after 1.3.0rc3 is published through the runner
-release process. They have been exercised against local test fixtures only, not a deployed
-pairing, a real browser approval or a public target.
+Status: first shipped in the `1.3.0rc3` runner preview, published as a GitHub prerelease on
+2026-11-11, and still included in the current `1.3.0rc4` runner preview
+(<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>; install it with the one
+hash-pinned command in the [README](../README.md)). These commands are **not** in the earlier
+`1.3.0rc2` or `1.3.0rc1` previews. They have been exercised against local test fixtures only,
+not a deployed pairing, a real browser approval or a public target.
 
 Replay depends on the Cloud canary approval flow: it runs only the existing read-only
 (`GET`/`HEAD`) canary scenarios, and only in a Cloud-bound context.
