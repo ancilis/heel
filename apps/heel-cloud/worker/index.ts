@@ -217,16 +217,18 @@ function withSecurityHeaders(response: Response, csp: string, noStore = false): 
 class InvalidControlPlaneRequest extends Error {}
 
 function singletonHeader(source: Headers, name: string): string | null {
-  // Cloudflare Headers preserves duplicate fields through getAll.  The web-test
-  // implementation merges them, for which a comma is invalid for every runner
-  // proof field and therefore remains fail-closed.
-  const cloudflare = source as Headers & { getAll?: (header: string) => string[] };
-  if (typeof cloudflare.getAll === "function") {
-    const values = cloudflare.getAll(name);
-    return values.length === 1 ? values[0] : null;
-  }
+  // Fetch Headers (workerd included) merges duplicate fields into one ", "-joined value; workerd's
+  // non-standard getAll throws a TypeError for every name except Set-Cookie, so it is never used.
+  // A comma is invalid in every field read here, so a duplicated field stays fail-closed.
   const value = source.get(name);
   return value === null || value.includes(",") ? null : value;
+}
+
+// Cloudflare hands the Worker every request with `Connection: Keep-Alive` (any client value is
+// overwritten). It is hop-by-hop and never forwarded: upstream headers are rebuilt from scratch.
+function edgeConnectionHeader(source: Headers): boolean {
+  const value = source.get("Connection");
+  return value === null || /^keep-alive$/i.test(value);
 }
 
 function controlPlaneCredentials(source: Headers): Headers {
@@ -281,7 +283,7 @@ function controlPlaneRequestHeaders(
     // Runner proof headers are an isolated protocol: a caller cannot nominate a
     // hop-by-hop/header-smuggling field or impersonate an edge-derived origin.
     if (method !== "POST" || source.has("Authorization") || source.has("Cookie")
-      || source.has("Connection") || source.has("TE") || source.has("Transfer-Encoding")
+      || !edgeConnectionHeader(source) || source.has("TE") || source.has("Transfer-Encoding")
       || source.has("Content-Encoding") || source.has("X-Heel-Internal-Origin")) throw new InvalidControlPlaneRequest();
     headers = new Headers();
     for (const name of RUNNER_HEADERS) {
