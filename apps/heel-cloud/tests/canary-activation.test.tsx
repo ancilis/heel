@@ -244,7 +244,7 @@ describe("active rehearsal controls", () => {
 // CUSTOMER-ONBOARDING-STATE: the observed journey had an active paired runner and an exact target authorization, yet
 // the card read "1/4 ready · Next action: pair runner · Ready to pair" and pointed at a runner companion that is not wired.
 describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual paired runner and authorization", () => {
-  const CLI = "./heel-rc2/bin/heel";
+  const CLI = "./heel-rc3/bin/heel";
 
   function stepState(activation: HTMLElement, title: string): string {
     const step = within(activation).getAllByRole("listitem").find((item) => item.querySelector("h2")?.textContent === title);
@@ -255,7 +255,7 @@ describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual pair
     const text = document.body.textContent ?? "";
     expect(text).not.toMatch(/companion/i);
     expect(text).not.toMatch(/20 minutes/i);
-    expect(text).not.toMatch(/rc3/i);
+    expect(text).not.toMatch(/rc2/i);
     expect(screen.queryByRole("link", { name: /open pairing guide|add access locally/i })).toBeNull();
     expect(Array.from(document.querySelectorAll("a"), (link) => link.getAttribute("href"))).not.toContain("/runner#canary-access");
   }
