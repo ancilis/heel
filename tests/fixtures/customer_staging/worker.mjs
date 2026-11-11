@@ -1,8 +1,9 @@
 // Controlled synthetic acceptance target for the Heel customer journey.
 //
 // A standalone Cloudflare Worker with no bindings, storage, outbound fetch, redirect or
-// dependency. It serves one ownership-proof file, one plan-gated export route and one
-// health route. All data is static and fake. Nothing here is Heel product code.
+// dependency. It serves one ownership-proof file, one plan-gated export route, one health
+// route and its own static OpenAPI inventory. All data is static and fake. Nothing here is
+// Heel product code.
 //
 // Operator configuration (never request-controlled):
 //   HEEL_TARGET_MODE       var:    vulnerable | patched | error_envelope
@@ -12,21 +13,42 @@
 //   HEEL_PRO_TOKEN_SHA256  secret: lowercase hex SHA-256 of the pro canary bearer token
 // Missing, malformed or equal digests, or an unknown mode, fail closed with 503.
 
-// The same fake export payload as tests/plan_differential_support.py EXPORT.
+// The one approved synthetic canary fixture id (tests/plan_differential_support.py MARKER).
+// Heel's paired runner learns a marker only from a route fixture binding, so the export
+// lives at /api/exports/{id} and is served only for this exact id; the protected export
+// body carries it in the top-level protected_canary field. It is public and not a secret.
+export const CANARY_ID = "heel-canary-export-0001";
+// The same fake export payload as tests/plan_differential_support.py EXPORT, plus the marker.
 const EXPORT = Object.freeze({
   account_id: "acct_canary",
   format: "csv",
   rows: [{ id: "row_1", amount_cents: 1200 }],
   total: 1,
+  protected_canary: CANARY_ID,
 });
+// Served verbatim at /openapi.json; byte-for-byte equal to openapi.json beside this file.
+// Ordinary path parameter only: no marker value, plan, finding or extension annotation.
+const OPENAPI = JSON.stringify({
+  openapi: "3.1.0",
+  info: { title: "Heel controlled staging target API", version: "1.1.0" },
+  paths: {
+    "/api/exports/{id}": {
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      get: { operationId: "getExport", responses: { 200: { description: "ok" } } },
+      head: { operationId: "headExport", responses: { 200: { description: "ok" } } },
+    },
+  },
+}, null, 2) + "\n";
 // The same recognized denial envelope as tests/plan_differential_support.py DENIAL_ENVELOPE.
 const DENIAL_ENVELOPE = Object.freeze({ error: "upgrade required" });
 
 export const MODES = Object.freeze(["vulnerable", "patched", "error_envelope"]);
+// Exact concrete paths only: any other export id is an unknown path (404, never reflected).
 export const ROUTES = Object.freeze({
   "/.well-known/heel-verify.txt": "/.well-known/heel-verify.txt",
-  "/api/export": "/api/export",
+  [`/api/exports/${CANARY_ID}`]: "/api/exports/{id}",
   "/healthz": "/healthz",
+  "/openapi.json": "/openapi.json",
 });
 const ALLOWED_METHODS = new Set(["GET", "HEAD"]);
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -113,6 +135,9 @@ async function decide(request, env, method, route) {
         export_configured: exportConfig(env) !== null,
       }),
     };
+  }
+  if (route === "/openapi.json") {
+    return { role: "-", status: 200, type: "application/json", body: encoder.encode(OPENAPI) };
   }
   if (route === "/.well-known/heel-verify.txt") {
     const token = verifyToken(env);
