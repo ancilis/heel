@@ -21,8 +21,8 @@ include a Stripe or PostgreSQL integration.
 - Anonymous browser-local OpenAPI review with a committed sample on first visit.
 - Same-origin, pinned Pyodide runtime and Heel wheel; no analyzer network calls.
 - Explicit local browser save/export without retaining the source document.
-- Checked-in Heel 1.3.0rc3 runner preview candidate wheel, source archive, and manifest under
-  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The 1.3.0rc3 candidate
+- Checked-in Heel 1.3.0rc4 runner preview candidate wheel, source archive, and manifest under
+  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The 1.3.0rc4 candidate
   is not yet published; its runner code equals the 1.3.0rc2 component, which is published as the
   public GitHub prerelease
   <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>, with a one-command hash-pinned install

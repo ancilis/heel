@@ -4,7 +4,6 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
-- Make the Linux `secret-service` vault and runner signing key work in a real session: `secret-tool` now receives one validated `DBUS_SESSION_BUS_ADDRESS` (a single local `unix:path=` socket owned by the user, optional 32-hex `guid`, re-serialised; remote, list, abstract, `tmpdir`/`runtime`, `unixexec`, `autolaunch` and escaped addresses are refused before launch) besides `PATH` and `LC_ALL`; no other variable is forwarded and macOS Keychain behaviour is unchanged. Missing is reported only after a search for the item's own attributes exits 0 with no output, so an unreachable service or a locked keyring is unavailable rather than missing and a locked existing credential or signing key is never overwritten.
 - Upgrade the control-plane cryptography pin to 50.0.1 and synchronize the hosted-proof wheel lock. The hosted control plane is not deployed; the runner side of this upgrade shipped in 1.3.0rc2 (below). Historical RC1 artifacts and publisher remain unchanged.
 
 - Answer a v3 runner pairing activation that loses its short SQLite busy wait (numeric `SQLITE_BUSY`/`SQLITE_LOCKED`, no open transaction, independent runner connection) with `503 runner_control_busy` (`retry_after_ms: 1000`, `Retry-After: 1`); `heel runner pair` resends the identical sealed activation after that bounded hint and never past the challenge deadline. Every other route and error stays a generic 500, whose log line gains only a typed `sqlite_primary_code` (H1A3-1F3DF).
@@ -34,12 +33,59 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc3]: unpublished candidate
+## [1.3.0rc4]: unpublished candidate
 
-Release-owner candidate re-version, prepared so the accepted H3 runner seam can later be integrated
-without overwriting the published 1.3.0rc2 prerelease. It is not a GitHub release, not on PyPI and
-not publicly deployed; customer copy keeps the published, hash-pinned 1.3.0rc2 install, and the
-same-origin `/downloads/` files are labeled as this not-yet-published candidate.
+Runner preview candidate for the H2 result handoff. It is not a GitHub release, not on PyPI and not
+publicly deployed. Customer copy is unchanged: the paired-runner surfaces keep the published
+v1.3.0rc3 install and the other surfaces keep the published, hash-pinned 1.3.0rc2 install, until
+this candidate's own release passes an anonymous public verification. The same-origin `/downloads/`
+files are labeled as this not-yet-published candidate.
+
+- Version identity 1.3.0rc4 (npm 1.3.0-rc.4) across the package, release contract, review engine,
+  MCP server info, `server.json` and browser engine; 1.3.0rc3 stays an accepted saved-review and
+  findings-sync engine version. Wheel, source archive, manifest, browser wheel/manifest, browser
+  sample and review golden are regenerated with the unchanged builders and open-core
+  classification; no new public module. The published 1.3.0rc3 bytes and version sources are kept
+  byte for byte as the historical fixture `tests/fixtures/runner_preview_rc3/`.
+- Result handoff (runner): the rehearsal itself is unchanged, the read-only `GET`/`HEAD` plan of an
+  approved scope run by the local runner, with credentials in the local vault and raw evidence on
+  the customer's machine. After a terminal run, `heel runner serve` sends a metadata-only
+  disclosure poll (digest, byte count and counts of the store-verified local findings projection;
+  no findings bytes) on the run's sealed result chain: every step for ten minutes, then once per
+  60 s, never at or after retention. Only a human-issued permit leads to the existing
+  `upload_findings`, which re-verifies binding, window and authority before the redacted findings
+  leave and records `consumed` with the real receipt. Keep-local and synchronized stop polling for
+  the life of the process; a restart sends one idempotent poll. A staged poll answered with a
+  non-200 or unreadable response is re-sent byte-identically on its next due step, and an upload
+  answered 502/503/504 is re-sent no sooner than 60 s later; any other refusal stops for the
+  process and startup stays fail-closed. Runtime schema v6 adds the `poll-disclosure` pending
+  operation (v5 rows copied verbatim). Retention prune now finishes for `available` and `consumed`
+  runs from their exact local terminal root.
+- Result handoff (Heel Cloud source, not deployed): a metadata-only disclosure-poll route on the
+  runner proof family (2 KiB cap) and a view-scoped disclosure read; the dashboard keeps the shown
+  run across reload (re-authorized by the tenant-scoped run read, nothing in browser storage) and
+  sharing or keeping local is an explicit click, after which only server values of the redacted
+  finding are shown. Copy now says Heel Cloud only checks the ownership proof and that approved
+  read-only `GET`/`HEAD` rehearsals run from the local runner.
+- Make the Linux `secret-service` vault and runner signing key work in a real session: `secret-tool` now receives one validated `DBUS_SESSION_BUS_ADDRESS` (a single local `unix:path=` socket owned by the user, optional 32-hex `guid`, re-serialised; remote, list, abstract, `tmpdir`/`runtime`, `unixexec`, `autolaunch` and escaped addresses are refused before launch) besides `PATH` and `LC_ALL`; no other variable is forwarded and macOS Keychain behaviour is unchanged. Missing is reported only after a search for the item's own attributes exits 0 with no output, so an unreachable service or a locked keyring is unavailable rather than missing and a locked existing credential or signing key is never overwritten.
+- Findings semantics are unchanged from 1.3.0rc3: an ordinary plan-differential key-path finding
+  is medium confidence and its values are not compared, error envelopes are `inconclusive`, the
+  canary-marker path stays separate, and the derived `evidence_states` list is unsigned and computed
+  only from the signed results. This is not a comprehensive abuse or authorization assessment.
+- Known CI limitations, causes UNKNOWN and not fixed: the Python 3.13 paired plan-differential run
+  that returned `inconclusive` (see 1.3.0rc3), and a bridge resolver-count assertion that saw 2 of
+  5 resolver calls once on Python 3.11. Both tests keep their exact expectations with allowlisted
+  failure diagnostics; a recurrence is read from its diagnostic, not rerun to green.
+
+## [1.3.0rc3]: 2026-11-11
+
+Runner preview prerelease, published as a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc3> from source commit
+`17a1ea70ee03a78232d04c00d589b78d6f55f0f6`. It is not a stable release and it is not published to
+PyPI. The paired-runner surfaces install it from that release; the other customer copy keeps the
+published, hash-pinned 1.3.0rc2 install. Known limitation: one paired plan-differential CI run on
+Python 3.13 returned `inconclusive` where `blocked` was expected; its root cause is UNKNOWN and not
+fixed, and the test keeps its exact expectation with an allowlisted failure diagnostic.
 
 - Version identity 1.3.0rc3 (npm 1.3.0-rc.3) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc2 stays an accepted saved-review and
