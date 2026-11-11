@@ -7453,17 +7453,26 @@ class RunnerStore:
         binding_digest = _digest(binding_digest, "context binding digest")
         if self.load_cloud_context_binding()["binding_digest"] != binding_digest:
             raise RunnerStoreError("cloud context binding changed")
-        record = _projection_submission_record({
+        record = self._pending_projection_submission(manifest, projection, binding_digest)
+        with self._transaction(exclusive=True) as context_fd:
+            self._write_projection_submission_locked(context_fd, record)
+        return record
+
+    @staticmethod
+    def _pending_projection_submission(
+        manifest: Mapping[str, Any], projection: Mapping[str, Any], binding_digest: str,
+    ) -> dict[str, Any]:
+        return _projection_submission_record({
             "state": "pending", "projection_id": projection["projection_id"],
             "projection_digest": projection["projection_digest"],
             "manifest_digest": manifest["manifest_digest"], "binding_digest": binding_digest,
             "approval_id": None, "run_id": None, "status": None, "reason": None,
         })
-        with self._transaction(exclusive=True) as context_fd:
-            _write_json(context_fd, _PROJECTION_SUBMISSION_FILE, self._envelope(
-                context_fd, _PROJECTION_SUBMISSION_SCHEMA, "submission", record,
-            ))
-        return record
+
+    def _write_projection_submission_locked(self, context_fd: int, record: Mapping[str, Any]) -> None:
+        _write_json(context_fd, _PROJECTION_SUBMISSION_FILE, self._envelope(
+            context_fd, _PROJECTION_SUBMISSION_SCHEMA, "submission", dict(record),
+        ))
 
     def _projection_submission_locked(self, context_fd: int) -> dict[str, Any] | None:
         value = _read_json(context_fd, _PROJECTION_SUBMISSION_FILE, None)
@@ -9579,6 +9588,176 @@ class RunnerStore:
                 context_fd, SAVED_REGRESSIONS_SCHEMA, "regressions", updated,
             )
             _write_json(context_fd, "regressions.json", envelope)
+        return record, True
+
+    # Regression replay provenance and results: identifiers and digests only, never authority.
+
+    def _regression_replays_locked(self, context_fd: int) -> list[dict[str, Any]]:
+        from heel.runner.regressions import (
+            MAX_REGRESSION_REPLAYS, REPLAYS_SCHEMA, SavedRegressionError, validate_regression_replay,
+        )
+
+        raw = _read_json(context_fd, "regression-replays.json", None)
+        if raw is None:
+            return []
+        records = self._validate_envelope(context_fd, raw, schema=REPLAYS_SCHEMA, payload_field="replays")
+        if not isinstance(records, list) or len(records) > MAX_REGRESSION_REPLAYS:
+            raise RunnerStoreError("invalid regression replays")
+        try:
+            result = [validate_regression_replay(item) for item in records]
+        except SavedRegressionError:
+            raise RunnerStoreError("invalid regression replays") from None
+        projection_ids = [item["projection_id"] for item in result]
+        if len(set(projection_ids)) != len(projection_ids):
+            raise RunnerStoreError("regression replays are not canonical")
+        return result
+
+    def list_regression_replays(self) -> list[dict[str, Any]]:
+        with self._transaction(exclusive=False) as context_fd:
+            return self._regression_replays_locked(context_fd)
+
+    def queue_regression_replay(
+        self, regression_id: str, projection_id: str, *, binding_digest: str, now_ms: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Register definition -> fresh projection provenance, then queue that projection.
+
+        Both writes happen under one exclusive lock, association first: a failed registration
+        never queues, and a failed queue write leaves only an unsent association that no signed
+        terminal run can match. The saved definition, the current Cloud context binding and the
+        exact compiled pair are re-checked under the lock, so nothing can widen between the
+        caller's guard, the compiler and the queue. Returns ``(submission, replay)``.
+        """
+        from heel.runner.regressions import (
+            MAX_REGRESSION_REPLAYS, REPLAYS_SCHEMA, SavedRegressionError, check_replay_pair,
+            new_regression_replay,
+        )
+
+        manifest, projection = self.load_approved_pair(projection_id)
+        binding_digest = _digest(binding_digest, "context binding digest")
+        with self._transaction(exclusive=True) as context_fd:
+            try:
+                cloud = validate_runner_context_binding(
+                    _read_json(context_fd, "cloud-context-binding.json", None),
+                )
+            except (TypeError, ValueError):
+                raise RunnerStoreError("invalid cloud context binding") from None
+            if cloud["binding_digest"] != binding_digest:
+                raise RunnerStoreError("cloud context binding changed")
+            regression = next((
+                item for item in self._saved_regressions_locked(context_fd)
+                if item["regression_id"] == regression_id
+            ), None)
+            if regression is None:
+                raise RunnerStoreError("saved regression is unavailable")
+            binding = self._binding_locked(context_fd)
+            try:
+                check_replay_pair(
+                    regression, manifest, projection,
+                    context=_context_from_dict(binding["context"]), identity=binding["identity"],
+                )
+                replay = new_regression_replay(
+                    regression, manifest, projection, binding_digest=binding_digest, now_ms=now_ms,
+                )
+            except SavedRegressionError:
+                raise RunnerStoreError("regression replay does not match its definition") from None
+            replays = self._regression_replays_locked(context_fd)
+            existing = next((item for item in replays if item["projection_id"] == projection_id), None)
+            if existing is not None:
+                # The same compiled pair (same instant) is the same association, never a second one.
+                if {**existing, "created_at_ms": 0} != {**replay, "created_at_ms": 0}:
+                    raise RunnerStoreError("regression replay association collision")
+                replay = existing
+            else:
+                if len(replays) >= MAX_REGRESSION_REPLAYS:
+                    raise RunnerStoreError("regression replay limit reached")
+                _write_json(context_fd, "regression-replays.json", self._envelope(
+                    context_fd, REPLAYS_SCHEMA, "replays", [*replays, replay],
+                ))
+            submission = self._pending_projection_submission(manifest, projection, binding_digest)
+            self._write_projection_submission_locked(context_fd, submission)
+        return submission, replay
+
+    def _regression_results_locked(self, context_fd: int) -> list[dict[str, Any]]:
+        from heel.runner.regressions import (
+            MAX_REGRESSION_RESULTS, RESULTS_SCHEMA, SavedRegressionError, validate_regression_result,
+        )
+
+        raw = _read_json(context_fd, "regression-results.json", None)
+        if raw is None:
+            return []
+        records = self._validate_envelope(context_fd, raw, schema=RESULTS_SCHEMA, payload_field="results")
+        if not isinstance(records, list) or len(records) > MAX_REGRESSION_RESULTS:
+            raise RunnerStoreError("invalid regression results")
+        try:
+            result = [validate_regression_result(item) for item in records]
+        except SavedRegressionError:
+            raise RunnerStoreError("invalid regression results") from None
+        run_ids = [item["run_id"] for item in result]
+        if len(set(run_ids)) != len(run_ids):
+            raise RunnerStoreError("regression results are not canonical")
+        regressions = {item["regression_id"] for item in self._saved_regressions_locked(context_fd)}
+        if any(item["regression_id"] not in regressions for item in result):
+            raise RunnerStoreError("regression result names no saved definition")
+        return result
+
+    def list_regression_results(self) -> list[dict[str, Any]]:
+        with self._transaction(exclusive=False) as context_fd:
+            return self._regression_results_locked(context_fd)
+
+    def record_regression_result(
+        self, *, regression_id: str, run_id: str, now_ms: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist the verified result of one terminal run of an associated replay.
+
+        Only a run whose stored grant names a projection registered for ``regression_id`` and
+        whose signed finals verify can be recorded; the outcome comes from those finals, never
+        from the caller. Recording the same run again returns the stored result without
+        writing; any other collision, the bound, or any verification failure raises and leaves
+        ``regression-results.json`` untouched. Returns ``(result, created)``.
+        """
+        from heel.runner.regressions import (
+            MAX_REGRESSION_RESULTS, RESULTS_SCHEMA, SavedRegressionError, derive_regression_result,
+            same_result,
+        )
+
+        with self._transaction(exclusive=False) as context_fd:
+            regression = next((
+                item for item in self._saved_regressions_locked(context_fd)
+                if item["regression_id"] == regression_id
+            ), None)
+            replays = self._regression_replays_locked(context_fd)
+        if regression is None:
+            raise RunnerStoreError("saved regression is unavailable")
+        projection_id = self.load_run_grant(run_id)["approval"]["projection_id"]
+        replay = next((
+            item for item in replays
+            if item["projection_id"] == projection_id and item["regression_id"] == regression_id
+        ), None)
+        if replay is None:
+            raise RunnerStoreError("run is not a replay of this saved regression")
+        try:
+            record = derive_regression_result(
+                self, regression=regression, replay=replay, run_id=run_id, now_ms=now_ms,
+            )
+        except SavedRegressionError:
+            raise RunnerStoreError("regression result is not verifiable") from None
+        with self._transaction(exclusive=True) as context_fd:
+            if (
+                regression not in self._saved_regressions_locked(context_fd)
+                or replay not in self._regression_replays_locked(context_fd)
+            ):
+                raise RunnerStoreError("regression replay changed")
+            results = self._regression_results_locked(context_fd)
+            existing = next((item for item in results if item["run_id"] == record["run_id"]), None)
+            if existing is not None:
+                if not same_result(existing, record):
+                    raise RunnerStoreError("regression result already recorded")
+                return existing, False
+            if len(results) >= MAX_REGRESSION_RESULTS:
+                raise RunnerStoreError("regression result limit reached")
+            _write_json(context_fd, "regression-results.json", self._envelope(
+                context_fd, RESULTS_SCHEMA, "results", [*results, record],
+            ))
         return record, True
 
     def store_response_evidence(

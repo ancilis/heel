@@ -43,6 +43,8 @@ _SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
 _SAFE_RUNNER_FINDINGS_FAILURE = "Heel runner findings are unavailable."
 _SAFE_RUNNER_REGRESSION_ADD_FAILURE = "Heel runner regression could not be saved safely."
 _SAFE_RUNNER_REGRESSION_LIST_FAILURE = "Heel runner regressions are unavailable."
+_SAFE_RUNNER_REGRESSION_REPLAY_FAILURE = "Heel runner regression replay could not be prepared safely."
+_SAFE_RUNNER_REGRESSION_RECORD_FAILURE = "Heel runner regression result could not be recorded safely."
 _SAFE_RUNNER_PAIRING_FAILURE = "Heel runner pairing failed: {}."
 _SAFE_RUNNER_SERVE_FAILURE = "Heel runner serve stopped: {}."
 _OPENAPI_READ_FLAGS = (
@@ -426,12 +428,29 @@ def _runner_regress_add(args) -> int:
     return 0
 
 
+def _runner_regress_record(args) -> int:
+    """Record the verified outcome of one terminal run of an associated fresh replay."""
+    try:
+        record, created = _runner_store().record_regression_result(
+            regression_id=args.regression, run_id=args.run, now_ms=time.time_ns() // 1_000_000,
+        )
+        rendered = json.dumps({"created": created, "result": record}, sort_keys=True)
+    except Exception:
+        print(_SAFE_RUNNER_REGRESSION_RECORD_FAILURE, file=sys.stderr)
+        return 2
+    print(rendered)
+    return 0
+
+
 def _runner_regress_list(_args) -> int:
     try:
-        records = _runner_store().list_saved_regressions()
-        rendered = json.dumps(
-            {"regression_count": len(records), "regressions": records}, sort_keys=True,
-        )
+        store = _runner_store()
+        records = store.list_saved_regressions()
+        results = store.list_regression_results()
+        rendered = json.dumps({
+            "regression_count": len(records), "regressions": records,
+            "result_count": len(results), "results": results,
+        }, sort_keys=True)
     except Exception:
         print(_SAFE_RUNNER_REGRESSION_LIST_FAILURE, file=sys.stderr)
         return 2
@@ -440,6 +459,12 @@ def _runner_regress_list(_args) -> int:
 
 
 def _runner_prepare(args) -> int:
+    replay_id = getattr(args, "regression", None)
+    live_failure = _SAFE_RUNNER_LIVE_FAILURE if replay_id is None else _SAFE_RUNNER_REGRESSION_REPLAY_FAILURE
+    if replay_id is not None and not args.live:
+        # A saved definition only ever becomes a fresh live plan; it is never local authority.
+        print(_SAFE_RUNNER_REGRESSION_REPLAY_FAILURE, file=sys.stderr)
+        return 2
     try:
         store = _runner_store()
         routes = store.list_routes()
@@ -447,7 +472,7 @@ def _runner_prepare(args) -> int:
         credentials = store.list_credentials()
     except Exception:
         if args.live:
-            print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
+            print(live_failure, file=sys.stderr)
         else:
             print("Heel runner preparation failed.", file=sys.stderr)
         return 2
@@ -505,6 +530,20 @@ def _runner_prepare(args) -> int:
             pairing_phrase=runner_phrase_words()[:6],
         )
         selected = [item["scenario_id"] for item in mappings]
+        regression = None
+        if replay_id is not None:
+            from .runner.regressions import check_replay_inputs
+
+            # Replay needs the serve owner and a fresh browser approval: Cloud context only.
+            if cloud_binding is None:
+                raise ValueError("regression replay requires a Cloud-approved context")
+            regression = next((
+                item for item in store.list_saved_regressions() if item["regression_id"] == replay_id
+            ), None)
+            if regression is None:
+                raise ValueError("saved regression is unavailable")
+            check_replay_inputs(store, regression)
+            selected = [regression["scenario_id"]]
         compiler = CanaryCompiler(
             store=store, identity=identity, signer=signer,
             now_ms=int(time.time() * 1000),
@@ -515,13 +554,26 @@ def _runner_prepare(args) -> int:
                 vaults[backend] = select_vault(backend)
         compiler.prepare_live(selected, vaults=vaults)
         result = compiler.compile(selected)
-        submission = None
-        if cloud_binding is not None:
+        submission = replay = None
+        if regression is not None:
+            from .runner.regressions import check_replay_pair
+
+            # Revalidate the pair actually compiled (a mapping may have changed after the
+            # guard); the store re-checks it again under the lock that registers and queues.
+            check_replay_pair(
+                regression, result.manifest, result.projection,
+                context=store.load_context(), identity=store.load_binding()["identity"],
+            )
+            submission, replay = store.queue_regression_replay(
+                replay_id, result.projection["projection_id"],
+                binding_digest=cloud_binding["binding_digest"], now_ms=time.time_ns() // 1_000_000,
+            )
+        elif cloud_binding is not None:
             submission = store.queue_projection_submission(
                 result.projection["projection_id"], binding_digest=cloud_binding["binding_digest"],
             )
     except Exception:
-        print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
+        print(live_failure, file=sys.stderr)
         return 2
     output = {
         "manifest_digest": result.manifest["manifest_digest"],
@@ -530,6 +582,8 @@ def _runner_prepare(args) -> int:
     }
     if submission is not None:
         output["submission"] = {"state": submission["state"], "projection_id": submission["projection_id"]}
+    if replay is not None:
+        output["regression"] = {"regression_id": replay["regression_id"], "projection_id": replay["projection_id"]}
     print(json.dumps(output, sort_keys=True))
     return 0
 
@@ -1318,6 +1372,10 @@ def main(argv=None):
         "prepare", help="review readiness or compile one local immutable rehearsal",
     )
     runner_prepare.add_argument("--live", action="store_true")
+    runner_prepare.add_argument(
+        "--regression", metavar="REGRESSION_ID",
+        help="with --live: compile a fresh plan for exactly one saved regression",
+    )
     runner_findings = runner_sub.add_parser(
         "findings", help="show the verified signed redacted local result of one terminal run",
     )
@@ -1334,7 +1392,12 @@ def main(argv=None):
     runner_regress_add.add_argument("--run", required=True, metavar="RUN_ID")
     runner_regress_add.add_argument("--scenario", required=True, metavar="SCENARIO_ID")
     runner_regress_add.add_argument("--name", required=True, metavar="NAME")
-    runner_regress_sub.add_parser("list", help="list saved local regression definitions")
+    runner_regress_record = runner_regress_sub.add_parser(
+        "record", help="record the verified outcome of one approved replay run",
+    )
+    runner_regress_record.add_argument("--regression", required=True, metavar="REGRESSION_ID")
+    runner_regress_record.add_argument("--run", required=True, metavar="RUN_ID")
+    runner_regress_sub.add_parser("list", help="list saved regression definitions and replay results")
     runner_run = runner_sub.add_parser(
         "run", help="replay imported GET/HEAD reads as two canary plans under a signed scope",
     )
@@ -1540,6 +1603,8 @@ def main(argv=None):
             return _runner_findings(args)
         if args.runnercmd == "regress" and args.runnerregresscmd == "add":
             return _runner_regress_add(args)
+        if args.runnercmd == "regress" and args.runnerregresscmd == "record":
+            return _runner_regress_record(args)
         if args.runnercmd == "regress" and args.runnerregresscmd == "list":
             return _runner_regress_list(args)
         if args.runnercmd == "run":
