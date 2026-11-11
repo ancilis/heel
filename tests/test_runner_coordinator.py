@@ -3904,3 +3904,45 @@ def test_runner_service_advances_disclosures_on_each_idle_poll_and_serve_owner_g
     owner.close()
     with pytest.raises(RunnerServeError):
         owner.advance_disclosures()
+
+
+@pytest.mark.parametrize("status", ["local_only", "synchronized"])
+def test_process_local_stop_rereads_once_after_restart_and_ends_at_retention(tmp_path, status):
+    """Astra decision (CONTROLLER-LOCAL-STOP-DECISION): the stop is process-local and bounded.
+
+    A restarted serve process may send exactly one idempotent metadata-only poll that reads the
+    unchanged server state back, then stops again; at retention expiry no process polls at all.
+    No local state, receipt or table records the stop.
+    """
+    def tail(grant, findings, authority, coordinator, holder):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, _handoff_state(grant, status)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")}, _handoff_state(grant, status)),
+        ]
+
+    now = [2_000]
+    h = _handoff_coordinator(tmp_path, tail, now=now)
+    before = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+    after_stop = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    # The stop is not persisted: the sealed row is still the same `available` record, apart from
+    # the advanced result-chain cursor that the accepted poll consumed.
+    assert after_stop.state == "available" and after_stop.receipt_digest is None
+    assert after_stop.permit_id is None and after_stop.disclosed_at_ms is None
+    assert after_stop.retention_expires_at_ms == before.retention_expires_at_ms
+
+    restarted, restarted_client = h.build(h.client.runtime, nonce_byte=b"z")
+    restarted.advance_disclosures()
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
+    assert h.transport.requests[-1][2] == _handoff_poll_body(h.grant, h.findings)
+    assert h.transport.requests[-1][1]["X-Heel-Runner-Nonce"] == _nonce(b"p")
+
+    # Past retention a further restart sends nothing.
+    now[0] = before.retention_expires_at_ms
+    expired, _client = h.build(h.client.runtime, nonce_byte=b"w")
+    expired.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
