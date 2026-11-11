@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
-from .identity import security_interactive_add_command
+from .identity import secret_tool_environment, security_interactive_add_command
 
 MAX_SECRET_BYTES = 16 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024
@@ -123,6 +123,15 @@ def _run_bounded_process(
         raise VaultUnavailable("secure credential vault unavailable")
     if payload is not None:
         payload = _secret(payload)
+    if command[0] in _LINUX_SECRET_TOOLS:
+        # Only the validated local session-bus address joins the minimal environment; the
+        # check runs before any process exists and before the secret reaches stdin.
+        try:
+            environment = secret_tool_environment()
+        except RuntimeError:
+            raise VaultUnavailable("secure credential vault unavailable") from None
+    else:
+        environment = dict(_MINIMAL_ENV)
     try:
         process = popen(
             command,
@@ -131,7 +140,7 @@ def _run_bounded_process(
             stderr=subprocess.DEVNULL,
             shell=False,
             bufsize=0,
-            env=dict(_MINIMAL_ENV),
+            env=environment,
         )
         output = process.stdout
         process_input = process.stdin if payload is not None else None
@@ -509,17 +518,26 @@ class SecretServiceVault(_CommandVault):
     def _lookup(self, handle_id: str):
         return self._run(("lookup", "heel", "canary", "handle", _handle(handle_id)))
 
+    def _absent(self, handle_id: str) -> bool:
+        """``lookup`` exit 1 means missing, unreachable or locked; a ``search`` for the item's
+        own attributes exits 0 with no output only when no item (locked or not) exists. Any
+        output fails closed and is never inspected, returned or logged."""
+        result = self._run(("search", "heel", "canary", "handle", _handle(handle_id)))
+        return result.returncode == 0 and result.stdout == b""
+
     def exists(self, handle_id: str) -> bool:
         result = self._lookup(handle_id)
         if result.returncode == 0:
             return True
-        if result.returncode == 1:
+        if result.returncode == 1 and self._absent(handle_id):
             return False
         raise VaultUnavailable("secure credential vault unavailable")
 
     def load(self, handle_id: str) -> bytes:
         result = self._lookup(handle_id)
         if result.returncode == 1:
+            if not self._absent(handle_id):
+                raise VaultUnavailable("secure credential vault unavailable")
             raise VaultUnavailable("secure credential was not found")
         if result.returncode != 0:
             raise VaultUnavailable("secure credential vault unavailable")

@@ -90,6 +90,43 @@ export HEEL_HOME="$PWD/.heel"
    them (and retries later if the Keychain refuses), and removing a credential deletes the
    header, all eight chunk slots and any v1 item.
 
+   Linux `secret-service` uses the freedesktop Secret Service through `/usr/bin/secret-tool`
+   (the runner signing key in `pair` uses the same helper). Prerequisites, in the shell that
+   runs Heel:
+
+   ```sh
+   sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
+   dbus-run-session -- bash                                   # headless: private session bus
+   read -rs pw && printf '%s' "$pw" \
+       | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
+   ```
+
+   The keyring password is typed at the hidden `read -rs` prompt and reaches the daemon only
+   on standard input (`printf` is a shell builtin and `pw` is never exported); never put it in
+   process arguments, an environment variable or a file. A desktop login session already has
+   a session bus and an unlocked keyring.
+
+   `secret-tool` runs with only `PATH`, `LC_ALL` and `DBUS_SESSION_BUS_ADDRESS`; nothing else
+   (`HOME`, `XDG_*`, `DISPLAY`, `LD_PRELOAD`, `PYTHONPATH`, …) is forwarded. The address is
+   accepted only as one local `unix:path=<absolute path>` entry, optionally with
+   `,guid=<32 lowercase hex>`, naming an existing socket (not a symlink) owned by your user,
+   at most 1024 ASCII bytes, and is passed on re-serialised. `tcp:`, `nonce-tcp:`,
+   `unixexec:`, `autolaunch:`, `unix:abstract=`, `unix:tmpdir=`, `unix:runtime=`, lists
+   (`;`), `%` escapes and any other key are refused before `secret-tool` starts and before a
+   secret is written, with the generic `secure credential vault unavailable` (or
+   `runner OS secret service unavailable`); the value itself is never printed. Heel trusts
+   the session bus as your user's uid-authenticated session, the same model as the macOS
+   login keychain: any process of your user on that bus can read the keyring.
+
+   Before a credential or signing key is reported missing or created, Heel searches the
+   Secret Service for that item's own attributes: only exit 0 with no output counts as
+   missing. A **locked** keyring still lists the item, so it reads as unavailable, never as
+   missing, and an existing item is never overwritten (a `secret-tool store` can otherwise
+   replace it once the collection is unlocked, for example through the desktop unlock
+   prompt). Any search output is kept only in Heel's bounded capture and discarded; it is
+   never returned or logged. Unlock the keyring and retry. An unreachable bus is likewise
+   unavailable, not missing.
+
    Optional for this standalone CLI, required for the self-serve (Heel Cloud) path:
    `--plan-label <your name for the plan>`, for example `--plan-label free` on `lower_plan`
    and `--plan-label pro` on `higher_plan`. The plan label is your own word, 1–32 printable
@@ -338,6 +375,10 @@ pair with a new invitation).
   secret service (`secret-tool`). Without either, `pair` fails with
   `no supported runner OS secret service`; there is no file fallback and no flag or
   variable that selects another store.
+- On Linux the Secret Service prerequisites, the single forwarded `DBUS_SESSION_BUS_ADDRESS`
+  and the locked-keyring behaviour are those of the `secret-service` credential backend
+  above: an unset, remote or otherwise refused bus address, an unreachable service or a
+  locked keyring fails `pair` closed and never creates or replaces the signing key.
 - On macOS the seed is written with one `security -i` command on standard input (never in
   process arguments) and is kept only after it reads back as exactly the generated seed;
   otherwise the new item is deleted and `pair` fails closed. Earlier releases stored an

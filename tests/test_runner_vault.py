@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import json
 import os
@@ -33,6 +34,10 @@ from heel.runner.vault import (
     _run_bounded_process,
     ephemeral_environment_name,
     validate_credential_secret,
+)
+from heel.runner.identity import LinuxSecretServiceBackend, SystemSecureSigner
+from tests.test_runner_identity import (  # noqa: F401 - session_bus is a shared fixture
+    UNSUPPORTED_BUS_ADDRESSES, _FakeProcess, apply_bus_address, session_bus,
 )
 from tests.test_runner_stop import compiled_pair, signed_grant
 
@@ -989,17 +994,253 @@ def test_os_vaults_use_verified_absolute_paths_fixed_argv_and_create_only(monkey
     assert all(b" -U" not in payload for _, payload, _ in adds)
     assert all(b"keychain-value" not in " ".join(command).encode() for command, _, _ in keychain_runner.calls)
 
-    secret_runner = ScriptedRunner([(1, b""), (0, b"")])
+    secret_runner = ScriptedRunner([(1, b""), (0, b""), (0, b"")])
     secret_service = SecretServiceVault(
         runner=secret_runner, verifier=verified, platform_name="Linux",
         executable_path="/usr/bin/secret-tool",
     )
     secret_service.store("b" * 32, b"secret-service-value")
-    assert secret_runner.calls[1][0] == (
+    assert secret_runner.calls[1][:2] == (_search("b" * 32), None)
+    assert secret_runner.calls[2][0] == (
         "/usr/bin/secret-tool", "store", "--label=Heel canary credential",
         "heel", "canary", "handle", "b" * 32,
     )
-    assert secret_runner.calls[1][1] == b"secret-service-value"
+    assert secret_runner.calls[2][1] == b"secret-service-value"
+
+
+def _search(handle):
+    return ("/usr/bin/secret-tool", "search", "heel", "canary", "handle", handle)
+
+
+_POISON_ENV = {
+    "LD_PRELOAD": "/tmp/evil.so", "PYTHONPATH": "/tmp/evil", "DISPLAY": ":0",
+    "HOME": "/tmp/home", "XDG_RUNTIME_DIR": "/tmp/xdg", "DBUS_SYSTEM_BUS_ADDRESS": "tcp:host=x",
+}
+
+
+class _EnvProcess:
+    def __init__(self, stdout=b""):
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(stdout)
+    def wait(self, timeout=None): return 0
+    def kill(self): pass
+
+
+def _recording_popen(seen):
+    def popen(command, **kwargs):
+        seen.append((tuple(command), kwargs))
+        return _EnvProcess()
+    return popen
+
+
+def _secret_service(runner):
+    return SecretServiceVault(
+        runner=runner, verifier=verified, platform_name="Linux",
+        executable_path="/usr/bin/secret-tool",
+    )
+
+
+def test_linux_secret_tool_env_forwards_only_validated_session_bus_address(monkeypatch, session_bus):
+    for name, value in _POISON_ENV.items():
+        monkeypatch.setenv(name, value)
+    seen = []
+    _run_bounded_process(
+        ("/usr/bin/secret-tool", "lookup", "heel", "canary", "handle", "a" * 32),
+        payload=None, timeout_seconds=2, popen=_recording_popen(seen),
+    )
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS",
+                       f"unix:guid={session_bus.guid},path={session_bus.path}")
+    _run_bounded_process(
+        ("/usr/bin/secret-tool", "lookup", "heel", "canary", "handle", "a" * 32),
+        payload=None, timeout_seconds=2, popen=_recording_popen(seen),
+    )
+    expected = {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                "DBUS_SESSION_BUS_ADDRESS": session_bus.address}
+    assert [kwargs["env"] for _, kwargs in seen] == [expected, expected]
+    assert all(kwargs["stderr"] is subprocess.DEVNULL and kwargs["shell"] is False
+               for _, kwargs in seen)
+
+
+@pytest.mark.parametrize(
+    "template,foreign_uid",
+    [(template, foreign) for _, template, foreign in UNSUPPORTED_BUS_ADDRESSES],
+    ids=[case for case, _, _ in UNSUPPORTED_BUS_ADDRESSES],
+)
+def test_linux_secret_tool_refuses_unsupported_bus_addresses_before_launch(
+    monkeypatch, session_bus, template, foreign_uid,
+):
+    forbidden = apply_bus_address(monkeypatch, session_bus, template, foreign_uid)
+    seen = []
+    runner = functools.partial(_run_bounded_process, popen=_recording_popen(seen))
+    vault = _secret_service(runner)
+    failures = []
+    for action in (
+        lambda: vault.exists("e" * 32),
+        lambda: vault.load("e" * 32),
+        lambda: vault.store("e" * 32, b"never-written-secret"),
+        lambda: vault.delete("e" * 32),
+        lambda: _run_bounded_process(("/usr/bin/secret-tool", "store", "x"),
+                                     payload=b"never-written-secret", timeout_seconds=2,
+                                     popen=_recording_popen(seen)),
+    ):
+        with pytest.raises(VaultUnavailable) as caught:
+            action()
+        failures.append(caught.value)
+    assert seen == []
+    for error in failures:
+        assert str(error) == "secure credential vault unavailable"
+        assert error.__cause__ is None
+        assert all(item not in repr(error) for item in forbidden)
+        assert "never-written-secret" not in repr(error)
+
+
+def test_linux_unreachable_service_is_unavailable_not_missing():
+    runner = ScriptedRunner([(1, b""), (1, b"")])
+    with pytest.raises(VaultUnavailable, match="^secure credential vault unavailable$"):
+        _secret_service(runner).exists("f" * 32)
+    assert runner.calls[1][:2] == (_search("f" * 32), None)
+
+    runner = ScriptedRunner([(1, b""), (1, b"")])
+    with pytest.raises(VaultUnavailable) as caught:
+        _secret_service(runner).load("f" * 32)
+    assert str(caught.value) == "secure credential vault unavailable"
+    assert "not found" not in str(caught.value)
+
+    runner = ScriptedRunner([(1, b""), (1, b"")])
+    with pytest.raises(VaultUnavailable, match="unavailable"):
+        _secret_service(runner).store("f" * 32, b"unreachable-secret")
+    assert all(command[1] != "store" for command, _, _ in runner.calls)
+    assert all(payload is None for _, payload, _ in runner.calls)
+
+
+def test_linux_missing_entry_requires_reachable_service_probe():
+    runner = ScriptedRunner([(1, b""), (0, b"")])
+    assert _secret_service(runner).exists("a" * 32) is False
+    runner = ScriptedRunner([(1, b""), (0, b"")])
+    with pytest.raises(VaultUnavailable, match="^secure credential was not found$"):
+        _secret_service(runner).load("a" * 32)
+
+    runner = ScriptedRunner([(1, b""), (0, b""), (0, b"")])
+    _secret_service(runner).store("a" * 32, b"value")
+    assert [call[0][1] for call in runner.calls] == ["lookup", "search", "store"]
+    assert runner.calls[1][:2] == (_search("a" * 32), None)
+
+    # Any search output (a locked item, or one that unlocked meanwhile) fails closed, never echoed.
+    for probe in ((0, b"x"), (0, b"[/org/freedesktop/secrets/collection/login/9]\nsecret = other-app\n")):
+        for action in ("exists", "load", "store"):
+            runner = ScriptedRunner([(1, b""), probe, (0, b"")])
+            vault = _secret_service(runner)
+            with pytest.raises(VaultUnavailable) as caught:
+                if action == "store":
+                    vault.store("a" * 32, b"value")
+                else:
+                    getattr(vault, action)("a" * 32)
+            assert str(caught.value) == "secure credential vault unavailable"
+            assert "other-app" not in repr(caught.value)
+            assert len(runner.calls) == 2
+
+
+class _LockedSecretTool:
+    """``secret-tool`` 0.20.5 semantics measured in the Linux probe (Fable REPORT exit-code table).
+
+    A locked item: ``lookup`` exits 1, a ``search`` for its own attributes exits 0 and lists it
+    with empty fields, a ``search`` for unrelated attributes exits 0 with no output, and ``store``
+    overwrites. ``store`` first runs the unlock that a desktop prompt or another session can
+    perform between Heel's presence check and its write.
+    """
+
+    def __init__(self, attributes, value):
+        self.items = {tuple(attributes): value}
+        self.locked = True
+        self.argv = []
+
+    def respond(self, argv, payload):
+        verb, attributes = argv[1], tuple(argv[2:])
+        self.argv.append(verb)
+        if verb == "lookup":
+            if self.locked or attributes not in self.items:
+                return 1, b""
+            return 0, self.items[attributes]
+        if verb == "search":
+            if attributes not in self.items:
+                return 0, b""
+            return 0, b"[/org/freedesktop/secrets/collection/login/1]\nlabel = locked\n"
+        if verb == "store":
+            self.locked = False  # unlocked between the last presence check and the write
+            self.items[tuple(argv[3:])] = payload
+            return 0, b""
+        raise AssertionError(verb)
+
+
+@pytest.mark.parametrize("surface", ["credential_vault", "identity_creation"])
+def test_linux_locked_existing_item_is_never_overwritten_when_unlocked_before_store(
+    monkeypatch, session_bus, surface,
+):
+    if surface == "credential_vault":
+        tool = _LockedSecretTool(("heel", "canary", "handle", "a" * 32), b"original-dummy")
+
+        def runner(command, *, payload, timeout_seconds):
+            code, out = tool.respond(command, payload)
+            return type("Result", (), {"returncode": code, "stdout": out})()
+
+        with pytest.raises(VaultUnavailable):
+            _secret_service(runner).store("a" * 32, b"replacement-dummy")
+        assert tool.items[("heel", "canary", "handle", "a" * 32)] == b"original-dummy"
+    else:
+        original = base64.b64encode(b"o" * 32)
+        tool = _LockedSecretTool(("heel", "runner", "label", "runner-linux"), original)
+
+        def popen(argv, **kwargs):
+            argv = tuple(argv)
+            if argv[1] != "store":
+                code, out = tool.respond(argv, None)
+                return _FakeProcess(argv, returncode=code, stdout=out)
+            process = _FakeProcess(argv, returncode=0, stdout=b"")
+            close = process.stdin.close
+
+            def commit():
+                tool.respond(argv, bytes(process.stdin.data))
+                close()
+            process.stdin.close = commit
+            return process
+
+        monkeypatch.setattr("heel.runner.identity._verified_secret_tool_path",
+                            lambda: "/usr/bin/secret-tool")
+        monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: b"n" * 32)
+        with pytest.raises(RuntimeError):
+            SystemSecureSigner("runner-linux", backend=LinuxSecretServiceBackend(popen=popen))
+        assert tool.items[("heel", "runner", "label", "runner-linux")] == original
+    assert "store" not in tool.argv
+
+
+def test_linux_present_entry_skips_probe():
+    runner = ScriptedRunner([(0, b"v\n")])
+    assert _secret_service(runner).exists("a" * 32) is True
+    assert len(runner.calls) == 1
+    runner = ScriptedRunner([(0, b"v\n")])
+    assert _secret_service(runner).load("a" * 32) == b"v"
+    assert len(runner.calls) == 1
+    runner = ScriptedRunner([(0, b"v\n")])
+    with pytest.raises(VaultUnavailable, match="already exists"):
+        _secret_service(runner).store("a" * 32, b"other")
+    assert len(runner.calls) == 1
+
+
+def test_keychain_env_unchanged_by_session_bus_variable(monkeypatch, session_bus):
+    for name, value in _POISON_ENV.items():
+        monkeypatch.setenv(name, value)
+    for address in (session_bus.address, "tcp:host=127.0.0.1,port=1", None):
+        if address is None:
+            monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        else:
+            monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", address)
+        seen = []
+        for command in (("/usr/bin/security", "find-generic-password"), ("/usr/bin/example", "fixed")):
+            _run_bounded_process(command, payload=None, timeout_seconds=2,
+                                 popen=_recording_popen(seen))
+        assert [kwargs["env"] for _, kwargs in seen] == [
+            {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        ]
 
 
 def test_linux_secret_tool_path_is_allowlisted_and_path_hijack_never_used():

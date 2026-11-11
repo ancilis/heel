@@ -28,6 +28,13 @@ _MACOS_SECURITY_PATH = "/usr/bin/security"
 _LINUX_SECRET_TOOL_PATH = "/usr/bin/secret-tool"
 _LINUX_SECRET_TOOL_ALLOWLIST = frozenset({_LINUX_SECRET_TOOL_PATH})
 _SECRET_HELPER_TIMEOUT_SECONDS = 5
+_HELPER_BASE_ENV = (("PATH", "/usr/bin:/bin"), ("LC_ALL", "C"))
+_SESSION_BUS_VARIABLE = "DBUS_SESSION_BUS_ADDRESS"
+_MAX_SESSION_BUS_ADDRESS_BYTES = 1024
+# D-Bus "optionally escaped" bytes minus ``*``: ``%`` escapes, ``;`` lists, ``,``/``=`` and every
+# other byte are refused, so the accepted value needs no unescaping and re-serialises exactly.
+_SESSION_BUS_PATH = re.compile(r"^/[-0-9A-Za-z_/.]{1,1022}$", flags=re.ASCII)
+_SESSION_BUS_GUID = re.compile(r"^[0-9a-f]{32}$", flags=re.ASCII)
 _MAX_SECRET_HELPER_OUTPUT_BYTES = 1024
 # One OS secret-store account per local pairing installation; never derived from a secret.
 RUNNER_PAIRING_SIGNER_LABEL_PREFIX = "heel-runner-pairing-v1-"
@@ -143,12 +150,56 @@ def _verified_secret_tool_path() -> str:
     return _verified_secret_helper_path(_LINUX_SECRET_TOOL_PATH)
 
 
+def session_bus_address() -> str:
+    """Return the canonical local session-bus address, or fail closed without echoing it.
+
+    Accepted: exactly one ``unix:`` entry with closed, non-duplicated keys ``path`` (required)
+    and ``guid`` (optional, 32 lowercase hex); ``path`` is absolute, normalised and names an
+    existing AF_UNIX socket (not a symlink) owned by the current uid. Unset, remote, list,
+    abstract, ``tmpdir``/``runtime``, ``unixexec``, ``autolaunch`` and escaped values are refused.
+    """
+    unavailable = "runner OS secret service unavailable"
+    value = os.environ.get(_SESSION_BUS_VARIABLE)
+    if (
+        type(value) is not str or not value.isascii()
+        or not 0 < len(value) <= _MAX_SESSION_BUS_ADDRESS_BYTES
+        or not value.startswith("unix:")
+    ):
+        raise RuntimeError(unavailable)
+    fields: dict[str, str] = {}
+    for pair in value[len("unix:"):].split(","):
+        key, separator, item = pair.partition("=")
+        if not separator or key not in {"path", "guid"} or key in fields:
+            raise RuntimeError(unavailable)
+        fields[key] = item
+    path, guid = fields.get("path"), fields.get("guid")
+    if (
+        path is None or _SESSION_BUS_PATH.fullmatch(path) is None
+        or os.path.normpath(path) != path
+        or (guid is not None and _SESSION_BUS_GUID.fullmatch(guid) is None)
+    ):
+        raise RuntimeError(unavailable)
+    try:
+        status = os.lstat(path)
+    except (OSError, ValueError):
+        raise RuntimeError(unavailable) from None
+    if not stat.S_ISSOCK(status.st_mode) or status.st_uid != os.getuid():
+        raise RuntimeError(unavailable)
+    return f"unix:path={path}" + ("" if guid is None else f",guid={guid}")
+
+
+def secret_tool_environment() -> dict[str, str]:
+    """The complete ``secret-tool`` environment: no other variable is ever forwarded."""
+    return {**dict(_HELPER_BASE_ENV), _SESSION_BUS_VARIABLE: session_bus_address()}
+
+
 def _run_bounded_secret_helper(
     helper: str, arguments: tuple[str, ...], *, payload: bytes | None,
-    popen: Callable[..., object],
+    popen: Callable[..., object], env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a fixed OS secret helper with bounded capture and stdin-only secret input."""
     argv = (helper, *arguments)
+    environment = dict(_HELPER_BASE_ENV) if env is None else dict(env)
     try:
         process = popen(
             argv,
@@ -157,7 +208,7 @@ def _run_bounded_secret_helper(
             stderr=subprocess.DEVNULL,
             shell=False,
             bufsize=0,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            env=environment,
         )
         process_stdin = process.stdin
         process_stdout = process.stdout
@@ -261,8 +312,11 @@ def _run_bounded_security(
 def _run_bounded_secret_tool(
     arguments: tuple[str, ...], *, payload: bytes | None, popen: Callable[..., object],
 ) -> subprocess.CompletedProcess:
+    helper = _verified_secret_tool_path()
+    # Validated before any process exists and before any payload is written.
+    environment = secret_tool_environment()
     return _run_bounded_secret_helper(
-        _verified_secret_tool_path(), arguments, payload=payload, popen=popen,
+        helper, arguments, payload=payload, popen=popen, env=environment,
     )
 
 
@@ -350,13 +404,28 @@ class LinuxSecretServiceBackend:
             popen=self._popen,
         )
         if result.returncode == 1:
-            return None
+            # lookup exit 1 means missing, unreachable or locked. A search for the item's own
+            # attributes lists a locked item too, so only exit 0 with no output is "missing";
+            # a locked existing item is unavailable and can never be overwritten by store.
+            if self._absent(label):
+                return None
+            raise RuntimeError("runner OS secret service unavailable")
         if result.returncode != 0:
             raise RuntimeError("runner OS secret service unavailable")
         try:
             return base64.b64decode(result.stdout.strip(), validate=True)
         except (TypeError, ValueError):
             raise RuntimeError("runner OS secret service returned invalid material") from None
+
+    def _absent(self, label: str) -> bool:
+        """``search`` for the item's own attributes exits 0 only when the service answered and
+        lists locked items too: exit 0 with no output is the only "missing". Any output (which
+        may hold the secret if the item unlocked meanwhile) stays in the bounded capture and is
+        discarded, never returned or logged."""
+        result = _run_bounded_secret_tool(
+            ("search", "heel", "runner", "label", label), payload=None, popen=self._popen,
+        )
+        return result.returncode == 0 and result.stdout == b""
 
     def store(self, label: str, seed: bytes) -> None:
         label = self._label(label)

@@ -4,6 +4,7 @@ All notable changes to Heel are documented here. Format loosely follows Keep a C
 
 ## [Unreleased]
 
+- Make the Linux `secret-service` vault and runner signing key work in a real session: `secret-tool` now receives one validated `DBUS_SESSION_BUS_ADDRESS` (a single local `unix:path=` socket owned by the user, optional 32-hex `guid`, re-serialised; remote, list, abstract, `tmpdir`/`runtime`, `unixexec`, `autolaunch` and escaped addresses are refused before launch) besides `PATH` and `LC_ALL`; no other variable is forwarded and macOS Keychain behaviour is unchanged. Missing is reported only after a search for the item's own attributes exits 0 with no output, so an unreachable service or a locked keyring is unavailable rather than missing and a locked existing credential or signing key is never overwritten.
 - Upgrade the control-plane cryptography pin to 50.0.1 and synchronize the hosted-proof wheel lock. The hosted control plane is not deployed; the runner side of this upgrade shipped in 1.3.0rc2 (below). Historical RC1 artifacts and publisher remain unchanged.
 
 - Answer a v3 runner pairing activation that loses its short SQLite busy wait (numeric `SQLITE_BUSY`/`SQLITE_LOCKED`, no open transaction, independent runner connection) with `503 runner_control_busy` (`retry_after_ms: 1000`, `Retry-After: 1`); `heel runner pair` resends the identical sealed activation after that bounded hint and never past the challenge deadline. Every other route and error stays a generic 500, whose log line gains only a typed `sqlite_primary_code` (H1A3-1F3DF).
