@@ -8866,6 +8866,35 @@ class RunnerStore:
             recovered += 1
         return recovered
 
+    @staticmethod
+    def _prune_lineage_matches(runtime: object, runtime_state: object, detached: Mapping[str, Any]) -> bool:
+        """Bind a prune-pending state to the exact local_terminal digest the detach record pinned.
+
+        The root digest is recomputed by the runtime from the prune state's retained immutable
+        terminal fields and must equal the detached digest exactly.  The immediate predecessor
+        must be one of the three closed shapes; a direct local_terminal predecessor additionally
+        keeps the original immediate-digest equality.
+        """
+        try:
+            root = runtime.terminal_root_state_digest(runtime_state)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        revision = runtime_state.revision
+        retained = (
+            runtime_state.available_at_ms, runtime_state.permit_id,
+            runtime_state.findings_projection_digest, runtime_state.receipt_digest,
+            runtime_state.disclosed_at_ms,
+        )
+        if revision == 2:
+            shape = retained == (None,) * 5 and runtime_state.prior_state_digest == root
+        elif revision == 3:
+            shape = type(retained[0]) is int and retained[1:] == (None,) * 4
+        elif revision == 4:
+            shape = type(retained[0]) is int and all(item is not None for item in retained[1:])
+        else:
+            shape = False
+        return bool(shape) and root == detached["runtime_state_digest"]
+
     def prune_runtime_terminal(
         self,
         run_id: str,
@@ -8969,7 +8998,7 @@ class RunnerStore:
                         or terminal["terminal_projection_digest"] != operational["projection_digest"]
                         or detached["terminal_record_digest"] != terminal["record_digest"]
                         or detached["terminal_projection_digest"] != terminal["terminal_projection_digest"]
-                        or detached["runtime_state_digest"] != runtime_state.prior_state_digest
+                        or not self._prune_lineage_matches(runtime, runtime_state, detached)
                         or runtime_state.terminal_record_digest != terminal["record_digest"]
                         or runtime_state.terminal_projection_digest != terminal["terminal_projection_digest"]
                         or runtime_state.grant_id != grant["grant_id"]

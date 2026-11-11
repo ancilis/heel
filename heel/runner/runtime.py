@@ -4210,6 +4210,28 @@ class RunnerRuntimeState:
                 raise
         return TerminalDisclosureBatch(items=states, has_more=len(rows) > limit)
 
+    def terminal_root_state_digest(self, state: TerminalDisclosureState) -> str:
+        """Recompute the exact ``local_terminal`` digest a later terminal state descends from.
+
+        Every root field is retained unchanged by ``available``, ``consumed`` and
+        ``prune_pending``; the Store binds this value to its signed detach record.
+        """
+        if type(state) is not TerminalDisclosureState or state.workspace_id != self.identity.workspace_id \
+                or state.runner_id != self.identity.runner_id or state.runner_key_id != self.identity.key_id:
+            raise RunnerRuntimeStateError("invalid runtime terminal state")
+        core = self._terminal_core(
+            state="local_terminal", workspace_id=state.workspace_id,
+            runner_id=state.runner_id, runner_key_id=state.runner_key_id,
+            run_id=state.run_id, run_hash=state.run_hash, project_id=state.project_id,
+            grant_id=state.grant_id, approval_projection_digest=state.approval_projection_digest,
+            terminal_projection_digest=state.terminal_projection_digest,
+            terminal_record_digest=state.terminal_record_digest, terminal_at_ms=state.terminal_at_ms,
+            retention_expires_at_ms=state.retention_expires_at_ms, result_chain=None,
+            available_at_ms=None, permit_id=None, findings_projection_digest=None,
+            receipt_digest=None, disclosed_at_ms=None, revision=1, prior_state_digest=None,
+        )
+        return self._validate_terminal_core(core).state_digest
+
     def load_available_disclosures(
         self, *, now_ms: int, after: tuple[int, str] | None = None, limit: int = 16,
     ) -> TerminalDisclosureBatch:

@@ -3950,3 +3950,77 @@ def test_process_local_stop_rereads_once_after_restart_and_ends_at_retention(tmp
     restarted.advance_disclosures()
     assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
     assert h.grant["run_id"] not in restarted._disclosure_stopped
+
+
+# --------------------------------------------------------------------------- retention prune lineage
+#
+# Base defect (task A report, CONFIRMED by probe): a run whose terminal disclosure reached
+# ``available`` (never shared) or ``consumed`` (shared) can never finish its retention prune: the
+# Store compares the detached record's ``local_terminal`` digest with the prune-pending state's
+# *immediate* predecessor, which is that later state.  Fresh synthetic fixtures only.
+
+def _shared_tail(grant, findings, authority, coordinator, holder):
+    permit = _handoff_permit(authority, coordinator, grant, findings)
+    return [
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, _handoff_receipt(grant, findings, permit)),
+    ]
+
+
+@pytest.mark.parametrize("lineage", ["available", "consumed"])
+def test_retention_prune_finishes_an_unshared_or_shared_run_from_its_exact_detached_lineage(tmp_path, lineage):
+    h = _handoff_coordinator(tmp_path, _shared_tail if lineage == "consumed" else (lambda *_: []))
+    if lineage == "consumed":
+        h.coordinator.advance_disclosures()
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == lineage
+    requests = len(h.transport.requests)
+
+    result = h.coordinator.maintenance_once(now_ms=state.retention_expires_at_ms)
+
+    assert (result.processed, result.has_more) == (1, False)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]) is None
+    assert h.coordinator.store.probe_run_reservation(h.grant["run_id"]).value == "absent"
+    assert len(h.transport.requests) == requests  # retention prune is local-only
+
+
+def test_retention_prune_refuses_a_prune_state_whose_terminal_lineage_differs_from_the_detached_record(tmp_path):
+    from heel.runner import runtime as runtime_module
+
+    h = _handoff_coordinator(tmp_path, lambda *_: [])
+    runtime = h.client.runtime
+    state = runtime.load_terminal_state(h.grant["run_id"])
+    (pending,) = runtime.claim_due_prune(now_ms=state.retention_expires_at_ms).items
+    # Re-seal the prune-pending row with one root lineage field changed and a self-consistent
+    # state digest: only the Store's binding to the detached local_terminal digest can refuse it.
+    with runtime._connection() as conn:
+        row = conn.execute(
+            "SELECT sealed_blob FROM terminal_disclosures WHERE run_hash=?", (pending.run_hash,),
+        ).fetchone()
+        core = dict(runtime._open(
+            row["sealed_blob"], schema="heel.runner-terminal-disclosure-state.v1",
+            primary_fields=(pending.run_hash,),
+        ))
+        core["terminal_at_ms"] += 1
+        core.pop("state_digest")
+        core["state_digest"] = runtime_module._state_digest(core)
+        changed = conn.execute(
+            "UPDATE terminal_disclosures SET sealed_blob=? WHERE run_hash=?",
+            (runtime._seal(core, schema=core["schema_version"], primary_fields=(pending.run_hash,)),
+             pending.run_hash),
+        ).rowcount
+        if conn.in_transaction:
+            conn.execute("COMMIT")
+    assert changed == 1
+    forged = runtime.load_terminal_state(h.grant["run_id"])
+    assert forged.state == "prune_pending" and forged.terminal_at_ms == pending.terminal_at_ms + 1
+    assert forged.state_digest != pending.state_digest
+    with pytest.raises(RunnerStoreError, match="local terminal prune authority is invalid"):
+        h.coordinator.store.prune_runtime_terminal(
+            h.grant["run_id"], runtime=runtime, expected_runtime_state_digest=forged.state_digest,
+            now_ms=forged.retention_expires_at_ms,
+        )
+    with pytest.raises(RunnerStoreError, match="local runtime prune receipt is unavailable"):
+        h.coordinator.store.load_pruned_run_receipt(
+            h.grant["run_id"], expected_runtime_state_digest=forged.state_digest,
+        )
