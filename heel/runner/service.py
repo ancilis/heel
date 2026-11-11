@@ -232,6 +232,11 @@ class RunnerService:
         if ensure_context is not None:
             if not callable(ensure_context) or ensure_context() is not True:
                 return False
+        # A plan queued by ``runner prepare --live`` is submitted here, by the owner of the
+        # serialized claim chain, before the poll that could later claim its approved run.
+        submit_pending = getattr(self.coordinator, "submit_pending_projection", None)
+        if submit_pending is not None:
+            submit_pending()
         lease = self.coordinator.claim()
         if lease is None:
             return False

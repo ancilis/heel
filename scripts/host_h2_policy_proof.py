@@ -91,7 +91,7 @@ HEEL_TREE_FILES = (
     "heel/runner/control_transport.py", "heel/runner/coordinator.py", "heel/runner/daemon.py",
     "heel/runner/execution.py", "heel/runner/http_transport.py", "heel/runner/identity.py",
     "heel/runner/openapi_routes.py", "heel/runner/plan_differential.py", "heel/runner/redaction.py",
-    "heel/runner/runtime.py", "heel/runner/service.py", "heel/runner/store.py", "heel/runner/vault.py",
+    "heel/runner/regressions.py", "heel/runner/runtime.py", "heel/runner/service.py", "heel/runner/store.py", "heel/runner/vault.py",
     "heel/saas/__init__.py", "heel/saas/auth.py", "heel/saas/billing.py", "heel/saas/canary_disclosure.py",
     "heel/saas/canary_reaper.py", "heel/saas/canary_runs.py", "heel/saas/canary_store.py", "heel/saas/catalog.py",
     "heel/saas/dashboard.py", "heel/saas/device_auth.py", "heel/saas/egress.py", "heel/saas/entitlement.py",
