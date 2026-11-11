@@ -198,6 +198,46 @@ def _scenario(view, scenario_id=SCENARIO):
     return result
 
 
+# Request lines this module's synthetic target can legitimately receive; anything else is
+# reported only as "unlisted" so a diagnostic message can never echo an unexpected request.
+_DIAGNOSTIC_REQUEST_LINES = frozenset(
+    f"{method} {path} HTTP/1.1"
+    for method in ("GET", "HEAD")
+    for path in (EXPORT_ROUTE, f"/exports/{CANARY}")
+)
+
+
+def _outcome_diagnostic(customer, view, scenario_id=SCENARIO) -> str:
+    """Failure-only, allowlisted operational facts for an outcome assertion message.
+
+    Discriminates incomplete execution (disposition/error/stop/containment), wrong observations
+    (role/status/body_shape per observation, request lines) and adapter classification (a
+    completed run whose observations are in shape). Never a full view, body, header, credential,
+    handle or environment value.
+    """
+    operational = view.get("operational_projection") or {}
+    scenarios = [item for item in (view.get("findings_projection") or {}).get(
+        "scenario_results", []) if item.get("scenario_id") == scenario_id]
+    result = scenarios[0] if len(scenarios) == 1 else {}
+    facts = {
+        "execution_disposition": operational.get("execution_disposition"),
+        "error_category": operational.get("error_category"),
+        "stop_reason": operational.get("stop_reason"),
+        "containment_codes": list(operational.get("containment_codes") or []),
+        "scenario_containment_codes": list(result.get("containment_codes") or []),
+        "observations": [
+            {key: item.get(key) for key in ("semantic_role", "status_code", "body_shape")}
+            for item in result.get("observations") or []
+        ],
+        "request_lines": [
+            line.decode("ascii", "replace") if line.decode("ascii", "replace")
+            in _DIAGNOSTIC_REQUEST_LINES else "unlisted"
+            for line in getattr(customer, "sent", [])
+        ],
+    }
+    return "diagnostic=" + json.dumps(facts, sort_keys=True)
+
+
 def _assert_redacted_projection(customer, run_id, view):
     findings = view["findings_projection"]
     assert validate_canary_findings(findings) == findings
@@ -301,7 +341,8 @@ def test_t6_marker_bound_runs_keep_the_existing_canary_result(customer):
     assert result["finding"]["confidence"] == "high"
 
     _run_id, patched = customer.run("patched")
-    assert (_scenario(patched)["assessment_outcome"], _scenario(patched)["finding"]) == ("blocked", None)
+    assert (_scenario(patched)["assessment_outcome"], _scenario(patched)["finding"]) == (
+        "blocked", None), _outcome_diagnostic(customer, patched)
 
     # The bound marker is missing from both bodies: the canary path owns the decision and the
     # markerless comparator is never consulted, even though both bodies share every key path.
@@ -309,6 +350,53 @@ def test_t6_marker_bound_runs_keep_the_existing_canary_result(customer):
     _run_id, unmarked = customer.run("vulnerable")
     assert (_scenario(unmarked)["assessment_outcome"], _scenario(unmarked)["finding"]) == (
         "inconclusive", None)
+
+
+def test_outcome_diagnostic_reports_only_allowlisted_operational_facts():
+    """The T6 failure message carries enumerated facts only: never a body, header, token,
+    handle, environment value or an unexpected request line."""
+    secret_header = f"Authorization: Bearer {TOKENS['lower_plan']}"
+    view = {
+        "operational_projection": {
+            "execution_disposition": "incomplete", "error_category": "target_timeout",
+            "stop_reason": "none", "containment_codes": ["target_timeout"],
+            "run_id": "run-secret-id", "signature_b64": "c2lnbmF0dXJl", "environ": {"HOME": "/h"},
+        },
+        "findings_projection": {"scenario_results": [{
+            "scenario_id": SCENARIO, "assessment_outcome": "inconclusive",
+            "containment_codes": ["evidence_unavailable"],
+            "finding": {"title": "acct_canary row_1", "evidence": PAYLOAD_DENIAL.decode()},
+            "local_evidence_refs": ["ev1_" + "a" * 64],
+            "observations": [
+                {"semantic_role": "higher_plan", "status_code": 200, "body_shape": "json_object",
+                 "truncation_state": "complete", "body": EXPORT_BODY.decode(),
+                 "headers": secret_header, "credential_handle_id": "cred-handle-0001"},
+            ],
+        }]},
+    }
+
+    class Sent:
+        sent = [f"GET /exports/{CANARY} HTTP/1.1".encode(),
+                f"GET /exports/{TOKENS['higher_plan']} HTTP/1.1".encode(),
+                secret_header.encode()]
+
+    message = _outcome_diagnostic(Sent(), view)
+    facts = json.loads(message.removeprefix("diagnostic="))
+    assert facts == {
+        "execution_disposition": "incomplete", "error_category": "target_timeout",
+        "stop_reason": "none", "containment_codes": ["target_timeout"],
+        "scenario_containment_codes": ["evidence_unavailable"],
+        "observations": [{"semantic_role": "higher_plan", "status_code": 200,
+                          "body_shape": "json_object"}],
+        "request_lines": [f"GET /exports/{CANARY} HTTP/1.1", "unlisted", "unlisted"],
+    }
+    for text in (*FORBIDDEN_PROJECTION_TEXT, *TOKENS.values(), *OWNERSHIP_TOKENS.values(),
+                 "Bearer", "Authorization", "run-secret-id", "c2lnbmF0dXJl", "HOME",
+                 "cred-handle-0001", "ev1_", "rows", "acct_"):
+        assert text not in message
+    # A missing or malformed view still yields a message rather than masking the assertion.
+    assert json.loads(_outcome_diagnostic(object(), {}).removeprefix("diagnostic="))[
+        "observations"] == []
 
 
 # --------------------------------------------------------------------------- ordinal binding
