@@ -47,17 +47,43 @@ it("uses closed create list revoke routes for browser context authorization", as
   ]);
 });
 
+// Obviously synthetic, but in the control plane's exact shape: 32 bytes as padded standard base64.
+const SYNTHETIC_INVITATION = `SyntheticInvite+Test/Only${"A".repeat(18)}=`;
+
+it("accepts only the runner's exact invitation token grammar from the pairing invitation response", async () => {
+  expect(SYNTHETIC_INVITATION).toHaveLength(44);
+  const respond = (token: unknown) => new CanaryApi({ transport: async () => jsonResponse({
+    schema_version: "heel.runner-pairing-invitation.v1", invitation_token: token, expires_at: 1_900_000_000.5 }, 201) });
+  await expect(respond(SYNTHETIC_INVITATION).createRunnerPairingInvitation(workspace))
+    .resolves.toEqual({ invitationToken: SYNTHETIC_INVITATION, expiresAt: 1_900_000_000.5 });
+  const malformed: unknown[] = [
+    "invite-1",                                    // the old identifier grammar: never minted, runner refuses it
+    SYNTHETIC_INVITATION.slice(0, -1),             // unpadded
+    `${SYNTHETIC_INVITATION.slice(0, -2)}==`,      // 31-byte padding
+    `${SYNTHETIC_INVITATION}A`,                    // too long
+    `A${SYNTHETIC_INVITATION}`,
+    SYNTHETIC_INVITATION.replace("+", "-"),        // url-safe alphabet
+    SYNTHETIC_INVITATION.replace("/", "_"),
+    `${SYNTHETIC_INVITATION}\n`,
+    ` ${SYNTHETIC_INVITATION.slice(1)}`,
+    "", 44, null, [SYNTHETIC_INVITATION],
+  ];
+  for (const token of malformed) {
+    await expect(respond(token).createRunnerPairingInvitation(workspace)).rejects.toMatchObject({ code: "invalid_response", status: 502 });
+  }
+});
+
 it("pairs and revokes runners only through the closed workspace routes and exact bodies", async () => {
   const pairing = `pending_${"1".repeat(32)}`;
   const calls: string[] = [];
   const api = new CanaryApi({ transport: async (path, init) => {
     calls.push(`${init.method}:${path}:${typeof init.body === "string" ? init.body : ""}`);
-    if (String(path).endsWith("/runner-pairings")) return jsonResponse({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: "invite-1", expires_at: 1_900_000_000.5 }, 201);
+    if (String(path).endsWith("/runner-pairings")) return jsonResponse({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: SYNTHETIC_INVITATION, expires_at: 1_900_000_000.5 }, 201);
     if (String(path).endsWith("/approve")) return jsonResponse({ schema_version: "heel.runner-pairing-approved.v1", status: "approved" });
     if (String(path).endsWith("/revoke")) return jsonResponse({ schema_version: "heel.runner-revoke-result.v1", revoked: true });
     return jsonResponse({ schema_version: "heel.runner-pairing-view.v1", pairing_id: pairing, runner_id: "runner-a", pairing_phrase: "a b c d e f", fingerprint: digest, status: "pending", expires_at: 1_900_000_000.5 });
   }});
-  assert.deepEqual(await api.createRunnerPairingInvitation(workspace), { invitationToken: "invite-1", expiresAt: 1_900_000_000.5 });
+  assert.deepEqual(await api.createRunnerPairingInvitation(workspace), { invitationToken: SYNTHETIC_INVITATION, expiresAt: 1_900_000_000.5 });
   assert.deepEqual(await api.inspectRunnerPairing(workspace, pairing), { pairingId: pairing, runnerId: "runner-a", pairingPhrase: "a b c d e f", fingerprint: digest, status: "pending", expiresAt: 1_900_000_000.5 });
   await api.approveRunnerPairing(workspace, pairing, "a b c d e f", digest);
   await api.revokeRunner(workspace, "runner-a");

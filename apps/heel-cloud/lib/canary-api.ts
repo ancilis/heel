@@ -11,6 +11,9 @@ const PROJECT_REF = /^prj_[0-9a-f]{32}$/;
 const RUN_REF = /^crun_[0-9a-f]{32}$/;
 const ENVIRONMENT_REF = /^env_[0-9a-f]{32}$/;
 const PAIRING_REF = /^pending_[0-9a-f]{32}$/;
+// The control plane mints 32 random bytes as padded standard base64; the runner CLI accepts exactly
+// this grammar (heel/runner/daemon.py `_INVITATION`), so the browser renders nothing else.
+const INVITATION_TOKEN = /^[A-Za-z0-9+/]{43}=$/;
 // The Worker's runner-route segment grammar; a runner id outside it is never sent.
 const RUNNER_REF = /^[A-Za-z0-9_-]{1,128}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -913,7 +916,8 @@ export class CanaryApi {
     if (!WORKSPACE_REF.test(workspaceRef)) invalidRequest();
     const value = await this.#json(`${CONTROL_PLANE_PREFIX}/v1/workspaces/${workspaceRef}/runner-pairings`, "POST", { schema_version: "heel.runner-pairing-invite.v1" }, 201);
     if (!exact(value, ["schema_version", "invitation_token", "expires_at"])
-      || value.schema_version !== "heel.runner-pairing-invitation.v1" || !identifier(value.invitation_token)
+      || value.schema_version !== "heel.runner-pairing-invitation.v1"
+      || typeof value.invitation_token !== "string" || !INVITATION_TOKEN.test(value.invitation_token)
       || typeof value.expires_at !== "number" || !Number.isFinite(value.expires_at) || value.expires_at <= 0) invalidResponse();
     return deepFreeze({ invitationToken: value.invitation_token as string, expiresAt: value.expires_at });
   }
