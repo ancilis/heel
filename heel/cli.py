@@ -399,12 +399,19 @@ def _runner_map(args) -> int:
 
 
 def _runner_findings(args) -> int:
-    """Print only the store-verified signed redacted local view of one terminal run."""
-    from .runner.regressions import load_terminal_local_view
+    """Print the store-verified signed redacted local view of one terminal run.
+
+    The only addition is a top-level, unsigned, derived ``evidence_states`` display list; the
+    signed objects inside the view are printed unchanged.
+    """
+    from .runner.regressions import evidence_states_for, load_terminal_local_view
 
     try:
+        view = load_terminal_local_view(_runner_store(), args.run)
+        if "evidence_states" in view:
+            raise ValueError("display key collides with the verified view")
         rendered = json.dumps(
-            load_terminal_local_view(_runner_store(), args.run), sort_keys=True,
+            {**view, "evidence_states": evidence_states_for(view)}, sort_keys=True,
         )
     except Exception:
         print(_SAFE_RUNNER_FINDINGS_FAILURE, file=sys.stderr)

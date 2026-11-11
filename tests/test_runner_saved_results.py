@@ -151,8 +151,16 @@ def test_findings_renders_only_the_verified_signed_redacted_local_view(
     code, output, error = invoke("runner", "findings", "--run", run_id)
 
     assert (code, error) == (0, "")
-    view = json.loads(output)
+    shown = json.loads(output)
+    # The only addition is the unsigned derived display list; the verified view is unchanged.
+    view = {key: value for key, value in shown.items() if key != "evidence_states"}
     assert view == store.load_final_projections(run_id)["local_view"]
+    assert shown["evidence_states"] == [
+        {"ordinal": item["ordinal"], "scenario_id": item["scenario_id"],
+         "evidence_state": {"inconclusive": "inconclusive", "observed": "verified"}[
+             item["assessment_outcome"]]}
+        for item in view["findings_projection"]["scenario_results"]
+    ]
     outcomes = {
         item["scenario_id"]: item["assessment_outcome"]
         for item in view["findings_projection"]["scenario_results"]

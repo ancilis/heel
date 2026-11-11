@@ -142,6 +142,34 @@ def load_terminal_local_view(store: "RunnerStore", run_id: str) -> dict[str, Any
     return view
 
 
+def evidence_states_for(view: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Derive an unsigned display state per scenario from an already store-verified local view.
+
+    Reads only signed ``scenario_results`` fields (ordinal, scenario_id, assessment_outcome,
+    finding.confidence); never evidence refs, bodies, handles or headers, and never mutates the
+    view. ``observed`` = markerless (medium) finding, ``verified`` = canary-marker (high) finding,
+    ``held`` = blocked, anything else ``inconclusive``.
+    """
+    states = []
+    for item in view["findings_projection"]["scenario_results"]:
+        outcome = item["assessment_outcome"]
+        finding = item["finding"]
+        confidence = finding["confidence"] if isinstance(finding, Mapping) else None
+        if outcome == "observed" and confidence == "medium":
+            state = "observed"
+        elif outcome == "observed" and confidence == "high":
+            state = "verified"
+        elif outcome == "blocked":
+            state = "held"
+        else:
+            state = "inconclusive"
+        states.append({
+            "ordinal": item["ordinal"], "scenario_id": item["scenario_id"],
+            "evidence_state": state,
+        })
+    return states
+
+
 def _verified_terminal_run(store: "RunnerStore", run_id: str) -> dict[str, Any]:
     """Load one terminal run whose grant, approved pair and signed finals bind each other.
 
