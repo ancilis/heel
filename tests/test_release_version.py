@@ -12,7 +12,7 @@ from heel.review_contract import ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 # The Python package, release contract, engine and server.json use the PEP 440 spelling.
-# The current version is the checked-in 1.3.0rc4 candidate, which is not yet published.
+# The current version is 1.3.0rc4, published as a GitHub prerelease on 2026-11-11.
 VERSION = "1.3.0rc4"
 # npm metadata needs SemVer; this is the single normalization mapping, not a second version.
 NPM_VERSION = "1.3.0-rc.4"
@@ -132,11 +132,12 @@ class ReleaseVersionContractTests(unittest.TestCase):
         for path in customer[:2] + customer[4:]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        # The CHANGELOG records the publication only after it happens: its date and release URL are
-        # added by the release owner after verify-public, not by this customer-copy change.
-        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
-        self.assertEqual(changelog.count("unpublished candidate"), 1)
-        self.assertNotIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
+        # The CHANGELOG is the publication record: the real date and release URL, recorded after the
+        # release owner's anonymous verify-public passed, with no remaining candidate wording.
+        self.assertIn(f"## [{VERSION}]: 2026-11-11", changelog)
+        self.assertIn(PUBLIC_RELEASE_URL, changelog)
+        self.assertNotIn("unpublished candidate", changelog)
+        self.assertNotIn("Customer copy is unchanged", changelog)
         self.assertIn(f"## [{PAIRED_RUNNER_VERSION}]: 2026-11-11", changelog)
         self.assertIn(PAIRED_RUNNER_RELEASE_URL, changelog)
         self.assertIn("## [1.3.0rc2]: 2026-11-10", changelog)
