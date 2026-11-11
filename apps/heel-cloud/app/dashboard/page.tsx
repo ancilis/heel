@@ -98,6 +98,25 @@ function proofInstruction(method: OwnershipProofMethod, httpUrl: string, token: 
 }
 
 /** Wall-clock seconds, the unit of the pairing invitation and request expiry. */
+type PairedRunner = { runnerId: string; key: string; label: string; name: string };
+
+/**
+ * Every runner the workspace can revoke: the server's bindable runners plus the runner of each active, unexpired
+ * binding (the bindable selector omits a runner while it is bound). A binding carries no display name or fingerprint,
+ * so its runner is shown by id. The pairing offer, the revoke list and the revoke precondition all use this one set.
+ */
+function pairedRunnersOf(dashboard: RunnerContextBindingDashboard, nowMs: number): PairedRunner[] {
+  const paired: PairedRunner[] = dashboard.runners.map((item) => ({
+    runnerId: item.runnerId, key: `${item.runnerId}:${item.runnerKeyId}`,
+    label: `${item.displayName} · ${item.fingerprint.slice(0, 12)}`, name: item.displayName,
+  }));
+  for (const item of dashboard.bindings) {
+    if (item.status !== "active" || item.expiresAtMs <= nowMs || paired.some((entry) => entry.runnerId === item.runnerId)) continue;
+    paired.push({ runnerId: item.runnerId, key: `${item.runnerId}:${item.runnerKeyId}`, label: item.runnerId, name: item.runnerId });
+  }
+  return paired;
+}
+
 function currentSeconds(): number {
   return Date.now() / 1000;
 }
@@ -319,6 +338,7 @@ export default function Dashboard() {
     const contextBindings = await canaryApi.listRunnerContextBindings(context.workspaceRef, context.project.projectRef);
     if (ticket !== generation.current) return;
     setConnection({ phase: "ready", context: { ...context, contextBindings } });
+    setNowSeconds(currentSeconds());
     setSelectedRunner((current) => contextBindings.runners.some((runner) => runner.runnerId === current) ? current : "");
   }, []);
 
@@ -604,7 +624,7 @@ export default function Dashboard() {
   async function revokeRunner(runnerId: string): Promise<void> {
     if (connection.phase !== "ready" || revokeCandidate !== runnerId) return;
     const { context } = connection;
-    if (!context.contextBindings.runners.some((item) => item.runnerId === runnerId)) return;
+    if (!pairedRunnersOf(context.contextBindings, nowSeconds * 1000).some((item) => item.runnerId === runnerId)) return;
     const ticket = generation.current;
     setRevokeCandidate(null);
     const operation = beginWork(); setNotice(null);
@@ -771,8 +791,9 @@ export default function Dashboard() {
   const showActivation = context !== null && (privateConnectorInUse || pendingApproval !== null || observedRun !== null);
   // Pairing is offered only after the project's target is verified, only to a workspace owner or admin (the server
   // also requires a recent sign-in), and only while the workspace has no active runner.
+  const pairedRunners = context !== null ? pairedRunnersOf(context.contextBindings, nowSeconds * 1000) : [];
   const canPairRunner = context !== null && executable !== undefined && pendingApproval === null
-    && context.contextBindings.runners.length === 0
+    && pairedRunners.length === 0
     && (context.account.workspace.role === "owner" || context.account.workspace.role === "admin");
   const pairingForContext = context !== null && pairingSession !== null && pairingSession.workspaceRef === context.workspaceRef
     && pairingSession.projectRef === context.project.projectRef ? pairingSession : null;
@@ -823,11 +844,14 @@ export default function Dashboard() {
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
           <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
-          {context.contextBindings.runners.length > 0 ? <ul aria-label="Paired runners">{context.contextBindings.runners.map((item) => <li key={`${item.runnerId}:${item.runnerKeyId}`}><span>{item.displayName} · {item.fingerprint.slice(0, 12)}</span>
-            {revokeCandidate === item.runnerId
-              ? <><button disabled={working} onClick={() => void revokeRunner(item.runnerId)} type="button">Confirm revoke {item.displayName}</button><button disabled={working} onClick={() => setRevokeCandidate(null)} type="button">Keep runner</button></>
-              : <button disabled={working} onClick={() => setRevokeCandidate(item.runnerId)} type="button">Revoke runner</button>}</li>)}</ul> : null}
           {context.contextBindings.bindings.length > 0 ? <ul className="context-binding-list">{context.contextBindings.bindings.map((item) => <li key={item.bindingId}><span>{item.origin} · {item.runnerId} · {item.status}</span>{item.status === "active" ? <button disabled={working} onClick={() => void revokeContextBinding(item.bindingId)} type="button">Revoke</button> : null}</li>)}</ul> : null}
+        </section> : null}
+        {context && !pendingApproval && pairedRunners.length > 0 ? <section className="runner-recovery" aria-labelledby="paired-runners-title"><p className="canary-kicker">Local runner</p><h2 id="paired-runners-title">Paired runners</h2>
+          <p>Revoking a runner stops Heel Cloud accepting its keys right away, whether or not a target is verified.</p>
+          <ul aria-label="Paired runners">{pairedRunners.map((item) => <li key={item.key}><span>{item.label}</span>
+            {revokeCandidate === item.runnerId
+              ? <><button disabled={working} onClick={() => void revokeRunner(item.runnerId)} type="button">Confirm revoke {item.name}</button><button disabled={working} onClick={() => setRevokeCandidate(null)} type="button">Keep runner</button></>
+              : <button disabled={working} onClick={() => setRevokeCandidate(item.runnerId)} type="button">Revoke runner</button>}</li>)}</ul>
         </section> : null}
       </div>
 
