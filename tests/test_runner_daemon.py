@@ -2214,9 +2214,9 @@ def test_serve_execution_bridge_runs_a_signed_lease_through_the_real_target_clie
     assert service.run_once() is True
     owner.close()
     # One preflight plus one recheck per attempt, all for the signed manifest origin's host only.
-    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"] * 5, _bridge_run_diagnostic(
+    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"] * 5, json.dumps(_bridge_run_diagnostic(
         bridge, resolver, sockets, timeline, started,
-    )
+    ), sort_keys=True)
     assert [call[0] for call in sockets.calls] == [(PUBLIC, 443)] * 4
     requests = [b"".join(item.sent) for item in tls_sockets]
     assert [line.split(b"\r\n", 1)[0] for line in requests] == [
