@@ -12,10 +12,12 @@ import { ActivationCard, type ActivationSnapshot } from "../../components/canary
 import { ApprovalDialog } from "../../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { RunProgress, type RunPhase } from "../../components/canary/RunProgress";
+import { RunnerPairingCard, pairingPhraseMatches } from "../../components/canary/RunnerPairingCard";
 import { TargetRegistrationCard, type OwnershipProofMethod, type PendingTarget } from "../../components/onboarding/TargetRegistrationCard";
 import {
   CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureMetadata, type CanaryPendingApprovalRequest,
-  type CanaryRunDashboard, type PendingEnvironmentProof, type RunnerContextBindingDashboard, type VerifiedEnvironmentRecord,
+  type CanaryRunDashboard, type PendingEnvironmentProof, type RunnerContextBindingDashboard, type RunnerPairingView,
+  type VerifiedEnvironmentRecord,
 } from "../../lib/canary-api";
 import {
   canCreateProject, resolveAccount, selectionFromParams, selectionQuery, type AccountSelection, type AccountWorkspaceView,
@@ -30,6 +32,8 @@ const SIGNED_OUT_MESSAGE = "You signed out. Sign in again to continue.";
 const CANARY_LOCKED_MESSAGE = "You are still signed in. Staging verification, runner access and rehearsals stay locked until it loads; nothing has been approved or executed.";
 const PROJECT_CREATED_READY = "Project created. Add a target next.";
 const PROOF_RECENT_AUTH_MESSAGE = "For your security, showing or replacing a pending proof needs a sign-in from the last 15 minutes. The proof is kept on the server: sign out, sign in again, then resume it.";
+const PAIRING_RECENT_AUTH_MESSAGE = "For your security, pairing or revoking a runner needs an owner or admin sign-in from the last 15 minutes. Sign out, sign in again, then create a new invitation.";
+const PAIRING_GONE_MESSAGE = "That pairing request is no longer available: it expired, was already used, or belongs to another workspace. Create a new invitation and run the pair command again.";
 const PROJECT_CREATED_BLOCKED = "Project created. Canary setup is unavailable right now, so target verification is blocked; use Try again shortly.";
 const cloudApi = new HeelCloudApi();
 const canaryApi = new CanaryApi();
@@ -55,6 +59,14 @@ type Connection =
   | { phase: "error"; message: string };
 
 type ProofChallenge = { environmentId: string; instruction: string };
+/** One pairing ceremony, bound to the workspace and project it started in; kept only in page memory. */
+type PairingSession = {
+  workspaceRef: string;
+  projectRef: string;
+  invitation: { token: string; expiresAt: number } | null;
+  pairing: RunnerPairingView | null;
+  approved: boolean;
+};
 type DisclosurePreview = CanaryDisclosureMetadata & {
   completedScenarios: number;
   outcomeCounts: { blocked: number; observed: number; inconclusive: number };
@@ -83,6 +95,11 @@ function isSessionLoss(error: unknown): boolean {
 /** The one place a proof instruction is worded; it is shown on screen only and never stored. */
 function proofInstruction(method: OwnershipProofMethod, httpUrl: string, token: string, dnsRecord: string): string {
   return method === "https-file" ? `Place the one-time token at ${httpUrl}: ${token}` : `Publish this exact record: ${dnsRecord}`;
+}
+
+/** Wall-clock seconds, the unit of the pairing invitation and request expiry. */
+function currentSeconds(): number {
+  return Date.now() / 1000;
 }
 
 function idempotencyKey(): `ca1-${string}` {
@@ -165,6 +182,9 @@ export default function Dashboard() {
   const [selectedRunner, setSelectedRunner] = useState("");
   const [selectedBindingEnvironment, setSelectedBindingEnvironment] = useState("");
   const [pendingHasMore, setPendingHasMore] = useState(false);
+  const [pairingSession, setPairingSession] = useState<PairingSession | null>(null);
+  const [revokeCandidate, setRevokeCandidate] = useState<string | null>(null);
+  const [nowSeconds, setNowSeconds] = useState(currentSeconds);
 
   const clearPendingApproval = useCallback((): void => {
     setPendingApproval(null);
@@ -210,6 +230,7 @@ export default function Dashboard() {
 
   const resetProjectState = useCallback((): void => {
     setSelectedRunner(""); setSelectedBindingEnvironment("");
+    setPairingSession(null); setRevokeCandidate(null);
     setProofChallenge(null);
     setSelectedPendingId(null); setReplacementPendingId(null);
     setOrigin("");
@@ -231,6 +252,8 @@ export default function Dashboard() {
     // Actions still pending belong to the previous context; they no longer block this one.
     setBusyOperation(null);
     clearApprovalIdentity();
+    // An invitation, opened pairing request or revoke confirmation never survives a context transition.
+    setPairingSession(null); setRevokeCandidate(null);
     setConnection({ phase: "checking" });
     const next = await loadConnection(requested);
     if (ticket !== generation.current) return null;
@@ -370,6 +393,13 @@ export default function Dashboard() {
     return () => { cancelled = true; clearInterval(timer); };
   }, [clearPendingApproval, connect, connection, pendingApproval, sessionEnded]);
 
+  // Expiry is re-evaluated while a pairing ceremony is open; the server still decides.
+  useEffect(() => {
+    if (pairingSession === null) return;
+    const timer = setInterval(() => setNowSeconds(currentSeconds()), 5_000);
+    return () => clearInterval(timer);
+  }, [pairingSession]);
+
   const executable = connection.phase === "ready"
     ? connection.context.environments.find((item) => item.isExecutable) : undefined;
   const pendingRecords = connection.phase === "ready"
@@ -504,6 +534,88 @@ export default function Dashboard() {
       if (ticket !== generation.current) return;
       setNotice("Canary access was revoked. Issued grants and active work were not changed.");
     } catch (error) { recover(error, ticket); } finally { endWork(operation); }
+  }
+
+  /** Handles a pairing or runner-revoke failure for the context that started it. */
+  function recoverPairing(error: unknown, ticket: number): void {
+    if (ticket !== generation.current) return;
+    if (error instanceof CanaryApiError && error.code === "recent_auth_required") setNotice(PAIRING_RECENT_AUTH_MESSAGE);
+    else if (error instanceof CanaryApiError && (error.code === "runner_pairing_not_found" || error.code === "invalid_runner_pairing")) {
+      setPairingSession((current) => current === null ? null : { ...current, pairing: null, approved: false });
+      setNotice(PAIRING_GONE_MESSAGE);
+    } else recover(error, ticket);
+  }
+
+  async function createPairingInvitation(): Promise<void> {
+    if (connection.phase !== "ready") return;
+    const { context } = connection;
+    const ticket = generation.current;
+    const operation = beginWork(); setNotice(null);
+    try {
+      const invitation = await canaryApi.createRunnerPairingInvitation(context.workspaceRef);
+      if (ticket !== generation.current) return;
+      setNowSeconds(currentSeconds());
+      setPairingSession({ workspaceRef: context.workspaceRef, projectRef: context.project.projectRef,
+        invitation: { token: invitation.invitationToken, expiresAt: invitation.expiresAt }, pairing: null, approved: false });
+    } catch (error) { recoverPairing(error, ticket); } finally { endWork(operation); }
+  }
+
+  async function inspectPairing(pairingId: string): Promise<void> {
+    if (connection.phase !== "ready") return;
+    const { context } = connection;
+    const ticket = generation.current;
+    const operation = beginWork(); setNotice(null);
+    try {
+      const pairing = await canaryApi.inspectRunnerPairing(context.workspaceRef, pairingId);
+      if (ticket !== generation.current) return;
+      // The invitation was consumed by the runner's exchange; its token is not shown again.
+      setNowSeconds(currentSeconds());
+      setPairingSession({ workspaceRef: context.workspaceRef, projectRef: context.project.projectRef, invitation: null, pairing, approved: false });
+    } catch (error) { recoverPairing(error, ticket); } finally { endWork(operation); }
+  }
+
+  async function approvePairing(typedPhrase: string): Promise<void> {
+    const session = pairingSession;
+    if (connection.phase !== "ready" || session === null || session.pairing === null || session.approved
+      || session.workspaceRef !== connection.context.workspaceRef || session.projectRef !== connection.context.project.projectRef) return;
+    const { pairing } = session;
+    // Only the person's own match of the server's words, before the request's expiry, ever sends an approval.
+    if (!pairingPhraseMatches(typedPhrase, pairing.pairingPhrase) || currentSeconds() >= pairing.expiresAt) return;
+    const { context } = connection;
+    const ticket = generation.current;
+    const operation = beginWork(); setNotice(null);
+    try {
+      await canaryApi.approveRunnerPairing(session.workspaceRef, pairing.pairingId, pairing.pairingPhrase, pairing.fingerprint);
+      if (ticket !== generation.current) return;
+      setPairingSession((current) => current?.pairing?.pairingId === pairing.pairingId ? { ...current, approved: true } : current);
+      await refreshContextBindings(context, ticket);
+    } catch (error) { recoverPairing(error, ticket); } finally { endWork(operation); }
+  }
+
+  async function refreshPairedRunners(): Promise<void> {
+    if (connection.phase !== "ready") return;
+    const ticket = generation.current;
+    const operation = beginWork(); setNotice(null);
+    try {
+      await refreshContextBindings(connection.context, ticket);
+    } catch (error) { recover(error, ticket); } finally { endWork(operation); }
+  }
+
+  async function revokeRunner(runnerId: string): Promise<void> {
+    if (connection.phase !== "ready" || revokeCandidate !== runnerId) return;
+    const { context } = connection;
+    if (!context.contextBindings.runners.some((item) => item.runnerId === runnerId)) return;
+    const ticket = generation.current;
+    setRevokeCandidate(null);
+    const operation = beginWork(); setNotice(null);
+    try {
+      await canaryApi.revokeRunner(context.workspaceRef, runnerId);
+      if (ticket !== generation.current) return;
+      setPairingSession(null);
+      await refreshContextBindings(context, ticket);
+      if (ticket !== generation.current) return;
+      setNotice("Runner revoked. Heel Cloud no longer accepts its keys and requests a stop of its active rehearsals; run heel runner unpair on that machine to remove its local identity.");
+    } catch (error) { recoverPairing(error, ticket); } finally { endWork(operation); }
   }
 
   async function startProof(): Promise<void> {
@@ -657,6 +769,13 @@ export default function Dashboard() {
   const privateConnectorInUse = context !== null
     && (context.contextBindings.runners.length > 0 || context.contextBindings.bindings.length > 0);
   const showActivation = context !== null && (privateConnectorInUse || pendingApproval !== null || observedRun !== null);
+  // Pairing is offered only after the project's target is verified, only to a workspace owner or admin (the server
+  // also requires a recent sign-in), and only while the workspace has no active runner.
+  const canPairRunner = context !== null && executable !== undefined && pendingApproval === null
+    && context.contextBindings.runners.length === 0
+    && (context.account.workspace.role === "owner" || context.account.workspace.role === "admin");
+  const pairingForContext = context !== null && pairingSession !== null && pairingSession.workspaceRef === context.workspaceRef
+    && pairingSession.projectRef === context.project.projectRef ? pairingSession : null;
   const progress = observedRun?.progress;
 
   return (
@@ -664,7 +783,7 @@ export default function Dashboard() {
       <header className="dashboard-nav"><Link className="brand" href="/" aria-label="Heel home"><span className="brand-mark" aria-hidden="true">H</span><span>Heel</span></Link>
         <div className="dashboard-context"><span className="dashboard-workspace">{selectedProject ? selectedProject.name : "Workspace not connected"}</span><span className="dashboard-presence"><i aria-hidden="true" /> {context ? "Cloud connected" : "Local-first"}</span></div></header>
 
-      <p className="runner-recovery">Supported validation: <Link href="/runner">export entitlement reference and local report viewer</Link>. No customer-target pairing command is available in this release.</p>
+      <p className="runner-recovery">Supported validation: <Link href="/runner">export entitlement reference and local report viewer</Link>.</p>
       <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified target setup</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Managed scanning is not available in this build.</p></div>
         <aside className="preview-notice" aria-label="Connection status"><span className="preview-pulse" aria-hidden="true" /><div><strong>{connection.phase === "ready" ? "Ready for customer setup" : "Connect to begin"}</strong><p>{connection.phase === "checking" ? "Checking signed-in context · no request sent" : connection.phase === "ready" ? "Live account state · operational metadata only" : "No sample data is shown"}</p></div></aside></section>
 
@@ -692,6 +811,11 @@ export default function Dashboard() {
           pendingTargets={pendingTargets} selectedPendingId={chosenPending?.environmentId ?? null} replacementPendingId={replacementPendingId}
           onSelectPendingTarget={(environmentId) => { setSelectedPendingId(environmentId || null); setNotice(null); }}
           onResumeProof={() => void pendingProofAction(false)} onReplaceProof={() => void pendingProofAction(true)} /> : null}
+        {canPairRunner && context ? <RunnerPairingCard key={`${context.workspaceRef}/${context.project.projectRef}`}
+          approved={pairingForContext?.approved ?? false} busy={working}
+          invitation={pairingForContext?.invitation ?? null} nowSeconds={nowSeconds} onApprove={(typed) => void approvePairing(typed)}
+          onCreateInvitation={() => void createPairingInvitation()} onInspect={(pairingId) => void inspectPairing(pairingId)}
+          onRefreshRunners={() => void refreshPairedRunners()} pairing={pairingForContext?.pairing ?? null} /> : null}
         {showActivation ? <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
           onReviewApproval={hasPlan && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
           scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} /> : null}
@@ -699,6 +823,10 @@ export default function Dashboard() {
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
           <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
+          {context.contextBindings.runners.length > 0 ? <ul aria-label="Paired runners">{context.contextBindings.runners.map((item) => <li key={`${item.runnerId}:${item.runnerKeyId}`}><span>{item.displayName} · {item.fingerprint.slice(0, 12)}</span>
+            {revokeCandidate === item.runnerId
+              ? <><button disabled={working} onClick={() => void revokeRunner(item.runnerId)} type="button">Confirm revoke {item.displayName}</button><button disabled={working} onClick={() => setRevokeCandidate(null)} type="button">Keep runner</button></>
+              : <button disabled={working} onClick={() => setRevokeCandidate(item.runnerId)} type="button">Revoke runner</button>}</li>)}</ul> : null}
           {context.contextBindings.bindings.length > 0 ? <ul className="context-binding-list">{context.contextBindings.bindings.map((item) => <li key={item.bindingId}><span>{item.origin} · {item.runnerId} · {item.status}</span>{item.status === "active" ? <button disabled={working} onClick={() => void revokeContextBinding(item.bindingId)} type="button">Revoke</button> : null}</li>)}</ul> : null}
         </section> : null}
       </div>
