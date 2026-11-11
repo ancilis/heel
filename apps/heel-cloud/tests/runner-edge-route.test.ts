@@ -247,3 +247,67 @@ describe("runner inactive-claim attestation edge route", () => {
     expect(rejected).not.toHaveBeenCalled();
   });
 });
+
+describe("runner pairing inspect edge route (browser same-origin read)", () => {
+  const pairing = `pending_${"a".repeat(32)}`;
+  const inspect = `/api/control-plane/v1/workspaces/${workspace}/runner-pairings/${pairing}`;
+  const session = { Cookie: "__Host-heel_session=session-value" };
+  const context = { waitUntil() {}, passThroughOnException() {} };
+  const read = (headers: Record<string, string>) => new Request(`https://heel.example${inspect}`, { method: "GET", headers });
+
+  it("forwards a same-origin GET that carries no Origin, as a browser sends it, with the edge-derived ceremony", async () => {
+    for (const headers of [
+      { ...session, "Sec-Fetch-Site": "same-origin", Origin: "https://heel.example" },
+      { ...session, "Sec-Fetch-Site": "same-origin" },
+    ]) {
+      const fetcher = vi.fn().mockResolvedValue(new Response("{}", { headers: { "Content-Type": "application/json" } }));
+      const status = (await worker.fetch(read(headers), env(fetcher), context)).status;
+      expect({ origin: "Origin" in headers, status }).toEqual({ origin: "Origin" in headers, status: 200 });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      const upstream = fetcher.mock.calls[0][0] as Request;
+      expect(upstream.method).toBe("GET");
+      expect(upstream.body).toBeNull();
+      expect(upstream.url).toBe(`https://heel.example${inspect.replace("/api/control-plane", "")}`);
+      expect([...upstream.headers.entries()].sort()).toEqual([
+        ["cookie", "heel_session=session-value"], ["origin", "https://heel.example"],
+        ["x-heel-edge-auth", edge], ["x-heel-internal-origin", "same-origin"],
+      ]);
+    }
+  });
+
+  it("refuses a read without same-origin fetch metadata, with a foreign Origin, or without one session", async () => {
+    const refused: Record<string, string>[] = [
+      { ...session },
+      { ...session, "Sec-Fetch-Site": "cross-site" },
+      { ...session, "Sec-Fetch-Site": "same-site" },
+      { ...session, "Sec-Fetch-Site": "none" },
+      { ...session, "Sec-Fetch-Site": "same-origin", Origin: "https://evil.example" },
+      { ...session, "Sec-Fetch-Site": "same-origin", Origin: "null" },
+      { "Sec-Fetch-Site": "same-origin" },
+      { ...session, "Sec-Fetch-Site": "same-origin", Authorization: `Bearer heel_sk_${"a".repeat(20)}` },
+    ];
+    const fetcher = vi.fn();
+    for (const headers of refused) {
+      expect((await worker.fetch(read(headers), env(fetcher), context)).status).toBe(400);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("keeps the exact Origin on every other pairing route and method", async () => {
+    const fetcher = vi.fn();
+    const body = JSON.stringify({ schema_version: "heel.runner-pairing-approve.v1" });
+    for (const [method, path] of [
+      ["POST", `${inspect}/approve`],
+      ["POST", `/api/control-plane/v1/workspaces/${workspace}/runner-pairings`],
+      ["DELETE", inspect],
+      ["GET", `/api/control-plane/v1/workspaces/${workspace}/runner-pairings`],
+      ["GET", `${inspect}/approve`],
+    ] as const) {
+      const headers: Record<string, string> = { ...session, "Sec-Fetch-Site": "same-origin" };
+      if (method === "POST") Object.assign(headers, { "Content-Type": "application/json", "Content-Length": String(body.length) });
+      const candidate = new Request(`https://heel.example${path}`, { method, headers, body: method === "POST" ? body : undefined });
+      expect((await worker.fetch(candidate, env(fetcher), context)).status).toBe(400);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+});

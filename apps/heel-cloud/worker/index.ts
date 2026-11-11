@@ -150,6 +150,7 @@ const RUNNER_NEXT_NONCE = /^[A-Za-z0-9+/]{43}=$/;
 const RUNNER_PAIRING_EXCHANGE = "/v1/runner-pairings/exchange";
 const RUNNER_PAIRING_ACTIVATE = /^\/v1\/runner-pairings\/pending_[0-9a-f]{32}\/(?:activate|activation-abort)$/;
 const RUNNER_PAIRING_MANAGE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings(?:/pending_[0-9a-f]{32}(?:/approve)?)?$`);
+const RUNNER_PAIRING_INSPECT = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runner-pairings/pending_[0-9a-f]{32}$`);
 const RUNNER_ROTATION_START = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotate$`);
 const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/rotations/rotation_[0-9a-f]{32}/approve$`);
 const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/revoke$`);
@@ -316,12 +317,17 @@ function controlPlaneRequestHeaders(
       headers.set("Origin", origin);
     }
   } else if (runnerPairingHuman) {
-    const origin = source.get("Origin") ?? "";
-    if (origin !== configuredPublicOrigin || source.get("Sec-Fetch-Site") !== "same-origin") throw new InvalidControlPlaneRequest();
+    // A browser sends no Origin on a same-origin GET (Fetch: "append a request Origin header"), so the
+    // read-only pairing inspect proves same-origin by fetch metadata alone; an Origin it does carry
+    // must still be exact. Every state-changing pairing method keeps the exact Origin requirement.
+    const origin = source.get("Origin");
+    const browserRead = method === "GET" && RUNNER_PAIRING_INSPECT.test(upstreamPath) && origin === null;
+    if (configuredPublicOrigin === undefined || (!browserRead && origin !== configuredPublicOrigin)
+      || source.get("Sec-Fetch-Site") !== "same-origin") throw new InvalidControlPlaneRequest();
     headers = controlPlaneCredentials(source);
     if (!headers.has("Cookie") || headers.has("Authorization")) throw new InvalidControlPlaneRequest();
     headers.set("X-Heel-Internal-Origin", "same-origin");
-    headers.set("Origin", origin);
+    headers.set("Origin", configuredPublicOrigin);
   } else
   if (
     upstreamPath === SIGNUP_ROUTE
