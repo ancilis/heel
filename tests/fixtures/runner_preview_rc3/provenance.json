@@ -1,0 +1,73 @@
+{
+  "schema": "heel.test-fixture.runner-preview-rc3.v1",
+  "purpose": "Historical public 1.3.0rc3 runner-preview bytes for tests/test_runner_preview_publisher_rc3.py. The fixed rc3 publisher is tested against these, never against the checkout's current downloads or version sources. Test input only; not a release artifact.",
+  "version": "1.3.0rc3",
+  "source_commit": "4b68c2f96d3c0c85c9c0a0a6453f72b4f56c8ca4",
+  "source_tree": "8989f05fb4691b7f53a362a8712c21404e58e239",
+  "public_release": {
+    "tag": "v1.3.0rc3",
+    "tag_object": "8dbe416318c44f553b9b76b0bc4fabd9f51d0ba1",
+    "target_commit": "17a1ea70ee03a78232d04c00d589b78d6f55f0f6",
+    "tag_created_at": "2026-11-11T13:14:42Z",
+    "prerelease": true,
+    "draft": false
+  },
+  "identical_blobs_at": [
+    "4b68c2f96d3c0c85c9c0a0a6453f72b4f56c8ca4",
+    "17a1ea70ee03a78232d04c00d589b78d6f55f0f6",
+    "7f78769eecb6157219df78b169693e16d7b2f550"
+  ],
+  "artifacts": [
+    {
+      "name": "heel_sim-1.3.0rc3-py3-none-any.whl",
+      "source_path": "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc3-py3-none-any.whl",
+      "size": 2769936,
+      "sha256": "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca",
+      "git_blob": "7fcbeb6621c30fbf7239e4f3b9e682e27b03011d"
+    },
+    {
+      "name": "heel_sim-1.3.0rc3.tar.gz",
+      "source_path": "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc3.tar.gz",
+      "size": 591640,
+      "sha256": "fd5c5e2cf54849ec81368dd641f4ba9e1a71b4cf790ee7ce2ce341c30fb996f3",
+      "git_blob": "a1ece2a02488c38024d29e3d949052987dde9004"
+    },
+    {
+      "name": "heel-open-core-manifest.json",
+      "source_path": "apps/heel-cloud/public/downloads/heel-open-core-manifest.json",
+      "size": 347,
+      "sha256": "7eb56ad211d53d87f6a0e093252966d26e65f4404c76f3302966cb22f435e8a0",
+      "git_blob": "260aebd9ca49e17b1bff58611b3066cf8ea24738"
+    }
+  ],
+  "version_sources": [
+    {
+      "source_path": "pyproject.toml",
+      "fixture": "version_sources/pyproject.toml.txt",
+      "size": 1270,
+      "sha256": "b1090c8ebe8f7f72c0bd3c1ce97b59c40b41ede398a6d9c3bc292515f3fdf2e5",
+      "git_blob": "eadaa9da1448bdfbb56d1aeb828dd8ded39ed8e6"
+    },
+    {
+      "source_path": "release/open-core-v1.json",
+      "fixture": "version_sources/open-core-v1.json.txt",
+      "size": 2350,
+      "sha256": "8e143684b9a70eaa6c430baa6d5d86671c3bf0c6932857854e91d6c838a0b1bc",
+      "git_blob": "51de2e9a0e4acb47f2923ac1ab162134f4ea0f16"
+    },
+    {
+      "source_path": "heel/__init__.py",
+      "fixture": "version_sources/__init__.py.txt",
+      "size": 211,
+      "sha256": "6005f631ec2783c751ec1205dc84cb3dd21cc7f3906da1099ebc3305e3cd0e7e",
+      "git_blob": "b9e9d2c91ef63f198685763c7e2fd51c1c8ea98b"
+    },
+    {
+      "source_path": "scripts/build_open_core_release.py",
+      "fixture": "version_sources/build_open_core_release.py.txt",
+      "size": 48314,
+      "sha256": "0ccc7b0e71e7c927bb00fb8121f14ae5779e9f96ad0b12e5bd006de042208310",
+      "git_blob": "c18acf6e7ce1286ba6a0a289809f9bd3afbb6194"
+    }
+  ]
+}
