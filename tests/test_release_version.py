@@ -19,6 +19,8 @@ LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1"})
 # The current version is the public GitHub prerelease that customer copy installs from its pinned
 # release URL. 1.3.0rc1 stays a published prerelease, named in copy only as erratum history.
 PREVIOUS_PREVIEW_VERSION = "1.3.0rc1"
+# Only the paired-runner surfaces carry the final rc3 runner; everything else stays on VERSION.
+PAIRED_RUNNER_VERSION = "1.3.0rc3"
 PUBLIC_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{VERSION}"
 PUBLIC_WHEEL_URL = (
     f"https://github.com/ancilis/heel/releases/download/v{VERSION}/"
@@ -108,12 +110,20 @@ class ReleaseVersionContractTests(unittest.TestCase):
             self.assertNotIn(f"heel_sim-{legacy_version}", combined)
         # Customer copy installs the current version from its own public release and never from
         # an older release's download URL.
-        customer = paths[:4] + [ROOT / "docs/EXPORT_DEMO.md", ROOT / "apps/heel-cloud/app/runner/page.tsx"]
+        customer = paths[:4] + [ROOT / "docs/EXPORT_DEMO.md"]
         for path in customer:
             text = path.read_text(encoding="utf-8")
             self.assertIn(f"releases/tag/v{VERSION}", text, path)
             self.assertNotIn(f"releases/download/v{PREVIOUS_PREVIEW_VERSION}", text, path)
             self.assertNotRegex(text, rf"{VERSION}[^.]*not yet published as a GitHub release", path)
+        # The paired-runner page installs the reviewed rc3 runner from its own public release
+        # (pinned exactly in test_release_automation) and never from rc1 or rc2.
+        runner = (ROOT / "apps/heel-cloud/app/runner/page.tsx").read_text(encoding="utf-8")
+        self.assertIn(f"releases/tag/v{PAIRED_RUNNER_VERSION}", runner)
+        for older in (PREVIOUS_PREVIEW_VERSION, VERSION):
+            self.assertNotIn(f"releases/download/v{older}", runner)
+            self.assertNotIn(f"releases/tag/v{older}", runner)
+        self.assertNotRegex(runner, rf"{PAIRED_RUNNER_VERSION}[^.]*not yet published as a GitHub release")
         for path in customer[:2] + customer[4:5]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

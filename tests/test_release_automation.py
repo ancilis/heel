@@ -12,6 +12,24 @@ PUBLISH = ROOT / ".github/workflows/publish.yml"
 WHEEL = "heel_sim-1.3.0rc2-py3-none-any.whl"
 SDIST = "heel_sim-1.3.0rc2.tar.gz"
 MANIFEST = "heel-open-core-manifest.json"
+# The paired-runner surfaces (/runner and the dashboard RunnerPairingCard) carry the final rc3
+# install line while the bundled release, MCP quickstart and docs stay on rc2 until rc3 is the
+# bundled version. This literal is copied from the "Customer install command" block of
+# docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca (the reviewed final rc3 wheel), which is not in
+# this tree, so it is pinned here rather than read or derived from the product source.
+PAIRED_RUNNER_RC3_INSTALL = (
+    "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "
+    "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/"
+    "heel_sim-1.3.0rc3-py3-none-any.whl"
+    "#sha256=0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca'"
+    " && ./heel-rc3/bin/heel --version"
+)
+PAIRED_RUNNER_RC3_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc3"
+PAIRED_RUNNER_RC3_CLI = "./heel-rc3/bin/heel "
+PAIRED_RUNNER_SURFACES = (
+    "apps/heel-cloud/app/runner/page.tsx",
+    "apps/heel-cloud/components/canary/RunnerPairingCard.tsx",
+)
 RELEASE_REQUIREMENTS = ROOT / "release/requirements-release.txt"
 
 
@@ -170,8 +188,8 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertTrue(command.startswith("python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install "))
         self.assertTrue(command.endswith(" && ./heel-rc2/bin/heel --version"))
         release = f"https://github.com/ancilis/heel/releases/tag/v{version}"
-        for path in ("README.md", "docs/MCP_QUICKSTART.md", "docs/EXPORT_DEMO.md",
-                     "apps/heel-cloud/app/runner/page.tsx"):
+        # The paired-runner surfaces are on rc3 and are pinned by the paired-runner test below.
+        for path in ("README.md", "docs/MCP_QUICKSTART.md", "docs/EXPORT_DEMO.md"):
             source = (ROOT / path).read_text(encoding="utf-8")
             unwrapped = " ".join(source.split())
             self.assertIn(command, source, path)
@@ -189,6 +207,41 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertIn(release, launch)
         self.assertNotIn("later work", launch)
         self.assertIn("not publicly deployed", launch)
+        for path in PAIRED_RUNNER_SURFACES:
+            source = (ROOT / path).read_text(encoding="utf-8")
+            self.assertNotIn(command, source, path)
+            self.assertNotIn("./heel-rc2/bin/heel", source, path)
+
+    def test_paired_runner_install_is_the_reviewed_rc3_runbook_command(self):
+        command = PAIRED_RUNNER_RC3_INSTALL
+        self.assertIn(
+            "releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256="
+            "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca'",
+            command,
+        )
+        self.assertTrue(command.startswith("python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "))
+        self.assertTrue(command.endswith(" && ./heel-rc3/bin/heel --version"))
+        for path in PAIRED_RUNNER_SURFACES:
+            source = (ROOT / path).read_text(encoding="utf-8")
+            self.assertIn(command, source, path)
+            self.assertIn(PAIRED_RUNNER_RC3_RELEASE, source, path)
+            self.assertIn("./heel-rc3/bin/heel", source, path)
+            self.assertNotIn("releases/download/v1.3.0rc2/", source, path)
+            self.assertNotIn("releases/tag/v1.3.0rc2", source, path)
+            self.assertNotIn("heel-rc2", source, path)
+            # Exactly one rc3 wheel digest is named, and it is the reviewed final one.
+            self.assertEqual(
+                set(re.findall(r"heel_sim-1\.3\.0rc3-py3-none-any\.whl#sha256=([0-9a-f]{64})", source)),
+                {"0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca"},
+                path,
+            )
+        page = (ROOT / PAIRED_RUNNER_SURFACES[0]).read_text(encoding="utf-8")
+        unwrapped = " ".join(page.split())
+        self.assertIn(PAIRED_RUNNER_RC3_CLI, page)
+        self.assertIn("Intel macOS is unsupported", unwrapped)
+        self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped)
+        self.assertIn("Python 3.11 or newer", unwrapped)
+        self.assertNotRegex(unwrapped, r"(?i)unpublished 1\.3\.0rc3|no public 1\.3\.0rc3 download")
 
 
 if __name__ == "__main__":
