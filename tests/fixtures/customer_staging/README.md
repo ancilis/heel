@@ -10,31 +10,63 @@ It closes three target prerequisites of the older loopback harness
 (`tests/plan_differential_support.py`): it is reachable over ordinary public HTTPS once
 deployed (T-1), serves an ownership-proof file (T-2), and has a `patched` mode whose refusal the
 existing matcher can decide (T-3). The export payload, the `{"error": "upgrade required"}`
-envelope and the OpenAPI shape are reused from that harness.
+envelope and the marker id are reused from that harness.
+
+**Canary label.** This target supports *canary-dependent paired read validation* only. The
+paired runner (`heel/runner/execution.py`) learns the protected marker solely from a route
+fixture binding whose id starts with `heel-canary-`, and decides a read only when that exact
+marker appears in the top-level `protected_canary` field of the response. It does not infer
+anything from arbitrary response bodies. So the export lives at `/api/exports/{id}`, it is
+served only for the one approved synthetic id `heel-canary-export-0001`, and the protected
+export carries that id as `protected_canary`. The marker is public, fake and not a secret; it
+appears in the response body and the path, never in the OpenAPI document.
+
+Current export body (pro, and free in `vulnerable`): 142 bytes, sha256
+`32dcd0f899e627cf3d7c41cedf3a1ad67aba36523af5e404a71312304b3c28aa`:
+`{"account_id":"acct_canary","format":"csv","rows":[{"id":"row_1","amount_cents":1200}],"total":1,"protected_canary":"heel-canary-export-0001"}`.
+`openapi.json`: 670 bytes, sha256 `2f24aff034b85ab704c7fcbe647fb50bd6dd444cb50ccae44db238db239e3b2e`.
 
 ## Contract
 
 | Route | Methods | Behavior |
 |---|---|---|
 | `/.well-known/heel-verify.txt` | GET, HEAD | `200 text/plain`, body = `HEEL_VERIFY_TOKEN` + `\n`; `503` if unset or not 16-512 printable ASCII. No setter. |
-| `/api/export` | GET, HEAD | `Authorization: Bearer <token>`; the SHA-256 of the token must equal exactly one configured digest. Missing/malformed/unknown → `401 {"error":"unauthenticated"}`. |
+| `/api/exports/heel-canary-export-0001` | GET, HEAD | `Authorization: Bearer <token>`; the SHA-256 of the token must equal exactly one configured digest. Missing/malformed/unknown → `401 {"error":"unauthenticated"}`. |
 | `/healthz` | GET, HEAD | `{"status","mode","revision","ownership_configured","export_configured"}` only. |
-| any other path | any | `404 {"error":"not found"}` |
+| `/openapi.json` | GET, HEAD | `200 application/json`, byte-identical to `openapi.json` here, so a clean-room user can download the inventory without repository access. |
+| any other path (including any other export id) | any | `404 {"error":"not found"}`; the path is never reflected. |
+
+The served inventory lists only `GET`/`HEAD /api/exports/{id}` with an ordinary required
+`string` path parameter: no ownership, health or spec endpoint, no marker value, and no plan,
+finding or `x-` annotation.
 | known path | other methods | `405`, `Allow: GET, HEAD` |
 
-`/api/export` fails closed with `503` unless `HEEL_TARGET_MODE` is a known mode and
+The export route fails closed with `503` unless `HEEL_TARGET_MODE` is a known mode and
 `HEEL_FREE_TOKEN_SHA256` / `HEEL_PRO_TOKEN_SHA256` are two different 64-character lowercase hex
 digests. The mode is set only by the operator at deploy time; no header, query or cookie
 changes it. The pro identity always receives the export (positive control).
 
-| `HEEL_TARGET_MODE` | free identity receives | Existing matcher (`evaluate_plan_pair`) | Saved-regression replay |
+| `HEEL_TARGET_MODE` | free identity receives | Paired runner (`adapters.evaluate_pair`) | Standalone comparator (`evaluate_plan_pair`, no marker) |
 |---|---|---|---|
-| `vulnerable` | `200` + the full pro export | finding, `body_superset` (row 6) | `fail` / `still_reachable` |
-| `patched` | `403`, empty body | held, `lower_denied` (row 7) | `pass` / `blocked` |
-| `error_envelope` | `403 {"error":"upgrade required"}` | inconclusive, `lower_denial_envelope` (row 9) | `fail` / `inconclusive` — never `pass` |
+| `vulnerable` | `200` + the full pro export (with marker) | `observed` | finding, `body_superset` (row 6) |
+| `patched` | `403`, empty body | `blocked` | held, `lower_denied` (row 7) |
+| `error_envelope` | `403 {"error":"upgrade required"}` | `inconclusive` | inconclusive, `lower_denial_envelope` (row 9) |
 
-`HEAD /api/export` is status parity only (row 8, inconclusive) in every mode. The ops proposal of
-`403 {}` is also held (row 7) by the current matcher; the worker serves the empty body.
+`HEAD` is never a finding: `inconclusive` in the paired runner and status parity only (row 8)
+in the comparator, in every mode. The paired runner is also `inconclusive` when the positive
+control fails (pro identity denied or unauthenticated) or when no `heel-canary-` id is bound.
+
+### Runner mapping (paired path)
+
+```sh
+curl -sS -o openapi.json "https://HOST/openapi.json"     # or use this folder's openapi.json
+heel runner import-openapi openapi.json
+heel runner map --scenario plan_entitlement_read --method GET --route '/api/exports/{id}' \
+  --fixture-fd 3 3< <(printf '%s' '{"id":"heel-canary-export-0001"}')
+```
+
+The fixture id must be exactly `heel-canary-export-0001`; any other id reaches only `404`s and
+stays `inconclusive`.
 
 Each request writes one console receipt: a generated `receipt` id, `method` (GET/HEAD/OTHER),
 `route` (a known route or `unknown`), `role` (free/pro/none/malformed/unknown/`-`), `status`,
@@ -43,7 +75,10 @@ Each request writes one console receipt: a generated `receipt` id, `method` (GET
 ## Proof status
 
 `target.test.mjs` is **component proof only**: constructed `Request` objects passed to the
-Worker in-process, plus the worker's own responses evaluated by the unchanged Python predicate.
+Worker in-process, plus the worker's own responses evaluated by the unchanged Python product
+code: the standalone comparator, and the paired composition (served inventory →
+`RouteInventory` → store mapping validator → catalog action → `prepare_action` → body shape →
+`protected_content` with the bound marker → `evaluate_pair`), without mocks.
 CI runs it in the `browser-alpha` job. It proves nothing about DNS, TLS, workers.dev response
 framing, the released runner or the browser journey; those need the deployed run below.
 
@@ -110,9 +145,11 @@ heel runner credential add --role higher_plan --profile bearer --label "staging 
 for ROLE in free pro; do
   /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
     | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
-    | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/export"
+    | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/exports/heel-canary-export-0001"
 done
 ```
+
+In `vulnerable` mode both lines should read `200 142`.
 
 ### 5. Receipts during the journey (bounded fields only)
 
@@ -141,7 +178,8 @@ in step 2, and its runner credential in step 3.
 
 ## Expected deployed acceptance (not yet run)
 
-From a clean machine with the released runner: ownership verifies over HTTPS; the
-`vulnerable` run records a `GET /api/export` `body_superset` finding; a saved regression replays
-`fail`/`still_reachable`; after `patched` it replays `pass`/`blocked`; under `error_envelope` it
-replays `fail`/`inconclusive`. Each runner request appears as one receipt.
+From a clean machine with the released runner and the mapping above: ownership verifies over
+HTTPS; the paired `plan_entitlement_read` run on `GET /api/exports/{id}` is `observed` in
+`vulnerable`, `blocked` in `patched` and `inconclusive` in `error_envelope`. Each runner request
+appears as one receipt. This is canary-dependent paired read validation of this synthetic
+target, not a product coverage claim.

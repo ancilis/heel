@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import worker, { MODES, ROUTES } from "./worker.mjs";
+import worker, { CANARY_ID, MODES, ROUTES } from "./worker.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../../..");
@@ -20,7 +20,8 @@ const PRO = "synthetic-pro-session-0001";
 const OTHER = "synthetic-other-session-0001";
 const VERIFY = "synthetic-ownership-token-0001-AbC_-";
 const sha = (value) => createHash("sha256").update(value).digest("hex");
-const EXPORT = { account_id: "acct_canary", format: "csv", rows: [{ id: "row_1", amount_cents: 1200 }], total: 1 };
+const EXPORT = { account_id: "acct_canary", format: "csv", rows: [{ id: "row_1", amount_cents: 1200 }], total: 1, protected_canary: CANARY_ID };
+const EXPORT_PATH = `/api/exports/${CANARY_ID}`;
 
 function env(overrides = {}) {
   return {
@@ -79,10 +80,18 @@ test("ownership file fails closed when the token is missing or not an exact ASCI
 });
 
 test("unknown paths are 404 and other methods on known routes are 405", async () => {
-  for (const path of ["/", "/api", "/api/export/", "/API/export", "/api/export.json", "/.well-known/", "/exports/1", "/api/pricing", "/healthz/x"]) {
+  const unknown = [
+    "/", "/api", "/api/export", "/api/export/", "/API/export", "/api/export.json", "/api/exports", "/api/exports/",
+    "/api/exports/heel-canary-export-0002", "/api/exports/HEEL-CANARY-EXPORT-0001", `${EXPORT_PATH}/`, `${EXPORT_PATH}x`,
+    `/api/exports/%68eel-canary-export-0001`, `/API/exports/${CANARY_ID}`, `/api/exports/${CANARY_ID}/rows`,
+    "/api/exports/attacker-id-0001", "/.well-known/", "/exports/1", "/api/pricing", "/healthz/x", "/openapi.yaml",
+  ];
+  for (const path of unknown) {
     for (const method of ["GET", "HEAD", "POST", "DELETE"]) {
       const got = await call(path, { method, token: PRO });
       assert.equal(got.status, 404, `${method} ${path}`);
+      assert.ok(!got.text.includes("attacker-id") && !got.text.includes("acct_canary"), path);
+      if (method === "GET") assert.deepEqual(JSON.parse(got.text), { error: "not found" });
     }
   }
   for (const path of Object.keys(ROUTES)) {
@@ -96,8 +105,8 @@ test("unknown paths are 404 and other methods on known routes are 405", async ()
 });
 
 test("export authenticates only the two configured digests", async () => {
-  assert.equal((await call("/api/export", { token: FREE })).status, 200);
-  assert.equal((await call("/api/export", { token: PRO })).status, 200);
+  assert.equal((await call(EXPORT_PATH, { token: FREE })).status, 200);
+  assert.equal((await call(EXPORT_PATH, { token: PRO })).status, 200);
   const refused = [
     {},
     { token: OTHER },
@@ -112,7 +121,7 @@ test("export authenticates only the two configured digests", async () => {
     { authorization: `Bearer ${"a".repeat(513)}` },
   ];
   for (const options of refused) {
-    const got = await call("/api/export", options);
+    const got = await call(EXPORT_PATH, options);
     assert.equal(got.status, 401, JSON.stringify(options));
     assert.deepEqual(JSON.parse(got.text), { error: "unauthenticated" });
     assert.equal(got.headers.get("www-authenticate"), "Bearer");
@@ -136,17 +145,17 @@ test("missing, malformed or equal digest configuration and an unknown mode fail 
   ];
   for (const overrides of broken) {
     for (const token of [FREE, PRO]) {
-      const got = await call("/api/export", { token, config: env(overrides) });
+      const got = await call(EXPORT_PATH, { token, config: env(overrides) });
       assert.equal(got.status, 503, JSON.stringify(overrides));
       assert.deepEqual(JSON.parse(got.text), { error: "target not configured" });
     }
   }
-  assert.equal((await call("/api/export", { token: PRO, config: null })).status, 503);
-  assert.equal((await call("/api/export", { token: PRO, config: {} })).status, 503);
+  assert.equal((await call(EXPORT_PATH, { token: PRO, config: null })).status, 503);
+  assert.equal((await call(EXPORT_PATH, { token: PRO, config: {} })).status, 503);
 });
 
 test("modes are operator configured: vulnerable, patched and error_envelope", async () => {
-  const exportFor = async (mode, token, extra = {}) => call("/api/export", { token, config: env({ HEEL_TARGET_MODE: mode }), ...extra });
+  const exportFor = async (mode, token, extra = {}) => call(EXPORT_PATH, { token, config: env({ HEEL_TARGET_MODE: mode }), ...extra });
   const vulnerable = await exportFor("vulnerable", FREE);
   assert.equal(vulnerable.status, 200);
   assert.deepEqual(JSON.parse(vulnerable.text), EXPORT);
@@ -161,7 +170,7 @@ test("modes are operator configured: vulnerable, patched and error_envelope", as
     const pro = await exportFor(mode, PRO);
     assert.equal(pro.status, 200, mode);
     assert.deepEqual(JSON.parse(pro.text), EXPORT);
-    const head = await call("/api/export", { method: "HEAD", token: PRO, config: env({ HEEL_TARGET_MODE: mode }) });
+    const head = await call(EXPORT_PATH, { method: "HEAD", token: PRO, config: env({ HEEL_TARGET_MODE: mode }) });
     assert.equal(head.status, 200);
     assert.equal(head.bytes.length, 0);
     assert.equal(head.headers.get("content-length"), String(JSON.stringify(EXPORT).length));
@@ -173,7 +182,7 @@ test("modes are operator configured: vulnerable, patched and error_envelope", as
   ]) {
     assert.equal((await exportFor("patched", FREE, extra)).status, 403);
   }
-  assert.equal((await call("/api/export?mode=vulnerable", { token: FREE, config: env({ HEEL_TARGET_MODE: "patched" }) })).status, 403);
+  assert.equal((await call(`${EXPORT_PATH}?mode=vulnerable`, { token: FREE, config: env({ HEEL_TARGET_MODE: "patched" }) })).status, 403);
 });
 
 test("health reports only mode, revision and configured flags", async () => {
@@ -195,7 +204,7 @@ test("no token, digest, header, query or body value is reflected or logged; rece
   for (const mode of MODES) {
     for (const token of [FREE, PRO, OTHER]) {
       for (const method of ["GET", "HEAD", "POST"]) {
-        responses.push(await call("/api/export?q=query-value-0001", {
+        responses.push(await call(`${EXPORT_PATH}?q=query-value-0001`, {
           method, token, config: env({ HEEL_TARGET_MODE: mode }), headers: { "x-probe": "header-value-0001" },
           body: method === "POST" ? "posted-body-0001" : undefined,
         }));
@@ -240,9 +249,28 @@ test("source has no outbound fetch, redirect, import, binding or plan metadata",
   }
   for (const forbidden of [FREE, PRO, VERIFY]) assert.ok(!config.includes(forbidden));
   const openapi = JSON.parse(readFileSync(join(HERE, "openapi.json"), "utf8"));
-  assert.deepEqual(Object.keys(openapi.paths), ["/api/export"]);
-  assert.deepEqual(Object.keys(openapi.paths["/api/export"]).sort(), ["get", "head"]);
-  assert.doesNotMatch(JSON.stringify(openapi), /"x-|plan|finding|security/i);
+  assert.deepEqual(Object.keys(openapi.paths), ["/api/exports/{id}"]);
+  const item = openapi.paths["/api/exports/{id}"];
+  assert.deepEqual(Object.keys(item).sort(), ["get", "head", "parameters"]);
+  // An ordinary required path parameter: no example, enum, default or marker value.
+  assert.deepEqual(item.parameters, [{ name: "id", in: "path", required: true, schema: { type: "string" } }]);
+  assert.doesNotMatch(JSON.stringify(openapi), /"x-|plan|finding|security|canary|protected|example|enum|default/i);
+});
+
+test("the target serves its own inventory at /openapi.json, byte-identical to openapi.json", async () => {
+  const file = readFileSync(join(HERE, "openapi.json"), "utf8");
+  for (const mode of [...MODES, "unset"]) {
+    const got = await call("/openapi.json", { config: env({ HEEL_TARGET_MODE: mode }) });
+    assert.equal(got.status, 200, mode);
+    assert.equal(got.text, file);
+    assert.equal(got.headers.get("content-type"), "application/json");
+    assert.equal(got.headers.get("content-length"), String(Buffer.byteLength(file)));
+  }
+  const head = await call("/openapi.json", { method: "HEAD" });
+  assert.equal(head.status, 200);
+  assert.equal(head.bytes.length, 0);
+  // The inventory lists only the export route: no ownership, health or spec endpoint.
+  assert.deepEqual(Object.keys(JSON.parse(file).paths), ["/api/exports/{id}"]);
 });
 
 // Component proof only: the worker's own responses are evaluated by the UNCHANGED product
@@ -282,8 +310,8 @@ test("component proof (not deployed acceptance): existing predicate on the worke
     const config = env({ HEEL_TARGET_MODE: mode });
     cases.push({
       method,
-      lower: observe(await call("/api/export", { method, token: FREE, config })),
-      higher: observe(await call("/api/export", { method, token: PRO, config })),
+      lower: observe(await call(EXPORT_PATH, { method, token: FREE, config })),
+      higher: observe(await call(EXPORT_PATH, { method, token: PRO, config })),
     });
     expected.push({ mode, method, ...want });
   };
@@ -307,4 +335,119 @@ test("component proof (not deployed acceptance): existing predicate on the worke
     const { mode, method, ...want } = expected[index];
     assert.deepEqual(result, want, `${mode} ${method}`);
   });
+});
+
+// Canary-dependent paired-read validation (component proof, not deployed acceptance).
+// This is the composition the released paired runner performs in heel/runner/execution.py,
+// using the UNCHANGED product functions: RouteInventory on the inventory the target serves,
+// the runner store's mapping validator, the closed catalog action schema, prepare_action,
+// the transport body-shape check, protected_content with the marker taken from the bound
+// fixture id exactly as execution.py does, and adapters.evaluate_pair. No product function
+// is replaced or mocked; only the HTTP hop is an in-process Worker call. It validates a
+// read only when the bound heel-canary marker appears in protected_canary: it is not
+// inference over arbitrary responses.
+const PAIRED = `
+import base64, json, sys
+sys.path.insert(0, sys.argv[1])
+from heel.runner.adapters import evaluate_pair, prepare_action
+from heel.runner.catalog import CATALOG_BY_ID
+from heel.runner.content_assertion import protected_content
+from heel.runner.http_transport import _body_shape
+from heel.runner.openapi_routes import RouteInventory
+from heel.runner.store import _mapping_record
+
+SCENARIO = "plan_entitlement_read"
+request = json.load(sys.stdin)
+inventory = RouteInventory(json.loads(base64.b64decode(request["openapi"])))
+
+def actions(method, fixture_id):
+    catalog = CATALOG_BY_ID[SCENARIO]
+    mapping = _mapping_record({
+        "scenario_id": SCENARIO, "method": method, "route_template": "/api/exports/{id}",
+        "fixture_bindings": [{"parameter_name": "id", "fixture_id": fixture_id}],
+    })
+    return [{
+        "ordinal": ordinal, "scenario_id": SCENARIO, "adapter_version": catalog["adapter_version"],
+        "method": method, "route_template": mapping["route_template"],
+        "fixture_bindings": [dict(item) for item in mapping["fixture_bindings"]],
+        "semantic_auth_role": role, "auth_profile": "bearer",
+        "assertion_class": catalog["assertion_class"],
+        "allowed_status_codes": list(catalog["allowed_status_codes"]),
+        "allowed_body_shapes": list(catalog["allowed_body_shapes"]),
+        "side_effect_class": catalog["side_effect_class"],
+    } for ordinal, role in enumerate(catalog["semantic_roles"])]
+
+if request["phase"] == "prepare":
+    out = {"inventory": inventory.read_routes(), "cases": []}
+    for case in request["cases"]:
+        prepared = [prepare_action(action) for action in actions(case["method"], case["fixture_id"])]
+        out["cases"].append([{"role": p.semantic_auth_role, "method": p.method, "route": p.route} for p in prepared])
+    json.dump(out, sys.stdout)
+else:
+    out = []
+    for case in request["cases"]:
+        observations = []
+        for action, side in zip(actions(case["method"], case["fixture_id"]), case["responses"]):
+            body = base64.b64decode(side["body"])
+            markers = [b["fixture_id"] for b in action["fixture_bindings"] if b["fixture_id"].startswith("heel-canary-")]
+            observations.append({
+                "status": side["status"],
+                "shape": _body_shape(body, method=action["method"]),
+                "protected": protected_content(body, marker=markers[0] if len(markers) == 1 else None,
+                                               status=side["status"], method=action["method"]),
+            })
+        pair = evaluate_pair(
+            SCENARIO, observations[0]["status"], observations[1]["status"], method=case["method"],
+            first_body_shape=observations[0]["shape"], second_body_shape=observations[1]["shape"],
+            first_protected=observations[0]["protected"], second_protected=observations[1]["protected"],
+        )
+        out.append({"outcome": pair.outcome, "protected": [o["protected"] for o in observations]})
+    json.dump(out, sys.stdout)
+`;
+
+function paired(payload) {
+  const run = spawnSync(python(), ["-I", "-B", "-c", PAIRED, REPO], { input: JSON.stringify(payload), encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  return JSON.parse(run.stdout);
+}
+
+test("canary-dependent paired read: the unchanged paired evaluator decides the worker's responses", async () => {
+  const served = await call("/openapi.json");
+  const openapi = Buffer.from(served.bytes).toString("base64");
+  // [label, mode, method, bound fixture id, token sent as lower_plan, token sent as higher_plan, expected]
+  const matrix = [
+    ["vulnerable", "vulnerable", "GET", CANARY_ID, FREE, PRO, { outcome: "observed", protected: [true, true] }],
+    ["patched", "patched", "GET", CANARY_ID, FREE, PRO, { outcome: "blocked", protected: [false, true] }],
+    ["error_envelope", "error_envelope", "GET", CANARY_ID, FREE, PRO, { outcome: "inconclusive", protected: [null, true] }],
+    // HEAD carries no body: never a finding, in any mode.
+    ...MODES.map((mode) => [`HEAD ${mode}`, mode, "HEAD", CANARY_ID, FREE, PRO, { outcome: "inconclusive", protected: [null, null] }]),
+    // Positive control failure: the higher identity does not receive the protected export.
+    ["control denied", "patched", "GET", CANARY_ID, FREE, FREE, { outcome: "inconclusive", protected: [false, false] }],
+    ["control unauthenticated", "vulnerable", "GET", CANARY_ID, FREE, OTHER, { outcome: "inconclusive", protected: [true, null] }],
+    // No marker bound: a non-canary fixture id, or a different canary id, reaches only 404s.
+    ["no marker", "vulnerable", "GET", "export-0001", FREE, PRO, { outcome: "inconclusive", protected: [null, null] }],
+    ["other canary", "vulnerable", "GET", "heel-canary-export-0002", FREE, PRO, { outcome: "inconclusive", protected: [null, null] }],
+  ];
+  const prepared = paired({ phase: "prepare", openapi, cases: matrix.map(([, , method, fixture_id]) => ({ method, fixture_id })) });
+  // The runner reads exactly the served inventory: one templated export route, GET and HEAD.
+  assert.deepEqual(prepared.inventory, [
+    { method: "GET", route_template: "/api/exports/{id}", operation_id: "getexport", placeholders: ["id"] },
+    { method: "HEAD", route_template: "/api/exports/{id}", operation_id: "headexport", placeholders: ["id"] },
+  ]);
+  const cases = [];
+  for (const [index, [label, mode, method, fixture_id, lowerToken, higherToken]] of matrix.entries()) {
+    const actions = prepared.cases[index];
+    assert.deepEqual(actions.map((a) => a.role), ["lower_plan", "higher_plan"], label);
+    assert.ok(actions.every((a) => a.method === method && a.route === `/api/exports/${fixture_id}`), label);
+    const config = env({ HEEL_TARGET_MODE: mode });
+    const responses = [];
+    for (const [action, token] of [[actions[0], lowerToken], [actions[1], higherToken]]) {
+      const got = await call(action.route, { method, token, config });
+      responses.push({ status: got.status, body: Buffer.from(got.bytes).toString("base64") });
+    }
+    cases.push({ method, fixture_id, responses });
+  }
+  const results = paired({ phase: "evaluate", openapi, cases });
+  assert.equal(results.length, matrix.length);
+  results.forEach((result, index) => assert.deepEqual(result, matrix[index][6], matrix[index][0]));
 });
