@@ -108,13 +108,25 @@ it("rejects a runner revoke result outside the typed contract and names the refu
   await expect(refused.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_runner_revocation", status: 400 });
 });
 
-it("the dashboard pairing card shows the same verified rc2 install line as /agent", async () => {
+// The final 1.3.0rc3 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca
+// ("Customer install command"), pinned to the reviewed final rc3 wheel (source 4b68c2f, 2769936 bytes). That runbook
+// is not in this tree, so the line is pinned here. The /agent MCP quickstart deliberately stays on its rc2 install,
+// consistent with this tree's bundled rc2 downloads; only the paired-runner surfaces move to rc3.
+const RC3_WHEEL_SHA256 = "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca";
+const RC3_RUNBOOK_INSTALL = "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "
+  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256=${RC3_WHEEL_SHA256}'`
+  + " && ./heel-rc3/bin/heel --version";
+
+it("the dashboard pairing card and /runner show the exact final rc3 runbook install line", async () => {
+  const { RUNNER_RC3_INSTALL, RUNNER_RC3_CLI, RUNNER_RC3_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
+  assert.equal(RUNNER_RC3_INSTALL, RC3_RUNBOOK_INSTALL);
+  assert.equal(RUNNER_RC3_CLI, "./heel-rc3/bin/heel");
+  assert.equal(RUNNER_RC3_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc3");
+  const runner = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
+  assert.ok(runner.includes(RC3_RUNBOOK_INSTALL));
+  assert.doesNotMatch(runner, /heel-rc2\/|releases\/(tag|download)\/v1\.3\.0rc2/);
   const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
-  const { RUNNER_RC2_INSTALL } = await import("../components/canary/RunnerPairingCard");
-  const sha = /const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";/.exec(agent)?.[1];
-  const template = /const INSTALL_PUBLIC_AGENT = `([^`]+)`;/.exec(agent)?.[1];
-  assert.ok(sha && template);
-  assert.equal(RUNNER_RC2_INSTALL, template.replace("${PUBLIC_WHEEL_SHA256}", sha));
+  assert.doesNotMatch(agent, /rc3/);
 });
 
 it("discovers only a closed pending approval summary", async () => {
