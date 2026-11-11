@@ -113,7 +113,7 @@ function containsSensitiveInput(node) {
 // H0X: the private control-plane sink lives only in this module, pinned by bytes (S3) and
 // checked by lexical and token facts (S1, S2). None of these checks claims to model dataflow.
 const CONTROL_PLANE_DISPATCH_PATH = "worker/control-plane-dispatch.ts";
-const CONTROL_PLANE_DISPATCH_SHA256 = "cbebaa836f6ab880ecc5ed93bceb0a8670e72b9bc1aee0983692881b0df711a9";
+const CONTROL_PLANE_DISPATCH_SHA256 = "ac084b9677132c3cc3e518c2d85679b2540793ee5c0d8784eb555a953f632a11";
 const dispatchModuleImport = 'import { canonicalPublicOrigin } from "../build/deployment-config";';
 const dispatchBindingGuard = `if (
     input.binding === undefined
@@ -153,6 +153,7 @@ const dispatchImport = 'import { dispatchControlPlane } from "./control-plane-di
 const dispatchCallSite = `const outcome = await dispatchControlPlane({
     binding: env.CONTROL_PLANE,
     publicOrigin: env.PUBLIC_ORIGIN,
+    privateTransport: env.CONTROL_PLANE_TRANSPORT,
     upstreamPath,
     method: request.method,
     headers: requestContract.headers,
