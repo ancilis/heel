@@ -87,6 +87,8 @@ class FakeControlPlane {
   /** One runner pairing as the real store keeps it after `heel runner pair` exchanged the invitation. */
   pairing: { workspaceRef: string; pairingId: string; runnerId: string; phrase: string; fingerprint: string; expiresAt: number; status: "pending" | "approved" } | null = null;
   invitationExpiresAt = () => Date.now() / 1000 + 600;
+  /** One runner-submitted rehearsal plan awaiting human approval, as the canary store keeps it; null lists none. */
+  plan: { ws: string; prj: string; runId: string; approvalId: string; hostname: string; status: string; grantId: string | null } | null = null;
 
   account(email: string, password: string, memberships: { role: Role; projects?: string[] }[]): Account {
     const account: Account = { userId: `usr_${hex(this.next++, 16)}`, email, password, memberships: [] };
@@ -272,11 +274,87 @@ class FakeControlPlane {
       pairing.status = "approved";
       return json({ schema_version: "heel.runner-pairing-approved.v1", status: "approved" });
     }
+    const canary = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/(prj_[0-9a-f]{32})\/(?:canary-approval-requests|canary-runs\/(crun_[0-9a-f]{32})(\/approve)?)$/);
+    // Modeled only once a test seeds a plan; every other test keeps the earlier "not modeled" answer unchanged.
+    if (canary && this.plan !== null) {
+      const [, ws, prj, runId, approve] = canary;
+      const membership = this.session.memberships.find((item) => item.workspace_id === ws);
+      if (membership === undefined) return json({ error: "not a member" }, 403);
+      const plan = this.plan !== null && this.plan.ws === ws && this.plan.prj === prj ? this.plan : null;
+      if (runId === undefined) {
+        if (method !== "GET") return json({ error: "not found" }, 404);
+        return json({ schema_version: "heel.canary-approval-request-list.v1", server_time_ms: 1, has_more: false,
+          requests: plan === null || plan.status !== "awaiting_execution_approval" ? [] : [planRequestWire(plan)] });
+      }
+      if (plan === null || plan.runId !== runId) return json({ error: "run not found", code: "canary_run_not_found" }, 404);
+      if (approve === undefined) {
+        if (method !== "GET") return json({ error: "not found" }, 404);
+        return json(runDashboardWire(plan));
+      }
+      if (method !== "POST") return json({ error: "not found" }, 404);
+      // Like the real route: a valid but stale owner session is refused with the exact code; a role that may never
+      // approve is an ordinary denial without it. Neither changes the plan or issues a grant.
+      if (!["owner", "admin"].includes(membership.role)) return json({ error: "insufficient role" }, 403);
+      if (!this.recentAuth) return json({ error: "a recent owner or admin browser session is required", code: "recent_auth_required" }, 403);
+      if (plan.status !== "awaiting_execution_approval" || data.hostname_retype !== plan.hostname
+        || data.projection_digest !== "a".repeat(64)) return json({ error: "invalid approval", code: "invalid_canary_approval" }, 400);
+      plan.status = "running";
+      plan.grantId = `cgr_${"1".repeat(32)}`;
+      return json(approvedWire(plan, String(data.reason), this.session.userId), 201);
+    }
     const bindingsRoute = route.match(/^\/v1\/workspaces\/(ws_[0-9a-f]{16})\/projects\/prj_[0-9a-f]{32}\/runner-context-bindings$/);
     if (method === "GET" && bindingsRoute) {
       return json({ schema_version: "heel.runner-context-binding-dashboard.v1", server_time_ms: 1, runners: this.runners.get(bindingsRoute[1]) ?? [], bindings: this.bindings.get(bindingsRoute[1]) ?? [] });
     }
     return json({ error: "not modeled" }, 503);
+  };
+}
+
+
+type PlanState = NonNullable<FakeControlPlane["plan"]>;
+
+/** The pending request list entry for a plan; its summary is what the approval dialog shows. */
+function planRequestWire(plan: PlanState): Wire {
+  return {
+    approval_id: plan.approvalId, run_id: plan.runId, projection_digest: "a".repeat(64), status: "awaiting_execution_approval",
+    submitted_at_ms: 1, expires_at_ms: 4_000_000_000_000, origin: `https://${plan.hostname}`, hostname: plan.hostname,
+    routes: ["GET /account"], scenarios: ["anonymous_read"], request_budget: 12, duration_seconds: 45, egress: `${plan.hostname}:443`,
+  };
+}
+
+function runDashboardWire(plan: PlanState): Wire {
+  return {
+    schema_version: "heel.canary-run-dashboard.v1", approval_control_generation: 3,
+    run: {
+      schema_version: "heel.canary-run-status.v1", run_id: plan.runId, approval_id: plan.approvalId, grant_id: plan.grantId,
+      status: plan.status, execution_disposition: null, error_category: "none", stop_reason: "none", source_event_sequence: -1,
+      quota_state: plan.grantId === null ? "unreserved" : "reserved", kill_switch_generation: 0, stop_generation: 0,
+      stop_deadline_ms: null, stop_acknowledged_at_ms: null, stop_ack_late: false,
+    },
+    progress: {
+      schema_version: "heel.canary-run-progress.v1", available: false, current_scenario_id: null, scenarios_completed: null,
+      scenarios_total: null, requests_started: null, requests_completed: null, remaining_requests: null, remaining_wall_ms: null,
+      retries_used: null, redaction_count: null, local_result_ready: false,
+    },
+  };
+}
+
+/** A synthetic `heel.execution-approved.v1` in the shape the client validates; never a real signed grant. */
+function approvedWire(plan: PlanState, reason: string, userId: string): Wire {
+  return {
+    schema_version: "heel.execution-approved.v1", run_id: plan.runId, grant_id: plan.grantId, reservation_id: `res_${"2".repeat(32)}`,
+    grant: {
+      schema_version: "heel.execution-grant.v1", grant_id: plan.grantId, run_id: plan.runId, workspace_id: plan.ws, project_id: plan.prj,
+      approval: { projection_id: plan.approvalId, projection_digest: "a".repeat(64), manifest_digest: "b".repeat(64) },
+      environment: { environment_id: `env_${"3".repeat(32)}`, origin: `https://${plan.hostname}`, environment_class: "staging", verification_record_digest: "c".repeat(64) },
+      runner_binding: { runner_id: "runner-a", runner_key_id: "key-a", public_key_digest: "d".repeat(64) },
+      approval_actor: { user_id: userId, role: "owner" }, approval_reason: reason, consented_at_ms: 1,
+      budgets: { maximum_requests: 12, maximum_concurrency: 1, action_timeout_ms: 5000, wall_timeout_ms: 45000, maximum_response_bytes: 262144 },
+      egress: { hostname: plan.hostname, port: 443, redirect_policy: "deny" },
+      retry_policy: { maximum_retries: 0, retryable_failure_codes: [] }, grant_nonce: "nonce_0123456789abcdef", kill_switch_generation: 0,
+      operational_receipt_policy: { schema_version: "heel.operational-run-projection.v1", maximum_bytes: 32768, allowed_error_categories: ["none"], allowed_stop_reasons: ["none"], allowed_containment_codes: ["admitted"] },
+      issued_at_ms: 1, expires_at_ms: 60_001, grant_digest: "e".repeat(64), signing_key_id: "cloud_0123456789abcdef", signature_b64: "A".repeat(86) + "==",
+    },
   };
 }
 
@@ -2524,5 +2602,126 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     expect(state.access).toBe("After pairing");
     expect(state.next).toMatch(/next action: pair runner/i);
     await pairCard();
+  });
+});
+
+
+// SEAM (CUSTOMER-RECENT-AUTH-RECOVERY): the in-memory control plane models the pending approval list, run status and
+// approve route with the real 15-minute owner/admin ceremony. Local synthetic evidence of the dashboard's recovery from
+// an exact `recent_auth_required` refusal, never deployed-journey proof; the server-side guard itself is unchanged.
+describe("CUSTOMER-RECENT-AUTH-RECOVERY: a stale sign-in at rehearsal approval gets an actionable re-auth path", () => {
+  const HOST = "staging.customer.example.test";
+  const RUN = `crun_${"7".repeat(32)}`;
+  const RECENT_AUTH = "For your security, approving a rehearsal needs an owner or admin sign-in from the last 15 minutes. Nothing was approved or run, and the plan is kept on the server: sign in again, then review the exact plan and approve it.";
+  const REAUTH_SIGN_IN = "Sign in again to return to this project. Nothing was approved or run; review the exact plan again before approving it.";
+
+  function ownerWithPlan(role: Role = "owner"): { ws: string; prj: string; prj2: string } {
+    const account = server.account(EMAIL, SECRET, [{ role, projects: ["First staging", "Customer staging"] }]);
+    server.session = account;
+    const ws = account.memberships[0].workspace_id;
+    const listed = server.projects.get(ws) ?? [];
+    const prj = listed[1].project_ref as string;
+    server.environments.set(`${ws}/${prj}`, [environmentWire(`env_${hex(server.next++, 32)}`, `https://${HOST}`, "https-file", true)]);
+    server.plan = { ws, prj, runId: RUN, approvalId: `cap_${"4".repeat(32)}`, hostname: HOST, status: "awaiting_execution_approval", grantId: null };
+    // The plan belongs to the second project, so landing back on it after re-auth is the restored context, not a default.
+    nav.search = `workspace=${ws}&project=${prj}`;
+    return { ws, prj, prj2: listed[0].project_ref as string };
+  }
+
+  function approvals(mark = 0): string[] {
+    return server.calls.slice(mark).filter((call) => call.method === "POST" && call.path.endsWith("/approve")).map((call) => call.path);
+  }
+
+  async function reviewAndApprove(reason: string): Promise<void> {
+    fireEvent.click(await screen.findByRole("button", { name: "Review exact plan" }));
+    const dialog = await screen.findByRole("dialog", { name: /approve one rehearsal/i });
+    fireEvent.change(within(dialog).getByLabelText(/retype exact hostname/i), { target: { value: HOST } });
+    fireEvent.change(within(dialog).getByLabelText(/reason for this rehearsal/i), { target: { value: reason } });
+    fireEvent.click(within(dialog).getByRole("button", { name: /approve and run/i }));
+  }
+
+  test("the exact recent_auth_required refusal explains re-auth, keeps the plan pending and approves nothing", async () => {
+    ownerWithPlan();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await screen.findByText(RECENT_AUTH);
+    expect(approvals()).toHaveLength(1);
+    expect(screen.queryByRole("dialog", { name: /approve one rehearsal/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Sign in again" })).toBeTruthy();
+    // Still signed in on the same project; the server guard was not satisfied or refreshed silently.
+    expect(server.session).not.toBeNull();
+    expect(server.recentAuth).toBe(false);
+    expect(server.plan).toMatchObject({ status: "awaiting_execution_approval", grantId: null });
+    await settle();
+    // The notice survives rediscovery of the still-pending plan; nothing is retried on its own.
+    expect(screen.getByText(RECENT_AUTH)).toBeTruthy();
+    expect(approvals()).toHaveLength(1);
+    expectNoSecretLeak();
+  });
+
+  test("an ordinary 403 denial at approval is not presented as an expired sign-in", async () => {
+    ownerWithPlan("member");
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await waitFor(() => expect(approvals()).toHaveLength(1));
+    await settle();
+    expect(screen.queryByText(RECENT_AUTH)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
+    expect(screen.queryByText(REAUTH_SIGN_IN)).toBeNull();
+    expect(server.session).not.toBeNull();
+    expect(server.plan).toMatchObject({ status: "awaiting_execution_approval", grantId: null });
+  });
+
+  test("signing in again restores the project and plan but approval needs a fresh explicit review", async () => {
+    const { ws, prj } = ownerWithPlan();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await screen.findByText(RECENT_AUTH);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+    await screen.findByText(REAUTH_SIGN_IN);
+    expect(server.session).toBeNull();
+    expect(nav.search).toBe("");
+    await signInFromSignedOut(EMAIL, SECRET);
+    // The same workspace and project are back from the normal read models, with the plan still pending.
+    await waitFor(() => expect(nav.search).toBe(`workspace=${ws}&project=${prj}`));
+    expect(projectSelect().value).toBe(prj);
+    const mark = server.calls.length;
+    await screen.findByRole("button", { name: "Review exact plan" });
+    await settle();
+    // No automatic re-approval: the dialog is closed, nothing was posted and the run has no grant.
+    expect(screen.queryByRole("dialog", { name: /approve one rehearsal/i })).toBeNull();
+    expect(approvals(mark)).toEqual([]);
+    expect(server.plan).toMatchObject({ status: "awaiting_execution_approval", grantId: null });
+
+    // The reopened dialog starts empty: the hostname and reason must be given again.
+    fireEvent.click(screen.getByRole("button", { name: "Review exact plan" }));
+    const dialog = await screen.findByRole("dialog", { name: /approve one rehearsal/i });
+    expect((within(dialog).getByLabelText(/retype exact hostname/i) as HTMLInputElement).value).toBe("");
+    expect((within(dialog).getByLabelText(/reason for this rehearsal/i) as HTMLTextAreaElement).value).toBe("");
+    expect((within(dialog).getByRole("button", { name: /approve and run/i }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await reviewAndApprove("Second, reviewed approval");
+    await waitFor(() => expect(server.plan?.status).toBe("running"));
+    expect(approvals(mark)).toEqual([`/api/control-plane/v1/workspaces/${ws}/projects/${prj}/canary-runs/${RUN}/approve`]);
+    const sent = server.calls.filter((call) => call.method === "POST" && call.path.endsWith("/approve")).at(-1);
+    expect(JSON.parse(sent?.body ?? "{}")).toMatchObject({ hostname_retype: HOST, reason: "Second, reviewed approval" });
+    expect(screen.queryByText(RECENT_AUTH)).toBeNull();
+    expectNoSecretLeak();
+  });
+
+  test("an ordinary sign-out after the recovery offer does not carry the project into the next sign-in", async () => {
+    const { prj, prj2 } = ownerWithPlan();
+    server.recentAuth = false;
+    render(<Dashboard />);
+    await reviewAndApprove("Release boundary check");
+    await screen.findByText(RECENT_AUTH);
+    fireEvent.click(signOutButton());
+    await screen.findByText(/You signed out\. Sign in again to continue\./);
+    await signInFromSignedOut(EMAIL, SECRET);
+    await waitFor(() => expect(nav.search).toContain(prj2));
+    expect(projectSelect().value).not.toBe(prj);
   });
 });

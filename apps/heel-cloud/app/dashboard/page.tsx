@@ -33,6 +33,8 @@ const CANARY_LOCKED_MESSAGE = "You are still signed in. Staging verification, ru
 const PROJECT_CREATED_READY = "Project created. Add a target next.";
 const PROOF_RECENT_AUTH_MESSAGE = "For your security, showing or replacing a pending proof needs a sign-in from the last 15 minutes. The proof is kept on the server: sign out, sign in again, then resume it.";
 const PAIRING_RECENT_AUTH_MESSAGE = "For your security, pairing or revoking a runner needs an owner or admin sign-in from the last 15 minutes. Sign out, sign in again, then create a new invitation.";
+const RUN_RECENT_AUTH_MESSAGE = "For your security, approving a rehearsal needs an owner or admin sign-in from the last 15 minutes. Nothing was approved or run, and the plan is kept on the server: sign in again, then review the exact plan and approve it.";
+const RUN_REAUTH_SIGN_IN_MESSAGE = "Sign in again to return to this project. Nothing was approved or run; review the exact plan again before approving it.";
 const PAIRING_GONE_MESSAGE = "That pairing request is no longer available: it expired, was already used, or belongs to another workspace. Create a new invitation and run the pair command again.";
 const PROJECT_CREATED_BLOCKED = "Project created. Canary setup is unavailable right now, so target verification is blocked; use Try again shortly.";
 const cloudApi = new HeelCloudApi();
@@ -234,6 +236,9 @@ export default function Dashboard() {
   // takes a new generation; a response that settles for an older generation is dropped.
   const generation = useRef(0);
   const operations = useRef(0);
+  // Only the "Sign in again" recovery for a rehearsal approval keeps the account's workspace/project refs across its
+  // sign-out; the next sign-in passes them to `connect` as hints that the server re-resolves like any address.
+  const reauthSelection = useRef<AccountSelection | null>(null);
 
   /** Marks the page busy for one action; the returned token is what that action's finally releases. */
   const beginWork = useCallback((): number => {
@@ -511,8 +516,9 @@ export default function Dashboard() {
     });
   }
 
-  async function signOut(): Promise<void> {
+  async function signOut(reauth = false): Promise<void> {
     const previous = connectionSelection(connection);
+    reauthSelection.current = reauth ? previous : null;
     const ticket = ++generation.current;
     clearApprovalIdentity();
     resetProjectState();
@@ -521,11 +527,12 @@ export default function Dashboard() {
     setConnection({ phase: "checking" });
     try {
       await cloudApi.logout();
-      if (ticket === generation.current) setConnection({ phase: "sign_in", message: SIGNED_OUT_MESSAGE });
+      if (ticket === generation.current) setConnection({ phase: "sign_in", message: reauth ? RUN_REAUTH_SIGN_IN_MESSAGE : SIGNED_OUT_MESSAGE });
     } catch (error) {
       if (ticket !== generation.current) return;
-      if (isSessionLoss(error)) setConnection({ phase: "sign_in", message: SIGNED_OUT_MESSAGE });
+      if (isSessionLoss(error)) setConnection({ phase: "sign_in", message: reauth ? RUN_REAUTH_SIGN_IN_MESSAGE : SIGNED_OUT_MESSAGE });
       else {
+        reauthSelection.current = null;
         if (await connect(previous) !== null) setNotice("Heel Cloud could not confirm sign-out, so you are still signed in. Try again.");
       }
     } finally { endWork(operation); }
@@ -730,7 +737,11 @@ export default function Dashboard() {
       if (ticket === generation.current) setObservedRun(run);
     } catch (error) {
       if (ticket !== generation.current) return;
-      if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
+      if (error instanceof CanaryApiError && error.status === 403 && error.code === "recent_auth_required") {
+        // The session is still valid but too old for this ceremony. Nothing was approved; the plan stays pending on the
+        // server and is rediscovered with the dialog closed, so approving always takes a fresh review.
+        setNotice(RUN_RECENT_AUTH_MESSAGE);
+      } else if (error instanceof CanaryApiError && (error.status === 401 || error.status === 403)) {
         if (error.status === 401) sessionEnded();
         else void connect({ workspaceRef: pending.workspaceRef, projectRef: pending.projectRef });
       } else setNotice(messageOf(error));
@@ -823,12 +834,16 @@ export default function Dashboard() {
         {connection.phase === "canary_unavailable" ? <> <button className="text-button" disabled={working} onClick={() => void retryCanarySetup()} type="button">Try again</button></> : null}
         {connection.phase === "no_workspace" || connection.phase === "error" ? <> <button className="text-button" disabled={working} onClick={() => void signOut()} type="button">Sign out</button></> : null}</p></section> : null}
 
-      {connection.phase === "sign_in" ? <AccountAccess api={cloudApi} onAuthenticated={async () => { await connect({}); }} /> : null}
+      {connection.phase === "sign_in" ? <AccountAccess api={cloudApi} onAuthenticated={async () => {
+        const resume = reauthSelection.current ?? {};
+        reauthSelection.current = null;
+        await connect(resume);
+      }} /> : null}
       {accountView ? <WorkspaceProjectBar account={accountView} disabled={working} onCreateProject={createProject}
         onSelectProject={(projectRef) => void selectProject(projectRef)} onSelectWorkspace={(workspaceRef) => void selectWorkspace(workspaceRef)}
         onSignOut={() => void signOut()} projectRef={selectedProject?.projectRef ?? null}
         projects={context?.projects ?? (connection.phase === "canary_unavailable" ? connection.projects : [])} /> : null}
-      {notice ? <p className="next-action" role="status">{notice}</p> : null}
+      {notice ? <p className="next-action" role="status">{notice}{notice === RUN_RECENT_AUTH_MESSAGE ? <> <button className="text-button" disabled={working} onClick={() => void signOut(true)} type="button">Sign in again</button></> : null}</p> : null}
       {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
       <div className="dashboard-grid"><div>
