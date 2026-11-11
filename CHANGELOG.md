@@ -44,9 +44,22 @@ same-origin `/downloads/` files are labeled as this not-yet-published candidate.
   MCP server info, `server.json` and browser engine; 1.3.0rc2 stays an accepted saved-review and
   findings-sync engine version.
 - Wheel, source archive, manifest, browser wheel/manifest, browser sample and review golden
-  regenerated with the unchanged builders from current main sources. Compared with the published
-  1.3.0rc2 wheel, only version strings, the two supported-engine-version sets and `RECORD` differ;
-  no runner, network-guard, dependency or pricing change.
+  regenerated with the unchanged builders. Before the runner integration below, only version
+  strings, the two supported-engine-version sets and `RECORD` differed from the published 1.3.0rc2
+  wheel.
+- Runner integration (three independently reviewed local-runner changes): `runner prepare --live`
+  now queues the immutable plan and the running `serve` submits it to the existing Cloud approval
+  queue; `runner findings --run` reads only verified, signed, redacted local results and prints no
+  raw evidence; `runner regress add|list|record` and `runner prepare --live --regression` save an
+  observed finding as a local definition and replay that one scenario as a fresh plan that needs
+  a new browser approval and one-shot grant. Replay reuses the existing read-only (`GET`/`HEAD`)
+  canary scenarios, works only in a Cloud-bound context whose verified canary approval queue is
+  reachable, and records `pass` only for `blocked` with a completed run (`observed` is `fail`,
+  anything else `inconclusive`). New public module `heel/runner/regressions.py`; changed
+  `heel/cli.py` and `heel/runner/{coordinator,daemon,service,store}.py`. No new Cloud API,
+  detector, network-guard, dependency or pricing change. Proven only with local test fixtures;
+  no deployed pairing, browser approval or public replay journey is claimed. Guide:
+  `docs/RUNNER_REGRESSION_REPLAY.md`.
 - The published 1.3.0rc2 bytes and version sources are kept byte for byte as the historical fixture
   `tests/fixtures/runner_preview_rc2/`, against which the fixed rc2 publisher is tested.
 
