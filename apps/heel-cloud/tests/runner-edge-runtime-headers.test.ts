@@ -185,11 +185,12 @@ describe("owner approval frames as the deployed edge delivers them", () => {
     expect(seen.upstreamHeaders).toContain("idempotency-key");
     expect(seen.upstreamHeaders).toContain("if-heel-control-generation");
     expect(seen.upstreamHeaders).not.toContain("connection");
-    for (const extra of [
+    const variants: Array<Record<string, string>> = [
       { "Idempotency-Key": `ca1-${"f".repeat(64)}, ca1-${"e".repeat(64)}`, "If-Heel-Control-Generation": "0" },
       { "Idempotency-Key": `ca1-${"f".repeat(64)}`, "If-Heel-Control-Generation": "0, 1" },
       { "If-Heel-Control-Generation": "0" },
-    ]) {
+    ];
+    for (const extra of variants) {
       expect(pick(await observe(edgeRequest(`${ownerBase}/canary-runs/${run}/approve`, { headers: { ...owner, ...extra }, body }))))
         .toEqual(refused);
     }
