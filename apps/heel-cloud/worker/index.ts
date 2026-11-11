@@ -471,9 +471,24 @@ function proxyError(status: number, error: string, csp: string): Response {
   }), csp);
 }
 
+// Runner-protocol machine routes. The released runner transport addresses these as bare
+// `/v1/...` on the dashboard origin, so they are also accepted at that spelling with the
+// identical upstream path and request contract. Human/session routes are never aliased.
+function isRunnerMachineRoute(upstreamPath: string): boolean {
+  return upstreamPath === RUNNER_PAIRING_EXCHANGE
+    || RUNNER_PAIRING_ACTIVATE.test(upstreamPath)
+    || RUNNER_ROTATION_PUBLIC.test(upstreamPath)
+    || RUNNER_CONTROL.test(upstreamPath)
+    || RUNNER_CONTEXT_CONTROL.test(upstreamPath)
+    || RUNNER_RESULT_PROJECTION.test(upstreamPath)
+    || RUNNER_RESYNC.test(upstreamPath)
+    || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
+}
+
 function controlPlaneRoute(method: string, pathname: string): string | null {
   if (pathname !== CONTROL_PLANE_PREFIX && !pathname.startsWith(`${CONTROL_PLANE_PREFIX}/`)) {
-    return null;
+    if (!isRunnerMachineRoute(pathname)) return null;
+    return method === "POST" ? pathname : "";
   }
   const upstreamPath = pathname.slice(CONTROL_PLANE_PREFIX.length);
   if ((upstreamPath === SIGNUP_ROUTE || upstreamPath === LOGIN_ROUTE || upstreamPath === LOGOUT_ROUTE)
