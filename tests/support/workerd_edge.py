@@ -19,12 +19,24 @@ Labelled seams (none is public acceptance; the final proof stays the deployed ed
 - SEAM-HOST: runners reach the Worker at ``https://localhost:<port>``; the Worker's configured
   ``PUBLIC_ORIGIN`` (and the control plane's) is ``PUBLIC_ORIGIN`` below, which browser-shaped
   requests send as ``Origin``. The Worker never consults ``Host`` for the routes used here.
+
+Harness hygiene (not seams; they narrow what the harness itself can do):
+- The per-harness edge secret never touches disk. ``workerd.capnp`` declares
+  ``CONTROL_PLANE_EDGE_SECRET`` with workerd's ``fromEnvironment`` binding and the value reaches
+  only the ``workerd`` child's environment; the control plane holds it in memory.
+- The front relays only an origin-form request target (``origin_form_target``) to the fixed
+  loopback Worker socket. Absolute-form, authority-form, ``*``, scheme-relative, userinfo, dot
+  segments, percent escapes, backslashes and control or non-ASCII bytes are answered 400 locally and
+  never reach ``workerd``. ``http.client`` does not follow redirects: an upstream 3xx is relayed
+  to the caller as-is.
 """
 from __future__ import annotations
 
 import hashlib
 import http.client
 import json
+import os
+import re
 import secrets
 import shutil
 import socket
@@ -47,6 +59,15 @@ _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade",
     "content-length",
 })
+# Non-secret Worker text bindings, fixed by construction; the edge secret is never one of them.
+_TEXT_BINDINGS = (("PUBLIC_ORIGIN", PUBLIC_ORIGIN), ("CONTROL_PLANE_TRANSPORT", "http"))
+# The environment variable workerd reads for the ``CONTROL_PLANE_EDGE_SECRET`` binding.
+EDGE_SECRET_ENVIRONMENT = "HEEL_WORKERD_CONTROL_PLANE_EDGE_SECRET"
+# Origin-form request target (RFC 9112 §3.2.1) restricted to the characters the Worker's control
+# plane routes use: "/" segments of unreserved/sub-delims/":" and an optional query. No "@", "%",
+# "\\", "#", whitespace or non-ASCII; empty segments ("//") and dot segments are refused below.
+_ORIGIN_FORM = re.compile(r"/[A-Za-z0-9\-._~!$&'()*+,;=:/]*(?:\?[A-Za-z0-9\-._~!$&'()*+,;=:/?]*)?")
+_DOT_SEGMENT = re.compile(r"(?:^|/)\.{1,2}(?:/|\?|$)")
 _BUNDLES: dict[str, Path] = {}
 _BUNDLE_LOCK = threading.Lock()
 
@@ -81,6 +102,68 @@ def _bundle() -> Path:
         ], check=True, cwd=_APP, timeout=120)
         _BUNDLES[digest] = output
         return output
+
+
+def origin_form_target(target: str) -> str | None:
+    """The request target if it is a plain origin-form path the front may relay, else ``None``."""
+    if not isinstance(target, str) or not _ORIGIN_FORM.fullmatch(target):
+        return None
+    path = target.split("?", 1)[0]
+    if "//" in path or _DOT_SEGMENT.search(path):
+        return None
+    return target
+
+
+def _front_handler(upstream_port: int, *, cloudflare_connection, on_answer):
+    """TLS-front request handler relaying to the Worker at the fixed ``127.0.0.1:upstream_port``."""
+    upstream_host = "127.0.0.1"
+
+    class FrontHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            return
+
+        def _relay(self):
+            self.close_connection = True
+            # Validate the target exactly as the client sent it: ``http.server`` rewrites a leading
+            # "//" in ``self.path``, so the raw request-line token must be the same string.
+            parts = self.requestline.split(" ")
+            target = origin_form_target(parts[1]) if len(parts) == 3 else None
+            if target is None or target != self.path:
+                self.send_error(400, "request target is not origin-form")
+                return
+            headers = [(name, value) for name, value in self.headers.items()
+                       if not (cloudflare_connection() and name.lower() == "connection")]
+            if any(name.lower() == "transfer-encoding" for name, _ in headers):
+                self.send_error(400)
+                return
+            lengths = [value for name, value in headers if name.lower() == "content-length"]
+            body = self.rfile.read(int(lengths[0])) if lengths and lengths[0].isdigit() else b""
+            if cloudflare_connection():
+                headers.append(("Connection", "Keep-Alive"))  # SEAM-CF-CONNECTION
+            upstream = http.client.HTTPConnection(upstream_host, upstream_port, timeout=30)
+            try:
+                upstream.putrequest(self.command, target, skip_host=True, skip_accept_encoding=True)
+                for name, value in headers:
+                    upstream.putheader(name, value)
+                upstream.endheaders(body if lengths else None)
+                response = upstream.getresponse()
+                payload = response.read()
+                on_answer((self.command, target, response.status, payload))
+                self.send_response(response.status)
+                for name, value in response.getheaders():
+                    if name.lower() not in _HOP_BY_HOP:
+                        self.send_header(name, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            finally:
+                upstream.close()
+
+        do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = _relay
+
+    return FrontHandler
 
 
 def _wait_listening(port: int, process: subprocess.Popen, log: Path, timeout: float = 30.0) -> None:
@@ -136,12 +219,8 @@ class WorkerdEdgeHarness:
         config = self.root / "workerd.capnp"
         bundle = _bundle()
         shutil.copyfile(bundle, self.root / "worker.js")
-        bindings = {
-            "PUBLIC_ORIGIN": PUBLIC_ORIGIN, "CONTROL_PLANE_EDGE_SECRET": self.edge_secret,
-            "CONTROL_PLANE_TRANSPORT": "http",
-        }
         text_bindings = ", ".join(
-            f'(name = "{name}", text = {json.dumps(value)})' for name, value in bindings.items())
+            f'(name = "{name}", text = {json.dumps(value)})' for name, value in _TEXT_BINDINGS)
         config.write_text(f"""using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
@@ -154,7 +233,10 @@ const edge :Workerd.Worker = (
   modules = [(name = "worker.js", esModule = embed "worker.js")],
   compatibilityDate = "{COMPATIBILITY_DATE}",
   compatibilityFlags = ["nodejs_compat"],
-  bindings = [(name = "CONTROL_PLANE", service = "control-plane"), {text_bindings}],
+  bindings = [
+    (name = "CONTROL_PLANE", service = "control-plane"), {text_bindings},
+    (name = "CONTROL_PLANE_EDGE_SECRET", fromEnvironment = "{EDGE_SECRET_ENVIRONMENT}"),
+  ],
 );
 """)
         self._workerd_log = self.root / "workerd.log"
@@ -162,50 +244,15 @@ const edge :Workerd.Worker = (
         self._workerd = subprocess.Popen(
             [str(_APP / "node_modules" / ".bin" / "workerd"), "serve", str(config)],
             stdout=log, stderr=subprocess.STDOUT, cwd=self.root,
+            env={**os.environ, EDGE_SECRET_ENVIRONMENT: self.edge_secret},
         )
         log.close()
         self._threads = [_start(self._backend)]
         _wait_listening(self._worker_port, self._workerd, self._workerd_log)
 
-        class FrontHandler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *_args):
-                return
-
-            def _relay(self):
-                self.close_connection = True
-                headers = [(name, value) for name, value in self.headers.items()
-                           if not (harness.cloudflare_connection and name.lower() == "connection")]
-                if any(name.lower() == "transfer-encoding" for name, _ in headers):
-                    self.send_error(400)
-                    return
-                lengths = [value for name, value in headers if name.lower() == "content-length"]
-                body = self.rfile.read(int(lengths[0])) if lengths and lengths[0].isdigit() else b""
-                if harness.cloudflare_connection:
-                    headers.append(("Connection", "Keep-Alive"))  # SEAM-CF-CONNECTION
-                upstream = http.client.HTTPConnection("127.0.0.1", harness._worker_port, timeout=30)
-                try:
-                    upstream.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
-                    for name, value in headers:
-                        upstream.putheader(name, value)
-                    upstream.endheaders(body if lengths else None)
-                    response = upstream.getresponse()
-                    payload = response.read()
-                    harness.edge_answers.append((self.command, self.path, response.status, payload))
-                    self.send_response(response.status)
-                    for name, value in response.getheaders():
-                        if name.lower() not in _HOP_BY_HOP:
-                            self.send_header(name, value)
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
-                finally:
-                    upstream.close()
-
-            do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = _relay
-
-        self._front = _TLSServer(FrontHandler, self.ca.server_context())
+        front = _front_handler(self._worker_port, cloudflare_connection=lambda: harness.cloudflare_connection,
+                               on_answer=self.edge_answers.append)
+        self._front = _TLSServer(front, self.ca.server_context())
         self.port = self._front.server_address[1]
         self.origin = f"https://localhost:{self.port}"
         self._threads.append(_start(self._front))
@@ -276,4 +323,5 @@ const edge :Workerd.Worker = (
         self.close()
 
 
-__all__ = ["PUBLIC_ORIGIN", "WorkerdEdgeHarness", "workerd_available"]
+__all__ = ["EDGE_SECRET_ENVIRONMENT", "PUBLIC_ORIGIN", "WorkerdEdgeHarness", "origin_form_target",
+           "workerd_available"]
