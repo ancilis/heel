@@ -25,9 +25,59 @@ describe('deployment boundaries', () => {
       expect(() => deploymentConfig({ HEEL_PUBLIC_ORIGIN: invalid, HEEL_DEPLOYMENT_MODE: 'local_review' }, 'build')).toThrow(/canonical HTTPS/);
     }
   });
+  it('binds exactly one provider-issued UUID v7 VPC service in full deployment mode', () => {
+    // Representative synthetic v7 value (version nibble 7, RFC 4122 variant); not an account resource.
+    const v7 = '01890a5d-ac96-774b-bcce-b302099a8057';
+    for (const value of [v7, v7.toUpperCase(), ` ${v7}\n`]) {
+      expect(deploymentConfig({ HEEL_PUBLIC_ORIGIN: origin, HEEL_CONTROL_PLANE_VPC_SERVICE_ID: value }, 'build'))
+        .toEqual({ vars: { PUBLIC_ORIGIN: origin }, vpc_services: [{ binding: 'CONTROL_PLANE', service_id: value.trim() }] });
+    }
+  });
   it('rejects a full build whose private service id is not a VPC service UUID', () => {
-    for (const invalid of ['', 'not-a-uuid', '00000000-0000-0000-8000-000000000001', `${service}0`]) {
+    for (const invalid of [
+      '', 'not-a-uuid', '00000000-0000-0000-8000-000000000001', `${service}0`,
+      '01890a5d-ac96-874b-bcce-b302099a8057', '01890a5d-ac96-774b-7cce-b302099a8057',
+      '01890a5d-ac96-774b-ccce-b302099a8057', '01890a5d-ac96-774b-bcce-b302099a805', '01890a5dac96774bbcceb302099a8057',
+    ]) {
       expect(() => deploymentConfig({ HEEL_PUBLIC_ORIGIN: origin, HEEL_CONTROL_PLANE_VPC_SERVICE_ID: invalid }, 'build')).toThrow(/VPC service/);
+    }
+  });
+});
+
+describe('private upstream transport', () => {
+  const full = { HEEL_PUBLIC_ORIGIN: origin, HEEL_CONTROL_PLANE_VPC_SERVICE_ID: service };
+  const binding = [{ binding: 'CONTROL_PLANE', service_id: service }];
+  it('keeps the legacy HTTPS configuration shape when the setting is missing or explicitly https', () => {
+    for (const command of ['build', 'serve']) {
+      expect(deploymentConfig(full, command)).toEqual({ vars: { PUBLIC_ORIGIN: origin }, vpc_services: binding });
+      expect(deploymentConfig({ ...full, HEEL_CONTROL_PLANE_TRANSPORT: 'https' }, command))
+        .toEqual({ vars: { PUBLIC_ORIGIN: origin }, vpc_services: binding });
+    }
+  });
+  it('emits the Worker-only setting only when private HTTP is explicitly selected', () => {
+    for (const command of ['build', 'serve']) {
+      expect(deploymentConfig({ ...full, HEEL_CONTROL_PLANE_TRANSPORT: 'http' }, command))
+        .toEqual({ vars: { PUBLIC_ORIGIN: origin, CONTROL_PLANE_TRANSPORT: 'http' }, vpc_services: binding });
+    }
+  });
+  it('keeps the public origin canonical HTTPS when private HTTP is selected', () => {
+    for (const value of ['http://heel.example', 'http://localhost', origin + '/']) {
+      expect(() => deploymentConfig({ ...full, HEEL_PUBLIC_ORIGIN: value, HEEL_CONTROL_PLANE_TRANSPORT: 'http' }, 'build'))
+        .toThrow(/canonical HTTPS/);
+    }
+  });
+  it('fails closed on every malformed setting in every command', () => {
+    for (const value of ['', ' ', 'HTTP', 'Http', 'HTTPS', ' http', 'http ', 'http\n', 'http:', 'https:', 'http://', 'tcp', 'h2', 'http2', 'tls', 'plain', '8080', 'http:8080']) {
+      for (const command of ['build', 'serve']) {
+        expect(() => deploymentConfig({ ...full, HEEL_CONTROL_PLANE_TRANSPORT: value }, command), JSON.stringify(value))
+          .toThrow(/HEEL_CONTROL_PLANE_TRANSPORT/);
+      }
+    }
+  });
+  it('refuses a private transport in local-review mode, which has no private service', () => {
+    for (const value of ['http', 'https']) {
+      expect(() => deploymentConfig({ HEEL_PUBLIC_ORIGIN: origin, HEEL_DEPLOYMENT_MODE: 'local_review', HEEL_CONTROL_PLANE_TRANSPORT: value }, 'build'))
+        .toThrow(/cannot bind/);
     }
   });
 });
