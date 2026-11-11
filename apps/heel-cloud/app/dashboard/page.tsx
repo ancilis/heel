@@ -434,14 +434,21 @@ export default function Dashboard() {
     ? pendingApproval.requestKey : null;
   const approvalDialogOpen = approvalKey !== null && approvalDialog?.requestKey === approvalKey && approvalDialog.open;
   const hasPlan = pendingApproval !== null && pendingApproval.run.run.status === "awaiting_execution_approval";
+  // Progress comes from the server's active records for this project: a runner is paired while its key is active (the
+  // bindable list omits a bound runner, so `pairedRunnersOf` adds it back), and it is authorized only by an active,
+  // unexpired binding for this exact verified environment and proof. Liveness and local credentials are not visible.
+  const pairedRunners = connection.phase === "ready" ? pairedRunnersOf(connection.context.contextBindings, nowSeconds * 1000) : [];
+  const authorizedForTarget = connection.phase === "ready" && executable !== undefined
+    && connection.context.contextBindings.bindings.some((item) => item.status === "active" && item.expiresAtMs > nowSeconds * 1000
+      && item.environmentId === executable.environmentId && item.verificationRecordDigest === executable.verificationRecordDigest);
   const snapshot: ActivationSnapshot = {
     environment: executable ? "verified" : proofChallenge ? "checking" : "unverified",
-    runner: executable ? (hasPlan ? "online" : "unpaired") : "locked",
-    canaryAccess: hasPlan ? "ready" : executable ? "missing" : "locked",
+    runner: executable ? (hasPlan ? "online" : pairedRunners.length > 0 ? "paired" : "unpaired") : "locked",
+    canaryAccess: hasPlan ? "ready" : !executable || pairedRunners.length === 0 ? "locked" : authorizedForTarget ? "authorized" : "unauthorized",
     rehearsal: hasPlan ? "awaiting_approval" : "locked",
   };
-  const completedSteps = [snapshot.environment === "verified", snapshot.runner === "online", snapshot.canaryAccess === "ready", hasPlan]
-    .filter(Boolean).length;
+  const completedSteps = [snapshot.environment === "verified", snapshot.runner === "paired" || snapshot.runner === "online",
+    snapshot.canaryAccess === "ready", hasPlan].filter(Boolean).length;
 
   const runPhase: RunPhase | null = useMemo(() => {
     if (observedRun === null) return null;
@@ -791,7 +798,6 @@ export default function Dashboard() {
   const showActivation = context !== null && (privateConnectorInUse || pendingApproval !== null || observedRun !== null);
   // Pairing is offered only after the project's target is verified, only to a workspace owner or admin (the server
   // also requires a recent sign-in), and only while the workspace has no active runner.
-  const pairedRunners = context !== null ? pairedRunnersOf(context.contextBindings, nowSeconds * 1000) : [];
   const canPairRunner = context !== null && executable !== undefined && pendingApproval === null
     && pairedRunners.length === 0
     && (context.account.workspace.role === "owner" || context.account.workspace.role === "admin");
@@ -826,7 +832,7 @@ export default function Dashboard() {
       {pendingHasMore ? <p className="next-action" role="status">Another pending approval is waiting after this one.</p> : null}
 
       <div className="dashboard-grid"><div>
-        {context ? <TargetRegistrationCard busy={working} instruction={proofChallenge?.instruction ?? null}
+        {context ? <TargetRegistrationCard busy={working} privateConnector={privateConnectorInUse} instruction={proofChallenge?.instruction ?? null}
           onCheckProof={() => void checkProof()} onCreateProof={() => void startProof()} onOriginChange={setOrigin}
           onProofMethodChange={setProofMethod} origin={origin} proofMethod={proofMethod} verifiedOrigin={executable?.origin ?? null}
           pendingTargets={pendingTargets} selectedPendingId={chosenPending?.environmentId ?? null} replacementPendingId={replacementPendingId}
@@ -844,6 +850,7 @@ export default function Dashboard() {
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
           <button className="button button-primary" disabled={working || !selectedBindingEnvironment || !selectedRunnerAvailable} onClick={() => void createContextBinding()} type="button">Authorize paired runner</button>
+          {context.contextBindings.runners.length === 0 && authorizedForTarget ? <p>Your paired runner is already authorized and listed below; a runner is offered here only while it has no active authorization.</p> : null}
           {context.contextBindings.bindings.length > 0 ? <ul className="context-binding-list">{context.contextBindings.bindings.map((item) => <li key={item.bindingId}><span>{item.origin} · {item.runnerId} · {item.status}</span>{item.status === "active" ? <button disabled={working} onClick={() => void revokeContextBinding(item.bindingId)} type="button">Revoke</button> : null}</li>)}</ul> : null}
         </section> : null}
         {context && !pendingApproval && pairedRunners.length > 0 ? <section className="runner-recovery" aria-labelledby="paired-runners-title"><p className="canary-kicker">Local runner</p><h2 id="paired-runners-title">Paired runners</h2>

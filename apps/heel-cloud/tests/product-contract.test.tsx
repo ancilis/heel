@@ -188,6 +188,13 @@ describe("Heel anonymous launch review", () => {
     expect(container.textContent).not.toMatch(/sign up to review|customer count|accuracy rate|testimonial/i);
   });
 
+  test("offers a plain account entry to verified staging setup, separate from the local static review", () => {
+    render(<Home />);
+    const entry = screen.getByRole("link", { name: "create an account or sign in" });
+    expect(entry.getAttribute("href")).toBe("/dashboard");
+    expect(entry.closest("p")?.textContent).toBe("The review above is static analysis in this browser and never contacts your product. To verify a staging target you own and pair a local runner, create an account or sign in.");
+  });
+
   test("runs the committed sample through the background browser client", async () => {
     render(<Home />);
 

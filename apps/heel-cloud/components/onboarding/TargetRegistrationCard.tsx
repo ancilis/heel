@@ -18,8 +18,12 @@ export interface PendingTarget {
 }
 
 export const TARGET_UNAVAILABLE_BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+/** The same boundary for an account that operates a paired private runner, which keeps its credentials locally. */
+export const TARGET_CONNECTOR_BOUNDARY = "Target verified. Managed scanning and discovery are not available in this build. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
 
 export interface TargetRegistrationCardProps {
+  /** True when the account already operates a paired private runner or authorization for this project. */
+  privateConnector?: boolean;
   /** Origin of the project's persisted, server-verified environment, or null when none exists yet. */
   verifiedOrigin: string | null;
   origin: string;
@@ -45,7 +49,7 @@ export interface TargetRegistrationCardProps {
 
 /** Registers one public HTTPS target through the existing ownership-proof contract; it never contacts the target. */
 export function TargetRegistrationCard({
-  verifiedOrigin, origin, proofMethod, instruction, busy,
+  verifiedOrigin, origin, proofMethod, instruction, busy, privateConnector = false,
   onOriginChange, onProofMethodChange, onCreateProof, onCheckProof,
   pendingTargets, selectedPendingId, replacementPendingId, onSelectPendingTarget, onResumeProof, onReplaceProof,
 }: TargetRegistrationCardProps) {
@@ -54,8 +58,8 @@ export function TargetRegistrationCard({
     return (
       <section className="runner-recovery" id="verify-origin" aria-labelledby="target-title"><p className="canary-kicker">Registered target</p><h2 id="target-title">Your target</h2>
         <p><code>{verifiedOrigin}</code></p>
-        <p role="status">{TARGET_UNAVAILABLE_BOUNDARY}</p>
-        <p>Optional: if you already operate a paired private connector, its access controls appear on this page. <Link href="/runner">About private connectors</Link></p>
+        <p role="status">{privateConnector ? TARGET_CONNECTOR_BOUNDARY : TARGET_UNAVAILABLE_BOUNDARY}</p>
+        {privateConnector ? null : <p>Optional: if you already operate a paired private connector, its access controls appear on this page. <Link href="/runner">About private connectors</Link></p>}
       </section>
     );
   }
