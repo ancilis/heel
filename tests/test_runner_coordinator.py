@@ -4024,3 +4024,123 @@ def test_retention_prune_refuses_a_prune_state_whose_terminal_lineage_differs_fr
         h.coordinator.store.load_pruned_run_receipt(
             h.grant["run_id"], expected_runtime_state_digest=forged.state_digest,
         )
+
+
+# --------------------------------------------------------------------------- staged poll recovery (F1)
+#
+# Fable H2 source review F1 (CONFIRMED, probe P4a): a non-200 or unreadable answer to a disclosure
+# poll leaves the sealed poll staged, and the serve step skipped every row with a pending call, so
+# the run was never polled again until ``heel runner serve`` restarted.  A row whose only pending
+# call is that poll stays due on the same cadence and is replayed byte-identically through the
+# existing pending path; nothing new is minted and every other staged call still parks the row.
+
+def _transient_poll_tail(first):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            first,
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, _handoff_receipt(grant, findings, permit)),
+        ]
+    return tail
+
+
+@pytest.mark.parametrize("first", [
+    (503, {}, {"error": "edge"}),
+    (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, {"malformed": True}),
+], ids=["edge-503", "unreadable-200"])
+def test_staged_poll_after_a_transient_answer_is_replayed_byte_identically_on_the_next_due_step(tmp_path, first):
+    h = _handoff_coordinator(tmp_path, _transient_poll_tail(first))
+    start = len(h.transport.requests)
+    assert h.coordinator.advance_disclosures() == 1
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure" and pending.run_id == h.grant["run_id"]
+    staged = h.transport.requests[-1]
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+    h.clock[0] += 2_000
+    assert h.coordinator.advance_disclosures() == 1  # same serve process, no restart
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll", "result-projection"]
+    replay = h.transport.requests[start + 1]
+    assert replay == staged  # exact path, headers (nonce/sequence/signature) and body
+    upload_headers = h.transport.requests[start + 2][1]
+    assert upload_headers["X-Heel-Runner-Nonce"] == _nonce(b"p")
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == "consumed" and state.permit_id == h.holder["permit"]["permit_id"]
+    assert h.client.runtime.load_pending_calls() == ()
+    h.clock[0] += 2_000
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start).count("result-projection") == 1
+
+
+def test_staged_poll_replay_keeps_the_slow_cadence_and_stops_at_retention(tmp_path):
+    now = [2_000]
+    h = _handoff_coordinator(
+        tmp_path, lambda *_: [(503, {}, {"error": "edge"}) for _ in range(4)], now=now,
+    )
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+
+    now[0] = state.terminal_at_ms + _TEN_MINUTES_MS + 1
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    for step in (2_000, 30_000):  # not yet 60 s since the last attempt
+        now[0] += step
+        assert h.coordinator.advance_disclosures() == 0
+    assert len(h.transport.requests) - start == 1
+    now[0] += 30_000
+    assert h.coordinator.advance_disclosures() == 1
+    assert h.transport.requests[-1] == staged
+    assert len(h.transport.requests) - start == 2
+
+    now[0] = state.retention_expires_at_ms
+    assert h.coordinator.advance_disclosures() == 0
+    now[0] += 120_000
+    assert h.coordinator.advance_disclosures() == 0
+    assert len(h.transport.requests) - start == 2
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+def test_a_staged_poll_the_server_refuses_on_replay_never_uploads_and_still_blocks_startup(tmp_path):
+    conflict = {"schema_version": "heel.canary-error.v1", "code": "canary_state_conflict"}
+    h = _handoff_coordinator(
+        tmp_path, lambda *_: [(503, {}, {"error": "edge"})] + [(409, {}, dict(conflict)) for _ in range(3)],
+    )
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    for _ in range(2):
+        h.clock[0] += 2_000
+        h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"] * 3
+    assert all(request == staged for request in h.transport.requests[start:])
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    # Pre-existing fail-closed policy (P4b): a refused staged replay keeps startup refused.
+    with pytest.raises(ValueError):
+        h.build(h.client.runtime, nonce_byte=b"z")
+
+
+def test_a_staged_findings_upload_still_parks_the_row_until_startup_replay(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (503, {}, {"error": "edge"}),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "upload-findings"
+    assert h.client.runtime.load_available_disclosures(now_ms=h.clock[0]).items == ()
+    for _ in range(3):
+        h.clock[0] += 2_000
+        assert h.coordinator.advance_disclosures() == 0
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]

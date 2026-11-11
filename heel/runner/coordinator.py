@@ -1017,10 +1017,14 @@ class RunnerCoordinator:
     def advance_disclosures(self) -> int:
         """One bounded serve step of the result handoff; returns the polls sent.
 
-        Walks the retained, unexpired, zero-pending ``available`` disclosures; polls those due;
-        uploads the exact local projection once on a human permit; stops for this process on
-        ``local_only``/``synchronized``.  A locally refused permit or an unreadable answer leaves
-        the run ``available`` (a staged call is replayed on restart) and never uploads.
+        Walks the retained, unexpired ``available`` disclosures with no staged call other than
+        their own poll; polls those due; uploads the exact local projection once on a human
+        permit; stops for this process on ``local_only``/``synchronized``.  A locally refused
+        permit or a non-200/unreadable answer leaves the run ``available`` and never uploads; a
+        poll left staged by such an answer is replayed byte-identically (same path, headers and
+        body through ``control.poll_disclosure``'s pending path) on the run's next due step,
+        within the same cadence and never at or after retention.  Any other staged call keeps
+        the row parked for startup replay.
         """
         now = self._now_ms()
         retained: set[str] = set()
