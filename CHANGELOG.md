@@ -47,7 +47,7 @@ same-origin `/downloads/` files are labeled as this not-yet-published candidate.
   regenerated with the unchanged builders. Before the runner integration below, only version
   strings, the two supported-engine-version sets and `RECORD` differed from the published 1.3.0rc2
   wheel.
-- Runner integration (three independently reviewed local-runner changes): `runner prepare --live`
+- Runner integration (five independently reviewed local-runner changes): `runner prepare --live`
   now queues the immutable plan and the running `serve` submits it to the existing Cloud approval
   queue; `runner findings --run` reads only verified, signed, redacted local results and prints no
   raw evidence; `runner regress add|list|record` and `runner prepare --live --regression` save an
@@ -55,8 +55,16 @@ same-origin `/downloads/` files are labeled as this not-yet-published candidate.
   a new browser approval and one-shot grant. Replay reuses the existing read-only (`GET`/`HEAD`)
   canary scenarios, works only in a Cloud-bound context whose verified canary approval queue is
   reachable, and records `pass` only for `blocked` with a completed run (`observed` is `fail`,
-  anything else `inconclusive`). New public module `heel/runner/regressions.py`; changed
-  `heel/cli.py` and `heel/runner/{coordinator,daemon,service,store}.py`. No new Cloud API,
+  anything else `inconclusive`). In the paired (browser-approved) run, a completed
+  `plan_entitlement_read` pair without a canary marker binding is now also evaluated by the existing
+  plan-differential comparator on the two stored, redacted bodies bound to that scenario's own
+  action ordinals: a lower-plan key-path superset is `observed` (medium confidence, values not
+  compared), a lower-plan denial is `blocked`, and missing, expired or malformed evidence stays
+  `inconclusive`; no new request is sent. `runner findings` also prints a derived, unsigned
+  top-level `evidence_states` list (`observed`, `verified` for the canary-marker path, `held`,
+  `inconclusive`) computed only from the signed results; the signed objects are unchanged. New
+  public module `heel/runner/regressions.py`; changed `heel/cli.py` and
+  `heel/runner/{coordinator,daemon,execution,plan_differential,service,store}.py`. No new Cloud API,
   detector, network-guard, dependency or pricing change. Proven only with local test fixtures;
   no deployed pairing, browser approval or public replay journey is claimed. Guide:
   `docs/RUNNER_REGRESSION_REPLAY.md`.
