@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
-const VPC_SERVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VPC_SERVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // WHATWG URL parses a host whose last label looks numeric (decimal or 0x hex) as IPv4.
 const NUMERIC_LABEL = /^(?:[0-9]+|0x[0-9a-f]*)$/;
