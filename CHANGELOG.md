@@ -33,13 +33,17 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc4]: unpublished candidate
+## [1.3.0rc4]: 2026-11-11
 
-Runner preview candidate for the H2 result handoff. It is not a GitHub release, not on PyPI and not
-publicly deployed. Customer copy is unchanged: the paired-runner surfaces keep the published
-v1.3.0rc3 install and the other surfaces keep the published, hash-pinned 1.3.0rc2 install, until
-this candidate's own release passes an anonymous public verification. The same-origin `/downloads/`
-files are labeled as this not-yet-published candidate.
+Runner preview prerelease for the H2 result handoff, published as a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4> from source commit
+`68b8d50e49d095d33fd4fb51327370b92086dfd3` after its anonymous public verification passed. It is
+not a stable release, it is not published to PyPI and the hosted control plane is not deployed.
+Every customer install surface now uses the one hash-pinned 1.3.0rc4 install from that release;
+1.3.0rc1, 1.3.0rc2 and 1.3.0rc3 stay published and are named only as history. The same-origin
+`/downloads/` files are the bundled 1.3.0rc4 artifacts. The packaged `release/open-core/README.md`
+inside the source archive was frozen at candidate build time and still describes 1.3.0rc4 as not
+yet published; this entry and the release page are the publication record.
 
 - Version identity 1.3.0rc4 (npm 1.3.0-rc.4) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc3 stays an accepted saved-review and

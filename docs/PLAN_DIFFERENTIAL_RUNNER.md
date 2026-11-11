@@ -778,3 +778,11 @@ Chosen for this phase:
   `inconclusive` and sends nothing.
 - Credentials registered before this command existed have handles that were never
   displayed. Use a fresh `HEEL_HOME`.
+
+## Reporting a problem
+
+If a step fails, open an issue at <https://github.com/ancilis/heel/issues/new> with only:
+the output of `heel --version`, your operating system and version, the step that failed,
+the run ID if there is one, and a short summary with credential handles, hostnames and
+response content removed. Never paste credentials, tokens, keys, cookies or raw responses
+or evidence: issues are public.
