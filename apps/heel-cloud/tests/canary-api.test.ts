@@ -47,6 +47,50 @@ it("uses closed create list revoke routes for browser context authorization", as
   ]);
 });
 
+it("pairs and revokes runners only through the closed workspace routes and exact bodies", async () => {
+  const pairing = `pending_${"1".repeat(32)}`;
+  const calls: string[] = [];
+  const api = new CanaryApi({ transport: async (path, init) => {
+    calls.push(`${init.method}:${path}:${typeof init.body === "string" ? init.body : ""}`);
+    if (String(path).endsWith("/runner-pairings")) return jsonResponse({ schema_version: "heel.runner-pairing-invitation.v1", invitation_token: "invite-1", expires_at: 1_900_000_000.5 }, 201);
+    if (String(path).endsWith("/approve")) return jsonResponse({ schema_version: "heel.runner-pairing-approved.v1", status: "approved" });
+    if (String(path).endsWith("/revoke")) return jsonResponse({ schema_version: "heel.runner-revoke-result.v1", revoked: true });
+    return jsonResponse({ schema_version: "heel.runner-pairing-view.v1", pairing_id: pairing, runner_id: "runner-a", pairing_phrase: "a b c d e f", fingerprint: digest, status: "pending", expires_at: 1_900_000_000.5 });
+  }});
+  assert.deepEqual(await api.createRunnerPairingInvitation(workspace), { invitationToken: "invite-1", expiresAt: 1_900_000_000.5 });
+  assert.deepEqual(await api.inspectRunnerPairing(workspace, pairing), { pairingId: pairing, runnerId: "runner-a", pairingPhrase: "a b c d e f", fingerprint: digest, status: "pending", expiresAt: 1_900_000_000.5 });
+  await api.approveRunnerPairing(workspace, pairing, "a b c d e f", digest);
+  await api.revokeRunner(workspace, "runner-a");
+  assert.deepEqual(calls, [
+    `POST:/api/control-plane/v1/workspaces/${workspace}/runner-pairings:{"schema_version":"heel.runner-pairing-invite.v1"}`,
+    `GET:/api/control-plane/v1/workspaces/${workspace}/runner-pairings/${pairing}:`,
+    `POST:/api/control-plane/v1/workspaces/${workspace}/runner-pairings/${pairing}/approve:{"fingerprint":"${digest}","pairing_phrase":"a b c d e f","schema_version":"heel.runner-pairing-approve.v1"}`,
+    `POST:/api/control-plane/v1/workspaces/${workspace}/runners/runner-a/revoke:{"reason_code":"human_revocation","schema_version":"heel.runner-revoke.v1"}`,
+  ]);
+  for (const runnerId of ["", "runner/a", "runner.a", "../x", "a".repeat(129)]) {
+    await expect(api.revokeRunner(workspace, runnerId)).rejects.toMatchObject({ code: "invalid_request" });
+  }
+  assert.equal(calls.length, 4);
+});
+
+it("rejects a runner revoke result outside the typed contract and names the refusal", async () => {
+  for (const body of [{ schema_version: "heel.runner-revoke-result.v1", revoked: false }, { schema_version: "heel.runner-revoke-result.v1", revoked: true, extra: 1 }, { schema_version: "heel.runner-revoked.v1", revoked: true }]) {
+    const api = new CanaryApi({ transport: async () => jsonResponse(body) });
+    await expect(api.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_response" });
+  }
+  const refused = new CanaryApi({ transport: async () => jsonResponse({ error: "invalid runner revocation", code: "invalid_runner_revocation" }, 400) });
+  await expect(refused.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_runner_revocation", status: 400 });
+});
+
+it("the dashboard pairing card shows the same verified rc2 install line as /agent", async () => {
+  const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
+  const { RUNNER_RC2_INSTALL } = await import("../components/canary/RunnerPairingCard");
+  const sha = /const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";/.exec(agent)?.[1];
+  const template = /const INSTALL_PUBLIC_AGENT = `([^`]+)`;/.exec(agent)?.[1];
+  assert.ok(sha && template);
+  assert.equal(RUNNER_RC2_INSTALL, template.replace("${PUBLIC_WHEEL_SHA256}", sha));
+});
+
 it("discovers only a closed pending approval summary", async () => {
   const api = new CanaryApi({ transport: async () => jsonResponse({
     schema_version: "heel.canary-approval-request-list.v1", server_time_ms: 1, has_more: false,
