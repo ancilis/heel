@@ -632,6 +632,45 @@ class RunnerCoordinator:
             binding["binding_id"], binding["binding_digest"], approval_projection,
         )
 
+    def submit_pending_projection(self) -> dict[str, Any] | None:
+        """Submit the one projection ``runner prepare --live`` queued; only the serve owner calls this.
+
+        The queued record names an immutable saved pair and the context binding it was compiled
+        under. A changed binding or an unloadable pair is settled as refused with nothing sent.
+        A lost answer leaves the record pending: the next idle poll resubmits the same immutable
+        projection and the server answers with the same approval (``projection_digest`` is unique).
+        """
+        pending = self.store.load_projection_submission()
+        if pending is None or pending["state"] != "pending":
+            return None
+        binding = self.store.verify_cloud_context_binding(
+            identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+        )
+        if binding["binding_digest"] != pending["binding_digest"]:
+            self.store.settle_projection_submission(pending, state="refused", reason="context_changed")
+            return None
+        try:
+            manifest, projection = self.store.load_approved_pair(pending["projection_id"])
+        except (RunnerStoreError, ValueError):
+            manifest = projection = None
+        if (
+            projection is None or projection["projection_digest"] != pending["projection_digest"]
+            or manifest["manifest_digest"] != pending["manifest_digest"]
+        ):
+            self.store.settle_projection_submission(pending, state="refused", reason="projection_unavailable")
+            return None
+        submitted = self.submit_cloud_context_approval(projection)
+        if (
+            submitted.get("approval_id") != pending["projection_id"]
+            or submitted.get("projection_digest") != pending["projection_digest"]
+        ):
+            raise ValueError("projection submission answer does not match the queued projection")
+        self.store.settle_projection_submission(
+            pending, state="submitted", approval_id=submitted["approval_id"],
+            run_id=submitted["run_id"], status=submitted["status"],
+        )
+        return submitted
+
     def _claimed_projection(
         self, manifest: dict[str, Any], projection: dict[str, Any], grant: dict[str, Any],
         *, claimed_at_ms: int,

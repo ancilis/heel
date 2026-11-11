@@ -1937,6 +1937,10 @@ def test_serve_exits_execution_unavailable_for_an_undecodable_claim_without_traf
             calls.append("ensure")
             return True
 
+        def submit_pending_projection(self):
+            calls.append("submit_pending")  # nothing queued: no control call
+            return None
+
         def claim(self):
             calls.append("claim")
             self.control.runtime.active.append(type("Active", (), {"run_id": "crun_" + "a" * 32})())
@@ -1960,7 +1964,7 @@ def test_serve_exits_execution_unavailable_for_an_undecodable_claim_without_traf
     with pytest.raises(daemon_module.RunnerServeError) as refused:
         service.run_once()
     assert refused.value.code == "execution_unavailable"
-    assert calls == ["ensure", "claim"]  # no heartbeat, progress, result or stop-ack
+    assert calls == ["ensure", "submit_pending", "claim"]  # no heartbeat, progress, result or stop-ack
     assert daemon_module._serve_failure(refused.value) == ("failed", "execution_unavailable")
     # A claim that fails without recording a run keeps its own failure.
     plain = Coordinator()

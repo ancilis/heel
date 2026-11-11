@@ -460,8 +460,9 @@ def _runner_prepare(args) -> int:
         }, sort_keys=True))
         return 0
 
-    # Task 5 is a local compilation boundary. It creates no network authority and
-    # uploads nothing; later control-plane tasks consume the safe projection.
+    # Preparation is local: it compiles, saves the immutable pair and, for a Cloud-paired
+    # context, only queues it. It never opens the runtime ledger or sends a request: a running
+    # ``serve`` owns the signed claim chain and submits the queued projection on its next poll.
     try:
         from .runner.compiler import CanaryCompiler
         from .runner.identity import RunnerIdentity, SystemSecureSigner, runner_phrase_words
@@ -469,7 +470,30 @@ def _runner_prepare(args) -> int:
 
         binding = store.load_binding()
         bound_identity = binding["identity"]
-        signer = SystemSecureSigner(binding["signer_label"])
+        cloud_binding = None
+        if store.has_cloud_context_provenance():
+            from .crypto import load_public_key_base64
+            from .runner.daemon import RunnerDaemon
+
+            # The paired key lives under the pairing label in the daemon's secret backend; it is
+            # loaded, never generated. The installed binding is re-verified with the record's key.
+            daemon = RunnerDaemon()
+            record = daemon._load_record(daemon._store())
+            authority = None if record is None or record["state"] != "active" else daemon._grant_authority(record)
+            if authority is None:
+                raise ValueError("runner is not paired with Cloud authority")
+            paired_identity, signer = daemon._active_identity(daemon._store(), record)
+            if (paired_identity.runner_id, paired_identity.key_id) != (
+                bound_identity["runner_id"], bound_identity["runner_key_id"],
+            ):
+                raise ValueError("bound context names another runner identity")
+            cloud_binding = store.verify_cloud_context_binding(
+                identity=paired_identity,
+                trusted_cloud_keys={authority["key_id"]: load_public_key_base64(authority["public_key_b64"])},
+                now_ms=int(time.time() * 1000),
+            )
+        else:
+            signer = SystemSecureSigner(binding["signer_label"])
         identity = RunnerIdentity(
             runner_id=bound_identity["runner_id"],
             workspace_id=bound_identity["workspace_id"],
@@ -491,14 +515,22 @@ def _runner_prepare(args) -> int:
                 vaults[backend] = select_vault(backend)
         compiler.prepare_live(selected, vaults=vaults)
         result = compiler.compile(selected)
+        submission = None
+        if cloud_binding is not None:
+            submission = store.queue_projection_submission(
+                result.projection["projection_id"], binding_digest=cloud_binding["binding_digest"],
+            )
     except Exception:
         print(_SAFE_RUNNER_LIVE_FAILURE, file=sys.stderr)
         return 2
-    print(json.dumps({
+    output = {
         "manifest_digest": result.manifest["manifest_digest"],
         "projection_digest": result.projection["projection_digest"],
         "scenario_ids": [item["scenario_id"] for item in result.manifest["scenarios"]],
-    }, sort_keys=True))
+    }
+    if submission is not None:
+        output["submission"] = {"state": submission["state"], "projection_id": submission["projection_id"]}
+    print(json.dumps(output, sort_keys=True))
     return 0
 
 

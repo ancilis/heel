@@ -332,6 +332,23 @@ def _delete_signer_seed(backend: OSSecretBackend, label: str) -> None:
     raise RuntimeError("runner signing key cannot be removed")
 
 
+def _projection_submission_view(store: RunnerStore) -> dict[str, Any] | None:
+    """Safe identifiers of the queued/submitted plan: no binding, route, fixture or credential data."""
+    if not store.is_context_bound:
+        return None
+    try:
+        record = store.load_projection_submission()
+    except (RunnerStoreError, ValueError, OSError):
+        return {"state": "unavailable", "reason": "local_state_invalid"}
+    if record is None:
+        return None
+    view = {key: record[key] for key in (
+        "state", "projection_id", "projection_digest", "approval_id", "run_id", "status")}
+    if record["reason"] is not None:
+        view["reason"] = record["reason"]
+    return view
+
+
 def self_serve_access(store: RunnerStore) -> dict[str, Any]:
     """Report whether both plan roles carry operator plan labels (labels only, never handles)."""
     records: list[dict[str, Any]] = []
@@ -504,6 +521,13 @@ class _ServeCoordinator:
             bound = self._coordinator.ensure_runner_context()
             self._on_contact()
             return bound
+        finally:
+            self._leave()
+
+    def submit_pending_projection(self):
+        self._enter()
+        try:
+            return self._coordinator.submit_pending_projection()
         finally:
             self._leave()
 
@@ -1161,6 +1185,9 @@ class RunnerDaemon:
             result["access"] = self_serve_access(store)
         except (RunnerStoreError, ValueError):
             result["access"] = {"state": "access.incomplete", "reason": "local_state_invalid"}
+        submission = _projection_submission_view(store)
+        if submission is not None:
+            result["projection_submission"] = submission
         probe: int | None = None
         try:
             try:

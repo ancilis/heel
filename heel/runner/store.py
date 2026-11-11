@@ -346,6 +346,47 @@ def _digest(value: object, label: str) -> str:
     return value
 
 
+_PROJECTION_SUBMISSION_FILE = "projection-submission.json"
+_PROJECTION_SUBMISSION_SCHEMA = "heel.runner-projection-submission.v1"
+_PROJECTION_SUBMISSION_FIELDS = frozenset({
+    "state", "projection_id", "projection_digest", "manifest_digest", "binding_digest",
+    "approval_id", "run_id", "status", "reason",
+})
+_PROJECTION_SUBMISSION_STATUSES = frozenset({"awaiting_execution_approval", "approved", "cancelled", "expired"})
+_PROJECTION_SUBMISSION_REASONS = frozenset({"context_changed", "projection_unavailable"})
+_CANARY_RUN_ID = re.compile(r"crun_[0-9a-f]{32}")
+
+
+def _projection_submission_record(value: object) -> dict[str, Any]:
+    """Closed record: pending → submitted (exact Cloud identifiers) or refused (fixed reason)."""
+    try:
+        if not isinstance(value, Mapping) or set(value) != _PROJECTION_SUBMISSION_FIELDS:
+            raise ValueError
+        record = dict(value)
+        _id(record["projection_id"], "projection ID")
+        for field in ("projection_digest", "manifest_digest", "binding_digest"):
+            _digest(record[field], field)
+        late = (record["approval_id"], record["run_id"], record["status"], record["reason"])
+        if record["state"] == "pending":
+            if late != (None, None, None, None):
+                raise ValueError
+        elif record["state"] == "submitted":
+            if (
+                record["approval_id"] != record["projection_id"]
+                or type(record["run_id"]) is not str or _CANARY_RUN_ID.fullmatch(record["run_id"]) is None
+                or record["status"] not in _PROJECTION_SUBMISSION_STATUSES or record["reason"] is not None
+            ):
+                raise ValueError
+        elif record["state"] == "refused":
+            if late[:3] != (None, None, None) or record["reason"] not in _PROJECTION_SUBMISSION_REASONS:
+                raise ValueError
+        else:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise RunnerStoreError("invalid projection submission record") from None
+    return record
+
+
 def _label(value: object) -> str:
     if type(value) is not str:
         raise ValueError("credential label must be text")
@@ -7403,6 +7444,58 @@ class RunnerStore:
         manifest = self.load_manifest(projection["manifest_digest"])
         self._assert_contract_context(manifest, projection)
         return manifest, projection
+
+    # One queued approval submission per bound context. ``runner prepare --live`` only queues;
+    # the serve owner (sole holder of the signed claim chain) submits and settles it.
+    def queue_projection_submission(self, projection_id: str, *, binding_digest: str) -> dict[str, Any]:
+        """Queue one saved Cloud-context projection; a newer queue replaces an unsent one."""
+        manifest, projection = self.load_approved_pair(projection_id)
+        binding_digest = _digest(binding_digest, "context binding digest")
+        if self.load_cloud_context_binding()["binding_digest"] != binding_digest:
+            raise RunnerStoreError("cloud context binding changed")
+        record = _projection_submission_record({
+            "state": "pending", "projection_id": projection["projection_id"],
+            "projection_digest": projection["projection_digest"],
+            "manifest_digest": manifest["manifest_digest"], "binding_digest": binding_digest,
+            "approval_id": None, "run_id": None, "status": None, "reason": None,
+        })
+        with self._transaction(exclusive=True) as context_fd:
+            _write_json(context_fd, _PROJECTION_SUBMISSION_FILE, self._envelope(
+                context_fd, _PROJECTION_SUBMISSION_SCHEMA, "submission", record,
+            ))
+        return record
+
+    def _projection_submission_locked(self, context_fd: int) -> dict[str, Any] | None:
+        value = _read_json(context_fd, _PROJECTION_SUBMISSION_FILE, None)
+        if value is None:
+            return None
+        return _projection_submission_record(self._validate_envelope(
+            context_fd, value, schema=_PROJECTION_SUBMISSION_SCHEMA, payload_field="submission",
+        ))
+
+    def load_projection_submission(self) -> dict[str, Any] | None:
+        with self._transaction(exclusive=False) as context_fd:
+            return self._projection_submission_locked(context_fd)
+
+    def settle_projection_submission(
+        self, pending: Mapping[str, Any], *, state: str, approval_id: str | None = None,
+        run_id: str | None = None, status: str | None = None, reason: str | None = None,
+    ) -> bool:
+        """Compare-and-set: settle only the exact pending record; False when a newer one replaced it."""
+        expected = _projection_submission_record(pending)
+        if expected["state"] != "pending" or state == "pending":
+            raise RunnerStoreError("only a pending projection submission settles")
+        settled = _projection_submission_record({
+            **expected, "state": state, "approval_id": approval_id, "run_id": run_id,
+            "status": status, "reason": reason,
+        })
+        with self._transaction(exclusive=True) as context_fd:
+            if self._projection_submission_locked(context_fd) != expected:
+                return False
+            _write_json(context_fd, _PROJECTION_SUBMISSION_FILE, self._envelope(
+                context_fd, _PROJECTION_SUBMISSION_SCHEMA, "submission", settled,
+            ))
+        return True
 
     @staticmethod
     def _run_hash(run_id: str) -> str:

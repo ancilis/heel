@@ -80,6 +80,8 @@ _ENVIRONMENT_CHECK = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/environ
 _ENVIRONMENT_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/environments/env_[0-9a-f]{{32}}/revoke$")
 _RUNNER_CONTEXT_BINDINGS = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/runner-context-bindings$")
 _RUNNER_CONTEXT_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/runner-context-bindings/rcb_[0-9a-f]{{32}}/revoke$")
+# ``index.ts`` CANARY_APPROVAL_REQUESTS_ROUTE (GET only): the dashboard's approval queue read.
+_CANARY_APPROVAL_REQUESTS = re.compile(rf"^/v1/workspaces/{_WS}/projects/{_PRJ}/canary-approval-requests$")
 _RUNNER_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
                    "X-Heel-Runner-Nonce", "X-Heel-Runner-Sequence", "X-Heel-Runner-Signature")
 _RUNNER_RESYNC_HEADERS = ("X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms",
@@ -98,9 +100,11 @@ class _EdgeRefusal(Exception):
 
 
 def _human_owner_route(method: str, path: str) -> bool:
-    """``isHumanCanaryRoute`` (context bindings only) or ``isHumanEnvironmentRoute``."""
+    """``isHumanCanaryRoute`` (context bindings, approval queue) or ``isHumanEnvironmentRoute``."""
     if _RUNNER_CONTEXT_BINDINGS.match(path) or _ENVIRONMENTS.match(path):
         return method in {"GET", "POST"}
+    if _CANARY_APPROVAL_REQUESTS.match(path):
+        return method == "GET"
     return method == "POST" and bool(
         _RUNNER_CONTEXT_REVOKE.match(path) or _ENVIRONMENT_CHECK.match(path) or _ENVIRONMENT_REVOKE.match(path)
     )
