@@ -40,7 +40,7 @@ const runnerBase = `/v1/workspaces/${workspace}/runners/${runner}`;
 type Family = { name: string; path: string; headers: Record<string, string>; cap: number };
 
 // One entry per accepted machine-route spelling: exchange, pairing activate/activation-abort,
-// rotation public, RUNNER_CONTROL, RUNNER_CONTEXT_CONTROL, RUNNER_RESULT_PROJECTION,
+// rotation public, RUNNER_CONTROL, RUNNER_CONTEXT_CONTROL, RUNNER_RESULT_PROJECTION, RUNNER_DISCLOSURE_POLL,
 // RUNNER_RESYNC and RUNNER_INACTIVE_CLAIM_ATTESTATION.
 const MACHINE_ROUTES: Family[] = [
   { name: "pairing exchange", path: "/v1/runner-pairings/exchange", headers: {}, cap: 16 * 1024 },
@@ -58,6 +58,7 @@ const MACHINE_ROUTES: Family[] = [
   { name: "context claim", path: `${runnerBase}/contexts/${binding}/claim`, headers: runnerProof, cap: 256 },
   { name: "context approval-projections", path: `${runnerBase}/contexts/${binding}/approval-projections`, headers: runnerProof, cap: 69632 },
   { name: "result projection", path: `${runnerBase}/runs/${run}/result-projection`, headers: runnerProof, cap: 272 * 1024 },
+  { name: "disclosure poll", path: `${runnerBase}/runs/${run}/disclosure-poll`, headers: runnerProof, cap: 2 * 1024 },
   { name: "resync start", path: `${runnerBase}/resync/start`, headers: resyncProof, cap: 2 * 1024 },
   { name: "resync complete", path: `${runnerBase}/resync/complete`, headers: resyncProof, cap: 2 * 1024 },
   { name: "inactive-claim attestation", path: `${runnerBase}/runs/${run}/inactive-claim-attestation`, headers: resyncProof, cap: 2 * 1024 },

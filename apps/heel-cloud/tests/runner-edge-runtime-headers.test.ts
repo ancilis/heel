@@ -51,6 +51,7 @@ const FRAMES: Array<{ name: string; path: string; body: string; cap: number }> =
   { name: "progress", path: `${runnerBase}/runs/${run}/progress`, body: "{}", cap: 36 * 1024 },
   { name: "result", path: `${runnerBase}/runs/${run}/result`, body: "{}", cap: 36 * 1024 },
   { name: "result projection", path: `${runnerBase}/runs/${run}/result-projection`, body: "{}", cap: 272 * 1024 },
+  { name: "disclosure poll", path: `${runnerBase}/runs/${run}/disclosure-poll`, body: "{}", cap: 2 * 1024 },
 ];
 
 type GetAll = (name: string) => string[];

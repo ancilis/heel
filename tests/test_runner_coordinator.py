@@ -3559,3 +3559,348 @@ def test_tls_edge_recovery_uses_the_production_transport_and_archives_the_edge_w
         assert set(seen["hosts"]) <= {"localhost", "127.0.0.1"} and seen["forbidden"] == []  # client and edge hop
     finally:
         cloud.close()
+
+
+# --------------------------------------------------------------------------- H2 result handoff
+#
+# Accepted result-handoff design (2026-11-11 §3.3/§3.5): while ``heel runner serve`` is idle the
+# runner polls ``POST …/runs/{run}/disclosure-poll`` on the run's result chain with metadata
+# only (digest, bytes, counts of the local findings projection), uploads the exact local
+# projection once through the existing permit-verified ``upload_findings`` when the poll answers
+# a human-issued permit, and stops polling on ``local_only``/``synchronized``.  Contract names
+# used below: ``RunnerCoordinator.advance_disclosures()`` (one bounded serve step),
+# ``RunnerControlClient.poll_disclosure(run_id=…, findings_projection=…)`` (staged
+# ``poll-disclosure`` call on the result chain), and the ``advance_disclosures`` serve hook.
+
+import contextlib  # noqa: E402
+
+_STATE_SCHEMA = "heel.canary-disclosure-state.v1"
+_POLL_SCHEMA = "heel.runner-disclosure-poll.v1"
+_TEN_MINUTES_MS = 10 * 60 * 1000
+
+
+def _handoff_coordinator(tmp_path, tail, *, now=None):
+    """A real-executor terminal run in runtime state ``available`` and its local findings.
+
+    ``tail(grant, findings, authority, coordinator)`` returns the scripted control answers
+    after the claim and terminal result.  ``now`` (a one-item list) drives both clocks.
+    """
+    clock = now if now is not None else [2_000]
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    holder: dict = {}
+    transport = ScriptedControlTransport([
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+            grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+        )),
+    ])
+    runtime = _control_runtime(tmp_path / "runtime.sqlite3", identity, signer)
+
+    def build(runtime_state, nonce_byte=b"c"):
+        client = RunnerControlClient(
+            origin="https://control.example", workspace_id=identity.workspace_id,
+            runner_id=identity.runner_id, signer=signer, clock=lambda: clock[0],
+            transport=transport, nonce_source=lambda _key: _nonce(nonce_byte),
+            trusted_disclosure_keys={authority.key_id: authority.public_key},
+            runtime=runtime_state,
+        )
+        coordinator = RunnerCoordinator(
+            control=client, store=store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key},
+            clock_ms=lambda: clock[0], monotonic=lambda: 1.0,
+        )
+        return coordinator, client
+
+    coordinator, client = build(runtime)
+    lease = coordinator.claim()
+    assert lease is not None
+    completed = LocalCanaryExecutor(
+        store=coordinator.store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate)
+    coordinator.result(grant["run_id"], completed.operational_projection)
+    assert client.runtime.load_terminal_state(grant["run_id"]).state == "available"
+    findings = coordinator.store.load_final_projections(grant["run_id"])["local_view"][
+        "findings_projection"
+    ]
+    transport.responses.extend(tail(grant, findings, authority, coordinator, holder))
+    return SimpleNamespace(
+        coordinator=coordinator, client=client, transport=transport, grant=grant,
+        findings=findings, authority=authority, clock=clock, build=build, holder=holder,
+    )
+
+
+def _handoff_counts(findings):
+    return {
+        "scenario_count": len(findings["scenario_results"]),
+        "finding_count": sum(
+            item["finding"] is not None for item in findings["scenario_results"]
+        ),
+    }
+
+
+def _handoff_poll_body(grant, findings):
+    return canonical_bytes({
+        "schema_version": _POLL_SCHEMA,
+        "run_id": grant["run_id"],
+        "projection": {
+            "schema_version": findings["schema_version"],
+            "projection_digest": findings["projection_digest"],
+            "byte_count": len(canonical_bytes(findings)),
+            **_handoff_counts(findings),
+        },
+    })
+
+
+def _handoff_permit(authority, coordinator, grant, findings, **overrides):
+    return _permit(
+        authority, coordinator, grant, findings, **{**_handoff_counts(findings), **overrides},
+    )
+
+
+def _handoff_receipt(grant, findings, permit):
+    return {
+        "schema_version": "heel.canary-findings-receipt.v1",
+        "receipt_id": "cfr_runner_handoff",
+        "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+        "permit_id": permit["permit_id"], "projection_id": findings["projection_id"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)),
+        **_handoff_counts(findings),
+        "accepted_at_ms": 2_001, "status": "synchronized",
+    }
+
+
+def _handoff_state(grant, status):
+    return {"schema_version": _STATE_SCHEMA, "run_id": grant["run_id"], "status": status}
+
+
+def _paths(transport, start=0):
+    return [path.rsplit("/", 1)[-1] for path, _headers, _body in transport.requests[start:]]
+
+
+def test_serve_poll_uploads_once_on_permit_and_marks_the_terminal_disclosure_consumed(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")},
+             _handoff_receipt(grant, findings, permit)),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    poll_path, poll_headers, poll_body = h.transport.requests[start]
+    assert poll_path == (
+        f"/v1/workspaces/{h.grant['workspace_id']}/runners/{h.coordinator.identity.runner_id}"
+        f"/runs/{h.grant['run_id']}/disclosure-poll"
+    )
+    assert poll_body == _handoff_poll_body(h.grant, h.findings)
+    assert len(poll_body) <= 2048 and b"scenario_results" not in poll_body
+    assert b"local_evidence_refs" not in poll_body
+    assert poll_headers["X-Heel-Runner-Nonce"] == _nonce(b"x")
+    assert poll_headers["X-Heel-Runner-Sequence"] == "7"
+    _upload_path, upload_headers, upload_body = h.transport.requests[start + 1]
+    assert upload_headers["X-Heel-Runner-Nonce"] == _nonce(b"p")
+    assert upload_headers["X-Heel-Runner-Sequence"] == "8"
+    assert upload_body == canonical_bytes({
+        "schema_version": "heel.runner-findings-upload.v1",
+        "run_id": h.grant["run_id"], "permit": h.holder["permit"],
+        "findings_projection": h.findings,
+    })
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == "consumed"
+    assert state.permit_id == h.holder["permit"]["permit_id"]
+    assert state.findings_projection_digest == h.findings["projection_digest"]
+    assert h.client.runtime.load_pending_calls() == ()
+
+    # Consumed is terminal for the serve step: no further poll, no second upload.
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+
+
+def test_serve_poll_keeps_polling_on_the_advancing_result_chain_while_awaiting_a_decision(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")},
+             _handoff_state(grant, "local_result_ready")),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")},
+             _handoff_state(grant, "awaiting_disclosure_approval")),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    h.coordinator.advance_disclosures()
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
+    first, second = h.transport.requests[start:start + 2]
+    assert first[2] == second[2] == _handoff_poll_body(h.grant, h.findings)
+    assert (first[1]["X-Heel-Runner-Nonce"], first[1]["X-Heel-Runner-Sequence"]) == (_nonce(b"x"), "7")
+    assert (second[1]["X-Heel-Runner-Nonce"], second[1]["X-Heel-Runner-Sequence"]) == (_nonce(b"p"), "8")
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    assert h.client.runtime.load_pending_calls() == ()
+
+
+@pytest.mark.parametrize("status", ["local_only", "synchronized"])
+def test_serve_poll_stops_after_local_only_or_synchronized(tmp_path, status):
+    def tail(grant, findings, authority, coordinator, holder):
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, _handoff_state(grant, status))]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+
+    for _ in range(3):
+        h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    # No receipt is ever fabricated for a run whose bytes were not uploaded by this runner.
+    assert state is None or state.receipt_digest is None or status == "synchronized"
+    if status == "local_only":
+        assert state is None or state.state != "consumed"
+
+
+def test_staged_disclosure_poll_replays_without_a_second_registration_or_upload(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            # The first answer is lost (unreadable), leaving the sealed poll staged.
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, {"malformed": True}),
+            # Restart replays the exact sealed poll; the server answers the same state.
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")},
+             _handoff_state(grant, "awaiting_disclosure_approval")),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")},
+             _handoff_receipt(grant, findings, permit)),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    with contextlib.suppress(ValueError):
+        h.coordinator.advance_disclosures()
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    assert pending.chain_operation == "result" and pending.run_id == h.grant["run_id"]
+    sealed_path, sealed_headers, sealed_body = h.transport.requests[-1]
+
+    restarted, restarted_client = h.build(h.client.runtime, nonce_byte=b"z")
+    replay_path, replay_headers, replay_body = h.transport.requests[-1]
+    assert (replay_path, replay_body) == (sealed_path, sealed_body)
+    assert replay_headers == sealed_headers
+    assert restarted_client.runtime.load_pending_calls() == ()
+    assert "result-projection" not in _paths(h.transport, start)
+
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start) == [
+        "disclosure-poll", "disclosure-poll", "disclosure-poll", "result-projection",
+    ]
+    assert h.transport.requests[-2][1]["X-Heel-Runner-Nonce"] == _nonce(b"p")
+    assert restarted_client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start).count("result-projection") == 1
+
+
+@pytest.mark.parametrize("kind", ["other-run", "other-workspace", "expired", "wrong-key", "wrong-counts", "wrong-digest"])
+def test_permit_for_another_run_workspace_or_expired_is_refused_locally_before_any_bytes_are_sent(tmp_path, kind):
+    def tail(grant, findings, authority, coordinator, holder):
+        if kind == "other-run":
+            permit = _handoff_permit(authority, coordinator, {**grant, "run_id": "crun_" + "b" * 32}, findings)
+        elif kind == "other-workspace":
+            permit = _handoff_permit(authority, coordinator, {**grant, "workspace_id": "ws_other_123456"}, findings)
+        elif kind == "expired":
+            permit = _handoff_permit(authority, coordinator, grant, findings, issued_at_ms=1_000, expires_at_ms=2_000)
+        elif kind == "wrong-key":
+            permit = _handoff_permit(SigningAuthority.generate(), coordinator, grant, findings)
+        elif kind == "wrong-counts":
+            permit = _handoff_permit(authority, coordinator, grant, findings, finding_count=1)
+        else:
+            other = copy.deepcopy(findings)
+            other["projection_digest"] = "f" * 64
+            permit = _handoff_permit(authority, coordinator, grant, other)
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, permit)]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    with contextlib.suppress(ValueError):
+        h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+    assert all(b"scenario_results" not in body for _p, _h, body in h.transport.requests[start:])
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    assert all(
+        item.request_operation != "upload-findings"
+        for item in h.client.runtime.load_pending_calls()
+    )
+
+
+def test_serve_poll_backs_off_to_sixty_seconds_after_ten_minutes_and_stops_at_retention_expiry(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": bytes_nonce}, _handoff_state(grant, "awaiting_disclosure_approval"))
+            for bytes_nonce in (_nonce(b"1"), _nonce(b"2"), _nonce(b"3"), _nonce(b"4"), _nonce(b"5"))
+        ]
+
+    now = [2_000]
+    h = _handoff_coordinator(tmp_path, tail, now=now)
+    terminal_at = h.client.runtime.load_terminal_state(h.grant["run_id"]).terminal_at_ms
+    retention = h.client.runtime.load_terminal_state(h.grant["run_id"]).retention_expires_at_ms
+    start = len(h.transport.requests)
+
+    # Within ten minutes of terminal every idle step (the service paces steps at 2 s) polls.
+    now[0] = terminal_at + 2_000
+    h.coordinator.advance_disclosures()
+    now[0] = terminal_at + 4_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 2
+
+    # After ten minutes, at most one poll per 60 s.
+    now[0] = terminal_at + _TEN_MINUTES_MS + 1
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 3
+    now[0] += 2_000
+    h.coordinator.advance_disclosures()
+    now[0] += 30_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 3
+    now[0] += 30_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 4
+
+    # At retention expiry polling stops for good.
+    now[0] = retention
+    h.coordinator.advance_disclosures()
+    now[0] = retention + 120_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 4
+
+
+def test_runner_service_advances_disclosures_on_each_idle_poll_and_serve_owner_gates_it():
+    from heel.runner.daemon import RunnerServeError, _ServeCoordinator
+
+    calls = []
+    coordinator = SimpleNamespace(
+        claim=lambda: None, advance_disclosures=lambda: calls.append("advance"),
+    )
+    service = RunnerService(coordinator=coordinator, executor=object(), idle_poll_interval=2.0)
+    assert service.run_once() is False
+    assert service.run_once() is False
+    assert calls == ["advance", "advance"]
+
+    inner = SimpleNamespace(advance_disclosures=lambda: calls.append("owned"))
+    owner = _ServeCoordinator(inner, lambda: None)
+    owner.advance_disclosures()
+    assert calls[-1] == "owned"
+    owner.close()
+    with pytest.raises(RunnerServeError):
+        owner.advance_disclosures()

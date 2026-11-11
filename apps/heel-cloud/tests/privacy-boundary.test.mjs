@@ -2568,6 +2568,26 @@ test("the edge keeps canary human and runner-result authorities on exact route a
 });
 
 
+test("the edge keeps the result-handoff poll and disclosure read on exact route and header families", async () => {
+  const worker = await source("worker/index.ts");
+  for (const fragment of [
+    "const CANARY_DISCLOSURE_ROUTE = new RegExp(",
+    "const RUNNER_DISCLOSURE_POLL = new RegExp(",
+    "const MAX_RUNNER_DISCLOSURE_POLL_BODY_BYTES = 2 * 1024;",
+    "if (CANARY_DISCLOSURE_ROUTE.test(upstreamPath)) return method === \"GET\";",
+  ]) assert.equal(worker.split(fragment).length - 1, 1, `missing exact ${fragment}`);
+  const read = worker.match(/const CANARY_DISCLOSURE_ROUTE = new RegExp\(\s*`([^`]+)`/);
+  const poll = worker.match(/const RUNNER_DISCLOSURE_POLL = new RegExp\(\s*`([^`]+)`/);
+  assert.ok(read && poll, "both route expressions are template literals");
+  assert.equal(read[1], "^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/disclosure$");
+  assert.equal(poll[1], "^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/disclosure-poll$");
+  // The runner poll joins the runner-proof family on every list that admits a runner route.
+  for (const line of worker.split("\n").filter((text) => text.includes("RUNNER_RESULT_PROJECTION.test(upstreamPath)"))) {
+    assert.ok(line.includes("RUNNER_DISCLOSURE_POLL.test(upstreamPath)"), `poll missing beside result projection: ${line.trim()}`);
+  }
+});
+
+
 test("the privacy analyzer pins the browser client to the same-origin closed control plane", async () => {
   const client = await source("lib/heel-cloud-api.ts");
   assert.deepEqual(analyzeSource(join(appRootPath, "lib/heel-cloud-api.ts"), client), []);
