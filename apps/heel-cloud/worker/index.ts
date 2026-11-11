@@ -110,6 +110,9 @@ const CANARY_DISCLOSURE_PERMIT_ROUTE = new RegExp(
 const CANARY_DISCLOSURE_LOCAL_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/disclosure-local-only$`,
 );
+const CANARY_DISCLOSURE_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/disclosure$`,
+);
 const CANARY_FINDINGS_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/findings$`,
 );
@@ -139,6 +142,7 @@ const MAX_RUNNER_CONTEXT_CLAIM_BODY_BYTES = 256;
 const MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES = 69632;
 const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;
 const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;
+const MAX_RUNNER_DISCLOSURE_POLL_BODY_BYTES = 2 * 1024;
 const MAX_RUNNER_PAIRING_BODY_BYTES = 16 * 1024;
 const API_KEY_AUTHORIZATION = /^Bearer heel_sk_[A-Za-z0-9_-]+$/;
 const DEVICE_AUTHORIZATION = /^Bearer heel_at_[A-Za-z0-9_-]{43}$/;
@@ -158,6 +162,8 @@ const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
 const RUNNER_CONTEXT_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/contexts(?:/list|/${RUNNER_CONTEXT_REF}/(?:claim|approval-projections))$`);
 const RUNNER_RESULT_PROJECTION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/result-projection$`);
+// Metadata-only result-handoff poll on the run's result chain: runner-proof family, 2 KiB.
+const RUNNER_DISCLOSURE_POLL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/disclosure-poll$`);
 const RUNNER_RESYNC = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/resync/(?:start|complete)$`);
 // Side-effect-free and nonce-free: rides the resync proof header family, never a nonce chain.
 const RUNNER_INACTIVE_CLAIM_ATTESTATION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/inactive-claim-attestation$`);
@@ -175,6 +181,7 @@ function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
   if (CANARY_RUN_STOP_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_DISCLOSURE_PERMIT_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_DISCLOSURE_LOCAL_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_DISCLOSURE_ROUTE.test(upstreamPath)) return method === "GET";
   return CANARY_FINDINGS_ROUTE.test(upstreamPath) && method === "GET";
 }
 
@@ -273,7 +280,8 @@ function controlPlaneRequestHeaders(
   let headers: Headers;
   const runnerResultProjection = RUNNER_RESULT_PROJECTION.test(upstreamPath);
   const runnerContextControl = RUNNER_CONTEXT_CONTROL.test(upstreamPath);
-  const runnerControl = RUNNER_CONTROL.test(upstreamPath) || runnerContextControl || runnerResultProjection;
+  const runnerDisclosurePoll = RUNNER_DISCLOSURE_POLL.test(upstreamPath);
+  const runnerControl = RUNNER_CONTROL.test(upstreamPath) || runnerContextControl || runnerResultProjection || runnerDisclosurePoll;
   const runnerResync = RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
   const humanCanary = isHumanCanaryRoute(method, upstreamPath);
   const humanEnvironment = isHumanEnvironmentRoute(method, upstreamPath);
@@ -384,7 +392,7 @@ function controlPlaneRequestHeaders(
   const maximum = runnerControl
     ? runnerResultProjection
       ? MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES
-      : (upstreamPath.endsWith("/contexts/list") ? MAX_RUNNER_CONTEXT_LIST_BODY_BYTES
+      : runnerDisclosurePoll ? MAX_RUNNER_DISCLOSURE_POLL_BODY_BYTES : (upstreamPath.endsWith("/contexts/list") ? MAX_RUNNER_CONTEXT_LIST_BODY_BYTES
         : (runnerContextControl && upstreamPath.endsWith("/claim") ? MAX_RUNNER_CONTEXT_CLAIM_BODY_BYTES
           : (upstreamPath.endsWith("/approval-projections") ? MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES
             : (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES))))
@@ -437,7 +445,7 @@ function controlPlaneResponse(response: Response, csp: string, upstreamPath = ""
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  if (RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath)) {
+  if (RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_DISCLOSURE_POLL.test(upstreamPath)) {
     const nextNonce = response.headers.get("X-Heel-Runner-Next-Nonce");
     if (nextNonce !== null) {
       if (!RUNNER_NEXT_NONCE.test(nextNonce)) throw new Error("invalid runner nonce response");
@@ -488,7 +496,7 @@ function isRunnerMachineRoute(upstreamPath: string): boolean {
     || RUNNER_ROTATION_PUBLIC.test(upstreamPath)
     || RUNNER_CONTROL.test(upstreamPath)
     || RUNNER_CONTEXT_CONTROL.test(upstreamPath)
-    || RUNNER_RESULT_PROJECTION.test(upstreamPath)
+    || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_DISCLOSURE_POLL.test(upstreamPath)
     || RUNNER_RESYNC.test(upstreamPath)
     || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
 }
@@ -510,7 +518,7 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "POST") return upstreamPath;
-  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_DISCLOSURE_POLL.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;

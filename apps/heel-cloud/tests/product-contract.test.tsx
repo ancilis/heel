@@ -160,11 +160,11 @@ const STALE_GITHUB_CLAIMS =
 const STALE_RC2_CLAIMS =
   /unpublished 1\.3\.0rc2|1\.3\.0rc2[^.]*(\.[^.]*)?not yet published as a GitHub release|no public 1\.3\.0rc2 download|one-command public install[^.]*later work/i;
 const PREVIOUS_RELEASE_DOWNLOAD = /releases\/download\/v1\.3\.0rc1/i;
-// The checked-in 1.3.0rc3 candidate is not yet published: copy may offer its same-origin files only
+// The checked-in 1.3.0rc4 candidate is not yet published: copy may offer its same-origin files only
 // with that label, and never as a GitHub release.
-const CANDIDATE_VERSION = "1.3.0rc3";
-const CANDIDATE_LABEL = /1\.3\.0rc3 candidate[^.]*not yet published/;
-const CANDIDATE_RELEASE_CLAIMS = /releases\/(tag|download)\/v1\.3\.0rc3/;
+const CANDIDATE_VERSION = "1.3.0rc4";
+const CANDIDATE_LABEL = /1\.3\.0rc4 candidate[^.]*not yet published/;
+const CANDIDATE_RELEASE_CLAIMS = /releases\/(tag|download)\/v1\.3\.0rc4/;
 // The published rc2 manifest, kept byte for byte as the historical rc2 publisher fixture.
 const PUBLIC_MANIFEST = JSON.parse(readFileSync(
   resolve(process.cwd(), "../../tests/fixtures/runner_preview_rc2/artifacts/heel-open-core-manifest.json"),
@@ -255,11 +255,11 @@ describe("Heel anonymous launch review", () => {
   test("offers the verified Agent artifacts and exact local install command", () => {
     render(<McpQuickstart />);
 
-    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc3 candidate" });
-    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc3-py3-none-any.whl");
+    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc4 candidate" });
+    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc4-py3-none-any.whl");
     expect(wheel.hasAttribute("download")).toBe(true);
     const source = screen.getByRole("link", { name: /download source archive/i });
-    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc3.tar.gz");
+    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc4.tar.gz");
     expect(source.hasAttribute("download")).toBe(true);
 
     const manifest = JSON.parse(readFileSync(
@@ -272,11 +272,11 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).toContain(wheelArtifact?.sha256);
     expect(document.body.textContent).toContain("python3 -m venv heel-rc2\n");
     expect(document.body.textContent).toContain(
-      "./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc3-py3-none-any.whl",
+      "./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl",
     );
     expect(RUNBOOK_INSTALL).toBe(PUBLIC_INSTALL);
     expect(document.body.textContent).toContain(PUBLIC_INSTALL);
-    // The bundled wheel is the unpublished 1.3.0rc3 candidate, not the public release's wheel: the
+    // The bundled wheel is the unpublished 1.3.0rc4 candidate, not the public release's wheel: the
     // public command keeps the published rc2 digest and the bundled files carry the candidate label.
     expect(PUBLIC_MANIFEST.version).toBe(PUBLIC_RELEASE.split("/v").pop());
     expect(manifest.version).not.toBe(PUBLIC_MANIFEST.version);

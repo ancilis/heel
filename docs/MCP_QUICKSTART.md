@@ -42,17 +42,17 @@ passed regressions; read those rc1 results as inconclusive. 1.3.0rc2 reports bot
 inconclusive with regression_passed=false (see the [export reference](EXPORT_DEMO.md)).
 
 A Heel Cloud build from this repository also bundles Agent files on its own origin:
-`heel_sim-1.3.0rc3-py3-none-any.whl`, `heel_sim-1.3.0rc3.tar.gz`, and
+`heel_sim-1.3.0rc4-py3-none-any.whl`, `heel_sim-1.3.0rc4.tar.gz`, and
 `heel-open-core-manifest.json`. They are that build's artifacts, not a separate verified public
-release: in this repository they are the 1.3.0rc3 candidate, which is not yet published as a public
+release: in this repository they are the 1.3.0rc4 candidate, which is not yet published as a public
 release, and public customer access to them still depends on the approved deployment. The public
 command above is the recommended install. If you did download the wheel from a deployment's `/agent`
-page (`/downloads/heel_sim-1.3.0rc3-py3-none-any.whl`), run this in the directory where you saved it
+page (`/downloads/heel_sim-1.3.0rc4-py3-none-any.whl`), run this in the directory where you saved it
 and use `.venv` in place of `heel-rc2` below:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.3.0rc3-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl
 ```
 
 `heel-sim` is not yet published to PyPI, and the current public repository export is a release-owner

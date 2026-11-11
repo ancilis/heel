@@ -18,8 +18,10 @@ import time
 from typing import Callable, Iterator
 
 from heel.canary_contracts import (
+    CANARY_DISCLOSURE_STATE_SCHEMA,
     CANARY_FINDINGS_SCHEMA,
     DISCLOSURE_PERMIT_SCHEMA,
+    DISCLOSURE_POLL_STATES,
     canonical_bytes,
     canonical_digest,
     validate_approval_projection,
@@ -27,6 +29,7 @@ from heel.canary_contracts import (
     validate_disclosure_permit,
     validate_execution_grant,
     validate_operational_run,
+    validate_runner_disclosure_poll_request,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 
@@ -513,6 +516,10 @@ class CanaryDisclosureService:
             return None
         if row["status"] != "permitted" or row["approved_by"] != actor:
             raise CanaryDisclosureError("canary_state_conflict")
+        return self._verified_permit(row)
+
+    def _verified_permit(self, row: sqlite3.Row) -> dict:
+        """Return the stored permit exactly as minted, after re-verifying its authority."""
         try:
             value = validate_disclosure_permit(json.loads(row["permit_json"]))
             self._verify_permit_signature(value)
@@ -1038,6 +1045,101 @@ class CanaryDisclosureService:
                 },
             )
             return receipt
+
+    @staticmethod
+    def _state_response(run_id: str, status: str) -> dict[str, object]:
+        return {
+            "schema_version": CANARY_DISCLOSURE_STATE_SCHEMA,
+            "run_id": run_id,
+            "status": status,
+        }
+
+    def poll(
+        self,
+        workspace_id: str,
+        project_ref: str,
+        run_id: str,
+        runner_id: str,
+        request: object,
+        *,
+        runner_key_id: str,
+    ) -> dict:
+        """Metadata-only runner poll (result-handoff §3.3), inside the caller's PoP transaction.
+
+        Registers exactly what ``preview`` registers (idempotent, conflicting metadata refused)
+        and answers either the closed disclosure state or the stored, byte-identical permit a
+        human issued. It never receives or returns findings bytes and mints no authority.
+        """
+        try:
+            request = validate_runner_disclosure_poll_request(request)
+        except (TypeError, ValueError):
+            raise CanaryDisclosureError("invalid_canary_projection") from None
+        run_id = _identifier(run_id)
+        if request["run_id"] != run_id:
+            raise CanaryDisclosureError("invalid_canary_projection")
+        projection = request["projection"]
+        with self._write():
+            registered = self.preview(
+                workspace_id,
+                project_ref,
+                run_id,
+                runner_id=runner_id,
+                runner_key_id=runner_key_id,
+                projection_schema_version=projection["schema_version"],
+                projection_digest=projection["projection_digest"],
+                byte_count=projection["byte_count"],
+                scenario_count=projection["scenario_count"],
+                finding_count=projection["finding_count"],
+            )
+            row = self.conn.execute(
+                "SELECT * FROM canary_disclosure_requests WHERE workspace_id=? "
+                "AND project_ref=? AND run_id=? AND request_id=?",
+                (workspace_id, project_ref, run_id, registered["request_id"]),
+            ).fetchone()
+            if row is None:
+                raise CanaryDisclosureError("canary_run_not_found")
+            if row["status"] == "permitted":
+                now = self._now_ms()
+                self._expire_unused_permits(row, now=now)
+                permit = self.conn.execute(
+                    "SELECT * FROM canary_disclosure_permits WHERE workspace_id=? "
+                    "AND project_ref=? AND request_id=? AND run_id=? AND status='permitted' "
+                    "AND expires_at>? ORDER BY issued_at DESC,permit_id DESC LIMIT 1",
+                    (workspace_id, project_ref, row["request_id"], run_id, now),
+                ).fetchone()
+                if permit is not None:
+                    return self._verified_permit(permit)
+                row = self.conn.execute(
+                    "SELECT * FROM canary_disclosure_requests WHERE request_id=?",
+                    (row["request_id"],),
+                ).fetchone()
+            if row["status"] not in DISCLOSURE_POLL_STATES:
+                raise CanaryDisclosureError("canary_state_conflict")
+            return self._state_response(run_id, row["status"])
+
+    def disclosure(self, workspace_id: str, project_ref: str, run_id: str) -> dict:
+        """Human ``view`` read of the registered metadata and status; never findings bytes.
+
+        Read-only: an elapsed permit is reported as the reopened choice without writing.
+        """
+        workspace_id = _identifier(workspace_id)
+        project_ref = _identifier(project_ref)
+        run_id = _identifier(run_id)
+        row = self.conn.execute(
+            "SELECT * FROM canary_disclosure_requests WHERE workspace_id=? "
+            "AND project_ref=? AND run_id=?",
+            (workspace_id, project_ref, run_id),
+        ).fetchone()
+        if row is None:
+            raise CanaryDisclosureError("canary_run_not_found")
+        response = self._preview_response(row)
+        if row["status"] == "permitted" and self.conn.execute(
+            "SELECT 1 FROM canary_disclosure_permits WHERE workspace_id=? AND project_ref=? "
+            "AND request_id=? AND run_id=? AND status='permitted' AND expires_at>? LIMIT 1",
+            (workspace_id, project_ref, row["request_id"], run_id, self._now_ms()),
+        ).fetchone() is None:
+            response["status"] = "awaiting_disclosure_approval"
+        return response
 
     def get(self, workspace_id: str, project_ref: str, run_id: str) -> dict:
         """Return only the tenant-bound exact synchronized projection while retained."""

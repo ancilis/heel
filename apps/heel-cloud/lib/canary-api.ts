@@ -72,6 +72,73 @@ export interface CanaryDisclosureMetadata {
   findingCount: number;
 }
 
+/** Every status a disclosure request row can hold (`canary_store.py` CHECK); nothing else is accepted. */
+export type CanaryDisclosureStatus =
+  | "local_result_ready" | "awaiting_disclosure_approval" | "permitted" | "synchronized" | "local_only" | "expired";
+
+/** The human `view` read of a run's disclosure: the runner-registered metadata and its status, never findings bytes. */
+export interface CanaryDisclosureState {
+  requestId: string;
+  runId: string;
+  status: CanaryDisclosureStatus;
+  projection: CanaryDisclosureMetadata;
+}
+
+export type CanaryAssessmentOutcome = "blocked" | "observed" | "inconclusive";
+
+export interface CanaryFindingObservation {
+  semantic_role: string;
+  status_code: number;
+  body_shape: string;
+  truncation_state: "complete" | "truncated";
+}
+
+export interface CanaryFinding {
+  title: string;
+  reachability_rationale: string;
+  confidence: "low" | "medium" | "high";
+  recommended_control: string;
+  regression_suggestion: string;
+}
+
+export interface CanaryScenarioResult {
+  ordinal: number;
+  scenario_id: string;
+  adapter_version: string;
+  assessment_outcome: CanaryAssessmentOutcome;
+  route: { method: "GET" | "HEAD"; route_template: string };
+  observations: readonly CanaryFindingObservation[];
+  finding: CanaryFinding | null;
+  containment_codes: readonly string[];
+  redaction_count: number;
+  local_evidence_refs: readonly string[];
+}
+
+/** The synchronized, runner-signed redacted projection exactly as `GET …/findings` returns it (validated below). */
+export interface CanaryFindingsProjection {
+  schema_version: "heel.canary-findings-projection.v1";
+  projection_id: string;
+  run_id: string;
+  grant_id: string;
+  workspace_id: string;
+  project_id: string;
+  environment_id: string;
+  manifest_digest: string;
+  approval_projection_digest: string;
+  grant_digest: string;
+  engine_version: string;
+  adapter_versions: readonly string[];
+  started_at_ms: number;
+  finished_at_ms: number;
+  assessment_outcome: CanaryAssessmentOutcome;
+  scenario_results: readonly CanaryScenarioResult[];
+  containment_codes: readonly string[];
+  redaction_count: number;
+  projection_digest: string;
+  signing_key_id: string;
+  signature_b64: string;
+}
+
 export interface CanaryApprovalSummary {
   approvalId: string;
   runId: string;
@@ -552,6 +619,35 @@ function validFindings(value: unknown, workspaceRef: string, projectRef: string,
   return totalObservations <= 20;
 }
 
+const DISCLOSURE_STATUSES: ReadonlySet<string> = new Set([
+  "local_result_ready", "awaiting_disclosure_approval", "permitted", "synchronized", "local_only", "expired",
+]);
+const DISCLOSURE_REQUEST_REF = /^cdr_[0-9a-f]{32}$/;
+
+function parseDisclosureState(value: unknown, runRef: string): CanaryDisclosureState {
+  if (!exact(value, ["schema_version", "request_id", "run_id", "status", "projection"])
+    || value.schema_version !== "heel.canary-disclosure-preview.v1"
+    || typeof value.request_id !== "string" || !DISCLOSURE_REQUEST_REF.test(value.request_id)
+    || value.run_id !== runRef || !DISCLOSURE_STATUSES.has(String(value.status))
+    || !exact(value.projection, ["schema_version", "projection_digest", "byte_count", "scenario_count", "finding_count"])
+    || value.projection.schema_version !== "heel.canary-findings-projection.v1"
+    || !digest(value.projection.projection_digest) || !integer(value.projection.byte_count, 1, 256 * 1024)
+    || !integer(value.projection.scenario_count, 0, 4)
+    || !integer(value.projection.finding_count, 0, value.projection.scenario_count as number)) invalidResponse();
+  const projection = value.projection as JsonRecord;
+  return deepFreeze({
+    requestId: value.request_id,
+    runId: runRef,
+    status: value.status as CanaryDisclosureStatus,
+    projection: {
+      projectionDigest: projection.projection_digest as string,
+      projectionBytes: projection.byte_count as number,
+      scenarioCount: projection.scenario_count as number,
+      findingCount: projection.finding_count as number,
+    },
+  });
+}
+
 function validApprovalScenario(value: unknown, index: number): value is JsonRecord {
   return exact(value, ["ordinal", "scenario_id", "adapter_version"])
     && value.ordinal === index && identifier(value.scenario_id) && identifier(value.adapter_version);
@@ -849,10 +945,15 @@ export class CanaryApi {
     return deepFreeze(value);
   }
 
-  async getFindings(workspaceRef: string, projectRef: string, runRef: string): Promise<Readonly<JsonRecord>> {
-    const value = await this.#json(runPath(workspaceRef, projectRef, runRef, "/findings"), "GET", undefined, 200);
+  /** The disclosure status and runner-registered metadata of one run; 404 `canary_run_not_found` until registered. */
+  async getDisclosure(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<CanaryDisclosureState> {
+    return parseDisclosureState(await this.#json(runPath(workspaceRef, projectRef, runRef, "/disclosure"), "GET", undefined, 200, {}, signal), runRef);
+  }
+
+  async getFindings(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<Readonly<CanaryFindingsProjection>> {
+    const value = await this.#json(runPath(workspaceRef, projectRef, runRef, "/findings"), "GET", undefined, 200, {}, signal);
     if (!validFindings(value, workspaceRef, projectRef, runRef)) invalidResponse();
-    return deepFreeze(value);
+    return deepFreeze(value as unknown as CanaryFindingsProjection);
   }
 
   async listEnvironments(workspaceRef: string, projectRef: string): Promise<readonly VerifiedEnvironmentRecord[]> {

@@ -7,13 +7,13 @@ runtime dependencies and does not require an account or network connection.
 
 ## Install the supplied release artifact
 
-Version 1.3.0rc3 is a runner preview release candidate, not yet published and not a stable release. Create an
+Version 1.3.0rc4 is a runner preview release candidate, not yet published and not a stable release. Create an
 isolated environment, then install the wheel supplied with this release:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./heel_sim-1.3.0rc3-py3-none-any.whl
+python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl
 heel --version
 ```
 
@@ -46,7 +46,7 @@ require Apple silicon; Intel macOS is not supported by this runner candidate.
 
 In the same shell, first set `HEEL_HOME` to an absolute physical path in which no component is a symbolic link, for example `export HEEL_HOME="$(pwd -P)/.heel"` from a private working directory; `pwd -P` prints that physical path and plain `$PWD` may not. Use that same physical `HEEL_HOME` from the first command for `heel scope create` and every `heel reference` command. On macOS, `/tmp` and `/var` are symbolic links to `/private/tmp` and `/private/var`. `heel scope create` does not check the storage path and can succeed with a `HEEL_HOME` built from a `$PWD` under `/tmp`, `/var` or `$TMPDIR`; that success does not show the path is safe. `heel reference run` opens the private runner and reference storage without following symbolic links, on purpose, and refuses that `HEEL_HOME` with the generic rejection message. Do not disable or work around that check.
 
-The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc3-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
+The supplied wheel supports `heel reference prepare` and `heel reference run`. Install the runner extra with `python -m pip install './heel_sim-1.3.0rc4-py3-none-any.whl[runner]'` (Python 3.11 or newer; it adds the pinned `cryptography` dependency). Then run `heel scope create --target reference:export --operator "your name" --confirm` outside MCP. Use its returned scope ID:
 
 ```sh
 heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111

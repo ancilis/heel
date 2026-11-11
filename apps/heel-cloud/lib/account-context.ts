@@ -6,6 +6,9 @@
  * Every identifier comes from the live control plane: the signed-in user and memberships from
  * `/v1/me`, projects from the workspace's project list. A requested selection (from the page
  * URL) is only a hint; it is honored only when the current server identity still lists it.
+ * The URL may also carry a third opaque ref, the run the dashboard is showing, so a reload restores a completed run
+ * without browser storage. That ref grants nothing either: it counts only for the exact workspace and project the
+ * server confirmed, and the page re-reads it through the tenant-scoped run status before showing anything.
  * Role helpers mirror `heel/saas/tenancy.py` for presentation only — the server remains the
  * authority and every action still handles its 403.
  */
@@ -21,16 +24,20 @@ import {
 
 const WORKSPACE_REF = /^ws_[0-9a-f]{16}$/;
 const PROJECT_REF = /^prj_[0-9a-f]{32}$/;
+const RUN_REF = /^crun_[0-9a-f]{32}$/;
 const PROJECT_WRITERS = new Set<HeelCloudWorkspace["role"]>(["owner", "admin", "member"]);
 const PROJECT_READERS = new Set<HeelCloudWorkspace["role"]>(["owner", "admin", "member", "viewer"]);
 const DEFAULT_ROLE_ORDER: readonly HeelCloudWorkspace["role"][] = ["owner", "admin", "member", "viewer", "billing"];
 
 export const WORKSPACE_PARAM = "workspace";
 export const PROJECT_PARAM = "project";
+export const RUN_PARAM = "run";
 
 export interface AccountSelection {
   workspaceRef?: string;
   projectRef?: string;
+  /** Only a hint for the confirmed workspace and project; never authority (see `confirmedRunRef`). */
+  runRef?: string;
 }
 
 export interface AccountWorkspaceView {
@@ -63,21 +70,35 @@ export function canListProjects(role: HeelCloudWorkspace["role"]): boolean {
 export function selectionFromParams(params: { get(name: string): string | null } | null): AccountSelection {
   const workspaceRef = params?.get(WORKSPACE_PARAM) ?? "";
   const projectRef = params?.get(PROJECT_PARAM) ?? "";
+  const runRef = params?.get(RUN_PARAM) ?? "";
+  const scoped = WORKSPACE_REF.test(workspaceRef) && PROJECT_REF.test(projectRef);
   return {
     ...(WORKSPACE_REF.test(workspaceRef) ? { workspaceRef } : {}),
-    ...(WORKSPACE_REF.test(workspaceRef) && PROJECT_REF.test(projectRef) ? { projectRef } : {}),
+    ...(scoped ? { projectRef } : {}),
+    ...(scoped && RUN_REF.test(runRef) ? { runRef } : {}),
   };
 }
 
 
-/** The exact query string for a selection; never carries anything but the two opaque refs. */
+/** The exact query string for a selection; never carries anything but the three opaque refs. */
 export function selectionQuery(selection: AccountSelection): string {
   if (selection.workspaceRef === undefined || !WORKSPACE_REF.test(selection.workspaceRef)) return "";
   const params = new URLSearchParams({ [WORKSPACE_PARAM]: selection.workspaceRef });
   if (selection.projectRef !== undefined && PROJECT_REF.test(selection.projectRef)) {
     params.set(PROJECT_PARAM, selection.projectRef);
+    if (selection.runRef !== undefined && RUN_REF.test(selection.runRef)) params.set(RUN_PARAM, selection.runRef);
   }
   return `?${params.toString()}`;
+}
+
+
+/**
+ * The requested run ref, only when the server-confirmed workspace and project are exactly the requested ones. A
+ * fallback to another workspace or project never inherits it. The caller still re-authorizes it with the run read.
+ */
+export function confirmedRunRef(requested: AccountSelection, workspaceRef: string, projectRef: string): string | null {
+  if (requested.runRef === undefined || !RUN_REF.test(requested.runRef)) return null;
+  return requested.workspaceRef === workspaceRef && requested.projectRef === projectRef ? requested.runRef : null;
 }
 
 

@@ -7,7 +7,7 @@ import Runner from "../app/runner/page";
 vi.mock("next/link", () => ({ default: ({ children, ...props }: React.ComponentProps<"a">) => <a {...props}>{children}</a> }));
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
-// The report shape the 1.3.0rc3 reference producer writes (heel/reference_rehearsal.py).
+// The report shape the 1.3.0rc4 reference producer writes (heel/reference_rehearsal.py).
 const PRODUCED = { execution_disposition: "completed", execution_support: "reference_only", provenance: { kind: "reference_product_execution", network_calls: false, manifest_digest: "0".repeat(64), run_id: "run_reference" } };
 
 for (const [result, expected, passed] of [["verified_violation", /reaching the lower-plan account/, false], ["invariant_held", /read regression passed/, true], ["inconclusive", /not a pass/, false]] as const) {

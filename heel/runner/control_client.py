@@ -15,7 +15,10 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
+    CANARY_DISCLOSURE_STATE_SCHEMA,
     INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES,
+    RUNNER_DISCLOSURE_POLL_MAX_BYTES,
+    RUNNER_DISCLOSURE_POLL_SCHEMA,
     RUNNER_INACTIVE_CLAIM_ATTESTATION_POP_DOMAIN,
     RUNNER_INACTIVE_CLAIM_ATTESTATION_PROOF_SCHEMA,
     RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_SCHEMA,
@@ -37,6 +40,8 @@ from heel.canary_contracts import (
     validate_runner_context_claim,
     validate_runner_approval_projection_submit,
     validate_runner_context_binding,
+    validate_canary_disclosure_state,
+    validate_runner_disclosure_poll_request,
 )
 from heel.crypto import ed25519_key_id, verify_envelope
 from heel.runner.runtime import (
@@ -96,6 +101,17 @@ class RunnerControlRecoveryError(RuntimeError):
 
     def __init__(self, message: str | None = None):
         super().__init__(message or self.code)
+
+
+class RunnerUploadDeferred(ValueError):
+    """A 502/503/504 answered a findings upload; the sealed upload stays staged unchanged.
+
+    Classified before the next-nonce header or any body is read.  Still a ``ValueError``, so
+    startup replay and every existing refusal path stay fail-closed exactly as before.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("invalid runner findings receipt")
 
 
 class RunnerAuthenticationRejected(RunnerControlRecoveryError):
@@ -240,7 +256,7 @@ _STOPS = {
 }
 _MAX_FINDINGS_UPLOAD_BYTES = 272 * 1024
 _CALL_DIAGNOSTIC_OPERATIONS = frozenset({
-    "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings",
+    "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings", "poll-disclosure",
     "list-contexts", "claim-context", "submit-context-approval-projection",
 })
 _MAX_CALL_DIAGNOSTICS = 128
@@ -766,6 +782,8 @@ class RunnerControlClient:
                 raise _ClaimChainAuthorityLost(runtime_pending)
             # Run chains are outside this phase's recovery (T4a): the staged call is kept.
             raise RunnerChainRecoveryRequired(operation)
+        if operation == "upload-findings" and status in {502, 503, 504}:
+            raise RunnerUploadDeferred()
         next_nonce = headers.get("X-Heel-Runner-Next-Nonce")
         if not self._b64_32(next_nonce):
             raise ValueError("invalid runner control response")
@@ -810,6 +828,10 @@ class RunnerControlClient:
                 or body["finding_count"] != finding_count
             ):
                 raise ValueError("invalid runner findings receipt")
+        elif operation == "poll-disclosure":
+            if status != 200 or run_id is None:
+                raise ValueError("invalid runner disclosure poll response")
+            body = self._decode_disclosure_poll(body, run_id)
         else:
             raise ValueError("invalid runner control operation")
 
@@ -862,6 +884,13 @@ class RunnerControlClient:
                         runtime_pending.call_id, next_nonce_b64=next_nonce,
                         now_ms=self._timestamp(),
                     )
+                elif operation == "poll-disclosure":
+                    if runtime_disclosure_lease is None:
+                        raise ValueError("runtime disclosure lease is required")
+                    self.runtime.commit_disclosure_poll(
+                        runtime_pending.call_id, runtime_disclosure_lease,
+                        next_nonce_b64=next_nonce, now_ms=self._timestamp(),
+                    )
                 elif operation == "upload-findings":
                     if runtime_disclosure_lease is None or upload_binding is None:
                         raise ValueError("runtime disclosure lease is required")
@@ -883,7 +912,7 @@ class RunnerControlClient:
                 raise ValueError("runner runtime state did not commit control response") from exc
 
         with self._state_lock:
-            if operation not in {"claim", "upload-findings"}:
+            if operation not in {"claim", "upload-findings", "poll-disclosure"}:
                 guard = self._run_guards.get(run_id)
                 if (
                     guard is None or guard.token is not guard_token
@@ -891,7 +920,8 @@ class RunnerControlClient:
                 ):
                     raise ValueError("active runner claim is required")
             staged = dict(self._chains)
-            if operation == "upload-findings":
+            if operation in {"upload-findings", "poll-disclosure"}:
+                # Terminal disclosure calls ride the sealed runtime result cursor, never _chains.
                 self._append_call_diagnostic_locked(operation, status, call)
                 if include_response_metadata:
                     return body, status, dict(headers)
@@ -1797,6 +1827,126 @@ class RunnerControlClient:
             call, "upload-findings", pending.run_id,
             upload_binding=(permit_value, findings, projection_bytes, finding_count),
             runtime_pending=pending, runtime_disclosure_lease=disclosure_lease,
+        )
+
+    @staticmethod
+    def _decode_disclosure_poll(body: object, run_id: str) -> dict[str, Any]:
+        """A poll answers the closed state or a schema-valid permit; nothing else.
+
+        The permit's binding, window and authority are re-verified by ``upload_findings``
+        before any byte is sent; a refused permit therefore uploads nothing.
+        """
+        try:
+            if isinstance(body, dict) and body.get("schema_version") == CANARY_DISCLOSURE_STATE_SCHEMA:
+                value = validate_canary_disclosure_state(body)
+            else:
+                value = validate_disclosure_permit(body)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner disclosure poll response") from None
+        if value["run_id"] != run_id:
+            raise ValueError("invalid runner disclosure poll response")
+        return value
+
+    def _disclosure_poll_body(self, run_id: str, findings_projection: object) -> tuple[dict[str, Any], bytes]:
+        try:
+            findings = validate_canary_findings(findings_projection)
+            self._verify_projection_signature(findings)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner disclosure poll") from None
+        if findings["workspace_id"] != self.workspace_id or findings["run_id"] != run_id:
+            raise ValueError("invalid runner disclosure poll")
+        request = validate_runner_disclosure_poll_request({
+            "schema_version": RUNNER_DISCLOSURE_POLL_SCHEMA, "run_id": run_id,
+            "projection": {
+                "schema_version": findings["schema_version"],
+                "projection_digest": findings["projection_digest"],
+                "byte_count": len(canonical_bytes(findings)),
+                "scenario_count": len(findings["scenario_results"]),
+                "finding_count": sum(
+                    item["finding"] is not None for item in findings["scenario_results"]
+                ),
+            },
+        })
+        body = canonical_bytes(request)
+        if len(body) > RUNNER_DISCLOSURE_POLL_MAX_BYTES:
+            raise ValueError("invalid runner disclosure poll")
+        return findings, body
+
+    def poll_disclosure(self, *, run_id, findings_projection):
+        """Metadata-only poll on the terminal run's sealed result cursor (H2 §3.3).
+
+        Sends the digest, byte count and counts of the local findings projection, never its
+        bytes. A staged poll is replayed byte-identically; the answer is the closed disclosure
+        state or the human-issued permit, which the caller must hand to ``upload_findings``.
+        """
+        if type(run_id) is not str or not run_id:
+            raise ValueError("invalid runner disclosure poll")
+        findings, body = self._disclosure_poll_body(run_id, findings_projection)
+        pending = tuple(
+            item for item in self.runtime.load_pending_calls()
+            if item.chain_operation == "result" and item.run_id == run_id
+        )
+        now_ms = self._timestamp()
+        try:
+            disclosure_lease = self.runtime.lease_terminal_disclosure(
+                run_id, expected_project_id=findings["project_id"],
+                expected_grant_id=findings["grant_id"],
+                expected_approval_projection_digest=findings["approval_projection_digest"],
+                now_ms=now_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        if pending:
+            if (
+                len(pending) != 1 or pending[0].request_operation != "poll-disclosure"
+                or pending[0].body != body
+            ):
+                raise ValueError("terminal runner result is required before disclosure")
+            call = _Call(
+                pending[0].path, dict(pending[0].headers), pending[0].body, pending[0].capability,
+                self._chain("result", run_id), pending[0].sequence, pending[0].generation,
+            )
+            return self._post_closed(
+                call, "poll-disclosure", run_id,
+                runtime_pending=pending[0], runtime_disclosure_lease=disclosure_lease,
+            )
+        try:
+            cursor = self.runtime._disclosure_result_cursor(disclosure_lease)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        nonce, sequence, generation = (
+            cursor["next_nonce_b64"], cursor["next_sequence"], cursor["generation"],
+        )
+        path = (
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/runs/"
+            f"{run_id}/disclosure-poll"
+        )
+        proof = {
+            "schema_version": "heel.runner-request-proof.v1",
+            "workspace_id": self.workspace_id, "runner_id": self.runner_id,
+            "key_id": self.signer.key_id, "capability": "runner_result",
+            "method": "POST", "path": path,
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "timestamp_ms": now_ms, "server_nonce": nonce, "sequence": sequence,
+        }
+        call = _Call(
+            path,
+            self._headers(
+                self._signature(b"heel.runner-pop.v1\0" + canonical_bytes(proof)),
+                now_ms, nonce=nonce, sequence=sequence,
+            ),
+            body, "runner_result", self._chain("result", run_id), sequence, generation,
+        )
+        try:
+            runtime_pending = self.runtime.stage_disclosure_call(
+                disclosure_lease, path=path, headers=call.headers, body=body,
+                now_ms=now_ms, request_operation="poll-disclosure",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        return self._post_closed(
+            call, "poll-disclosure", run_id,
+            runtime_pending=runtime_pending, runtime_disclosure_lease=disclosure_lease,
         )
 
     def claim(self):

@@ -254,3 +254,69 @@ def test_first_scan_frames_cross_the_actual_worker(tmp_path, worker_edge, monkey
     relayed = b"".join(body for *_rest, body in edge.edge_answers)
     for value in (*FIRST_SCAN_TOKENS.values(), edge.edge_secret):
         assert value.encode() not in relayed
+
+
+# --------------------------------------------------------------------------- result handoff (H2)
+#
+# The two routes the accepted result-handoff design adds (spec 2026-11-11 §3.3) must cross the
+# actual Worker on their exact families: the runner's PoP ``disclosure-poll`` (runner-proof
+# header family, 2 KiB cap) and the human ``view`` read ``GET …/disclosure`` (session family).
+# Nothing is seeded: an unknown run answers the control plane's own closed error, which proves
+# the Worker forwarded the request instead of refusing it at the edge.
+
+_HANDOFF_RUN = "crun_" + "c" * 32
+_HANDOFF_PROOF = {
+    "X-Heel-Runner-Key-Id": "key_wire_handoff", "X-Heel-Runner-Timestamp-Ms": "1",
+    "X-Heel-Runner-Nonce": "N" * 43 + "=", "X-Heel-Runner-Sequence": "1",
+    "X-Heel-Runner-Signature": "S" * 86 + "==",
+}
+
+
+def test_result_handoff_routes_cross_the_actual_worker_on_their_exact_families(worker_edge):
+    edge, _zone = worker_edge
+    workspace_id, cookie = edge.signup_owner("owner-handoff@example.test")
+    status, project, _ = edge.request(
+        "POST", f"/v1/workspaces/{workspace_id}/projects", {"name": "Handoff"}, cookie=cookie,
+    )
+    assert status == 201, project
+    project_ref = project["project_ref"]
+
+    read_path = (
+        f"/v1/workspaces/{workspace_id}/projects/{project_ref}/canary-runs/{_HANDOFF_RUN}/disclosure"
+    )
+    status, body, _ = edge.request("GET", read_path, cookie=cookie)
+    assert ("GET", read_path) in edge.forwarded, edge.edge_answers[-1:]
+    assert (status, body) == (
+        404, {"schema_version": "heel.canary-error.v1", "code": "canary_run_not_found"},
+    )
+    # The read is GET-only at the edge.
+    before = len(edge.forwarded)
+    status, _, _ = edge.request("POST", read_path, {}, cookie=cookie)
+    assert status in {400, 404, 405} and len(edge.forwarded) == before
+
+    runner_id = "runr_" + "d" * 32
+    poll_path = (
+        f"/v1/workspaces/{workspace_id}/runners/{runner_id}/runs/{_HANDOFF_RUN}/disclosure-poll"
+    )
+    small = json.dumps({"schema_version": "heel.runner-disclosure-poll.v1"}).encode()
+    status, body, _ = edge.request(
+        "POST", poll_path, raw=small, origin=None, fetch_site=None,
+        headers={"X-Heel-Runner-Id": runner_id, **_HANDOFF_PROOF},
+    )
+    assert ("POST", poll_path) in edge.forwarded, edge.edge_answers[-1:]
+    assert (status, body) == (
+        401, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"},
+    )
+
+    before = len(edge.forwarded)
+    oversized = b'{"p":"' + b"x" * 2048 + b'"}'
+    status, body, _ = edge.request(
+        "POST", poll_path, raw=oversized, origin=None, fetch_site=None,
+        headers={"X-Heel-Runner-Id": runner_id, **_HANDOFF_PROOF},
+    )
+    # The edge's uniform refusal for every over-cap runner body; nothing is forwarded.
+    assert (status, json.dumps(body, separators=(",", ":")).encode()) == REFUSED
+    assert len(edge.forwarded) == before
+    # A session cookie never authorizes the runner route at the edge.
+    status, _, _ = edge.request("POST", poll_path, raw=small, cookie=cookie)
+    assert status in {400, 401, 403} and len(edge.forwarded) == before

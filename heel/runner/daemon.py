@@ -531,6 +531,13 @@ class _ServeCoordinator:
         finally:
             self._leave()
 
+    def advance_disclosures(self):
+        self._enter()
+        try:
+            return self._coordinator.advance_disclosures()
+        finally:
+            self._leave()
+
     def claim(self):
         self._enter()
         try:

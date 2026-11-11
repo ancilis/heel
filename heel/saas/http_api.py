@@ -40,6 +40,7 @@ from heel.findings_sync import (
     stable_json,
 )
 from heel.canary_contracts import (
+    RUNNER_DISCLOSURE_POLL_MAX_BYTES,
     canonical_bytes,
     parse_json,
     validate_approval_projection,
@@ -48,6 +49,7 @@ from heel.canary_contracts import (
     validate_runner_heartbeat_request,
     validate_runner_progress_request,
     validate_runner_result_request,
+    validate_runner_disclosure_poll_request,
     validate_runner_stop_ack_request,
     validate_runner_context_create,
     validate_runner_context_revoke,
@@ -593,11 +595,16 @@ class _Handler(BaseHTTPRequestHandler):
             len(parts) == 8 and parts[:2] == ["v1", "workspaces"] and parts[3] == "runners"
             and parts[5] == "runs" and parts[7] == "result"
         )
+        canary_disclosure_poll = bool(
+            len(parts) == 8 and parts[:2] == ["v1", "workspaces"] and parts[3] == "runners"
+            and parts[5] == "runs" and parts[7] == "disclosure-poll"
+        )
         maximum = (
             MAX_FINDINGS_SYNC_BYTES
             if sync_path
             else MAX_UPLOAD_BYTES if canary_findings_upload
             else DISCOVERY_RESULT_MAX_BYTES if canary_result
+            else RUNNER_DISCLOSURE_POLL_MAX_BYTES if canary_disclosure_poll
             else MAX_DEVICE_BODY if device_path else MAX_BODY
         )
         if length > maximum:
@@ -892,7 +899,7 @@ class _Handler(BaseHTTPRequestHandler):
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {
                 "heartbeat", "progress", "result", "stop-ack", "result-projection",
-                "inactive-claim-attestation",
+                "disclosure-poll", "inactive-claim-attestation",
             })
         ))
 
@@ -1041,6 +1048,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return lambda: self._runner_request(
                     wid, tail[1], "runner_result", tail[3], "result-projection",
                 )
+            if (method == "POST" and len(tail) == 5 and tail[0] == "runners"
+                    and tail[2] == "runs" and tail[4] == "disclosure-poll"):
+                # Metadata-only result-handoff poll on the run's result chain (H2 §3.3).
+                return lambda: self._runner_request(
+                    wid, tail[1], "runner_result", tail[3], "disclosure-poll",
+                )
             if method == "GET" and len(tail) == 2 and tail[0] == "jobs":
                 return lambda: self._ws_job_get(wid, tail[1])
             if tail == ("projects",):
@@ -1120,6 +1133,8 @@ class _Handler(BaseHTTPRequestHandler):
                         return lambda: self._ws_canary_disclosure_permit(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "disclosure-local-only" and method == "POST":
                         return lambda: self._ws_canary_disclosure_local_only(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "disclosure" and method == "GET":
+                        return lambda: self._ws_canary_disclosure_read(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "findings" and method == "GET":
                         return lambda: self._ws_canary_findings(wid, project_ref, run_id)
         return None
@@ -1452,6 +1467,7 @@ class _Handler(BaseHTTPRequestHandler):
                 else 2048 if operation == "context-plan-request-claim"
                 else 69632 if operation == "context-approval-projections"
                 else MAX_UPLOAD_BYTES if operation == "result-projection"
+                else RUNNER_DISCLOSURE_POLL_MAX_BYTES if operation == "disclosure-poll"
                 else DISCOVERY_RESULT_MAX_BYTES if operation == "result"
                 else 36 * 1024
             )
@@ -1460,13 +1476,14 @@ class _Handler(BaseHTTPRequestHandler):
                           "progress": validate_runner_progress_request, "result": validate_runner_result_request,
                           "stop-ack": validate_runner_stop_ack_request, "context-list": validate_runner_context_list,
                           "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit,
-                          "context-plan-request-claim": validate_runner_plan_request_claim}
+                          "context-plan-request-claim": validate_runner_plan_request_claim,
+                          "disclosure-poll": validate_runner_disclosure_poll_request}
             if operation != "result-projection":
                 parsed = validators[operation](parsed)
             if (canonical_bytes(parsed) != self._raw_body()
                     or (run_id is not None and (parsed.get("run_id", parsed.get("binding_id", parsed.get("context_binding_id"))) != run_id))):
                 raise RunnerAuthError("invalid runner authentication")
-            if operation not in {"claim", "result-projection", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"} and not self._operational_context_matches(
+            if operation not in {"claim", "result-projection", "disclosure-poll", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"} and not self._operational_context_matches(
                     self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
                     projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
@@ -1514,6 +1531,13 @@ class _Handler(BaseHTTPRequestHandler):
                     return RunnerHttpAction(200, disclosure.upload(
                         wid, project_ref, run_id, runner_id, parsed,
                     ))
+                if operation == "disclosure-poll":
+                    project_ref = self._runner_run_project(
+                        store.conn, wid, runner_id, run_id,
+                    )
+                    return RunnerHttpAction(200, disclosure.poll(
+                        wid, project_ref, run_id, runner_id, parsed, runner_key_id=key_id,
+                    ))
                 projection = parsed["operational_projection"]
                 project_ref = projection["project_id"]
                 if operation == "heartbeat":
@@ -1535,7 +1559,7 @@ class _Handler(BaseHTTPRequestHandler):
                 action=action,
                 chain_name=(
                     "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"}
-                    else f"result:{run_id}" if operation == "result-projection"
+                    else f"result:{run_id}" if operation in {"result-projection", "disclosure-poll"}
                     else f"{operation}:{run_id}"
                 ),
                 max_body_bytes=maximum,
@@ -2853,6 +2877,14 @@ class _Handler(BaseHTTPRequestHandler):
             wid, project_ref, run_id, request_id=preview["request_id"], actor=actor,
         )
         self._json(200, result)
+
+    def _ws_canary_disclosure_read(self, wid: str, project_ref: str, run_id: str) -> None:
+        # A parameterless read: no query or fragment alias reaches the authorization path.
+        if "?" in self.path or "#" in self.path:
+            raise CanaryDisclosureError("canary_run_not_found")
+        self._authorize(wid, "view")
+        _, disclosure = self._human_canary_services()
+        self._json(200, disclosure.disclosure(wid, project_ref, run_id))
 
     def _ws_canary_findings(self, wid: str, project_ref: str, run_id: str) -> None:
         self._authorize(wid, "view")

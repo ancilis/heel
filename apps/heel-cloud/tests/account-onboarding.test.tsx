@@ -12,7 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import Dashboard from "../app/dashboard/page";
-import { CanaryApi, CanaryApiError } from "../lib/canary-api";
+import { CanaryApi, CanaryApiError, type CanaryDisclosureState } from "../lib/canary-api";
 
 
 const nav = vi.hoisted(() => ({ search: "", replace: vi.fn() }));
@@ -938,7 +938,7 @@ describe("C7AR1 R3: same-document navigation is revalidated and applied", () => 
 
 // SEAM (C7AR2): besides the fake transport above, `CanaryApi` methods are replaced only to hold or settle a
 // component's async action at a chosen moment. No proof, binding, approval, run or target request is real; the
-// terminal run below is component metadata so the existing local-summary input renders.
+// terminal run below is component metadata so the result-sharing status read starts.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -974,12 +974,13 @@ async function requestProof(): Promise<void> {
 
 const BLOCKED_NOTICE = /Project created\. Canary setup is unavailable right now/;
 const RUN_ID = `crun_${"1".repeat(32)}`;
-const SUMMARY = JSON.stringify({
-  schema_version: "heel.canary-findings-projection.v1", projection_digest: "a".repeat(64),
-  scenario_results: [{ assessment_outcome: "observed", finding: null }],
-});
+const AWAITING_SHARE: CanaryDisclosureState = {
+  requestId: `cdr_${"2".repeat(32)}`, runId: RUN_ID, status: "awaiting_disclosure_approval",
+  projection: { projectionDigest: "a".repeat(64), projectionBytes: 25, scenarioCount: 1, findingCount: 0 },
+};
+const UNREADABLE_SHARING = /returned no readable sharing status/;
 
-/** Shows a terminal local-result run only where `owns(projectRef)` holds, so the summary input renders there. */
+/** Shows a terminal local-result run only where `owns(projectRef)` holds, so its sharing status is read there. */
 function terminalRunWhere(owns: (projectRef: string) => boolean): void {
   vi.spyOn(CanaryApi.prototype, "listPendingApprovalRequests").mockImplementation(async (_workspaceRef, projectRef) =>
     ({ hasMore: false, request: owns(projectRef) ? { runId: RUN_ID, approvalId: "old-approval" } : null }) as never);
@@ -989,18 +990,21 @@ function terminalRunWhere(owns: (projectRef: string) => boolean): void {
   } as never);
 }
 
-/** Chooses a local summary whose read settles only when the returned promise is settled. */
-async function chooseHeldSummary(): Promise<ReturnType<typeof deferred<string>>> {
-  await screen.findByText("Load local summary to review separate sharing →");
-  const read = deferred<string>();
-  fireEvent.change(document.querySelector("input[type=file]") as HTMLInputElement, { target: { files: [{ size: 25, text: () => read.promise }] } });
+/** Holds the shown run's disclosure status read; it settles only when the returned promise is settled. */
+async function holdSharingRead(): Promise<ReturnType<typeof deferred<CanaryDisclosureState>>> {
+  const read = deferred<CanaryDisclosureState>();
+  const spy = vi.spyOn(CanaryApi.prototype, "getDisclosure").mockImplementation(() => read.promise);
+  await screen.findByRole("region", { name: "Result sharing" });
+  await waitFor(() => expect(spy).toHaveBeenCalled());
   return read;
 }
 
-function expectNoLocalSummaryState(): void {
+function expectNoSharingState(): void {
   expect(screen.queryByRole("dialog", { name: "Share result summary?" })).toBeNull();
   expect(screen.queryByText("Share result summary?")).toBeNull();
-  expect(screen.queryByText("That file is not a closed signed canary summary.")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Review sharing" })).toBeNull();
+  expect(screen.queryByRole("region", { name: "Result sharing" })).toBeNull();
+  expect(screen.queryByText(UNREADABLE_SHARING)).toBeNull();
 }
 
 
@@ -1184,14 +1188,14 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
 });
 
 
-describe("C7AR2 N1: a local summary read belongs to the account and project that chose it", () => {
-  async function chooseThenSwitchAccount(): Promise<{ read: ReturnType<typeof deferred<string>>; second: Account }> {
+describe("C7AR2 N1: a result-sharing status read belongs to the account and project that started it", () => {
+  async function readThenSwitchAccount(): Promise<{ read: ReturnType<typeof deferred<CanaryDisclosureState>>; second: Account }> {
     const first = server.account("first@example.test", "first-password", [{ role: "owner", projects: ["First"] }]);
     const second = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Second"] }]);
     server.session = first;
     terminalRunWhere(() => server.session === first);
     render(<Dashboard />);
-    const read = await chooseHeldSummary();
+    const read = await holdSharingRead();
     fireEvent.click(signOutButton());
     await signInFromSignedOut(EMAIL, SECRET);
     await screen.findByRole("combobox", { name: /project/i });
@@ -1199,22 +1203,23 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     return { read, second };
   }
 
-  test("a previous account's summary that reads successfully opens nothing for the new account", async () => {
-    const { read, second } = await chooseThenSwitchAccount();
-    await act(async () => { read.resolve(SUMMARY); });
+  test("a previous account's status that reads successfully opens nothing for the new account", async () => {
+    const { read, second } = await readThenSwitchAccount();
+    await act(async () => { read.resolve(AWAITING_SHARE); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().selectedOptions[0].textContent).toBe("Second");
     expect(nav.search).toContain(second.memberships[0].workspace_id);
+    expect(nav.search).not.toContain(RUN_ID);
     expect(signOutButton().disabled).toBe(false);
     expectNoSecretLeak();
   });
 
-  test("a previous account's summary that fails to parse shows no error to the new account", async () => {
-    const { read } = await chooseThenSwitchAccount();
-    await act(async () => { read.resolve("not-json"); });
+  test("a previous account's status read that fails shows no error to the new account", async () => {
+    const { read } = await readThenSwitchAccount();
+    await act(async () => { read.reject(new CanaryApiError("invalid_response", 502)); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().selectedOptions[0].textContent).toBe("Second");
   });
 
@@ -1222,12 +1227,12 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     const { ws, alpha, beta } = alphaBeta();
     terminalRunWhere((projectRef) => projectRef === alpha);
     const view = render(<Dashboard />);
-    const read = await chooseHeldSummary();
+    const read = await holdSharingRead();
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
-    await act(async () => { read.resolve(SUMMARY); });
+    await act(async () => { read.resolve(AWAITING_SHARE); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().value).toBe(beta);
   });
 
@@ -1235,29 +1240,33 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     const { ws, alpha, beta } = alphaBeta();
     terminalRunWhere((projectRef) => projectRef === alpha);
     const view = render(<Dashboard />);
-    const read = await chooseHeldSummary();
+    const read = await holdSharingRead();
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
-    await act(async () => { read.reject(new DOMException("read failed", "NotReadableError")); });
+    await act(async () => { read.reject(new CanaryApiError("unavailable", 0)); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().value).toBe(beta);
   });
 
-  test("in the current context an invalid summary is refused and a valid one opens the sharing review", async () => {
+  test("in the current context an unreadable status is reported and a valid one offers the sharing review", async () => {
     const { alpha } = alphaBeta();
     terminalRunWhere((projectRef) => projectRef === alpha);
+    const reads: Array<CanaryDisclosureState | Error> = [new CanaryApiError("invalid_response", 502), AWAITING_SHARE];
+    vi.spyOn(CanaryApi.prototype, "getDisclosure").mockImplementation(async () => {
+      const next = reads.length > 1 ? reads.shift()! : reads[0];
+      if (next instanceof Error) throw next;
+      return next;
+    });
     render(<Dashboard />);
-    const invalid = await chooseHeldSummary();
-    await act(async () => { invalid.resolve("not-json"); });
-    await screen.findByText("That file is not a closed signed canary summary.");
+    await screen.findByText(UNREADABLE_SHARING);
     expect(screen.queryByRole("dialog", { name: "Share result summary?" })).toBeNull();
 
-    const valid = await chooseHeldSummary();
-    await act(async () => { valid.resolve(SUMMARY); });
+    fireEvent.click(await screen.findByRole("button", { name: "Review sharing" }, { timeout: 4_000 }));
     const dialog = await screen.findByRole("dialog", { name: "Share result summary?" });
-    expect(within(dialog).getByText("Crossed").nextSibling?.textContent).toBe("1");
+    expect(within(dialog).getByText("Findings").nextSibling?.textContent).toBe("0");
     expect(within(dialog).getByText("25 B")).toBeTruthy();
+    expect(document.querySelector("input[type=file]")).toBeNull();
     expect(projectSelect().value).toBe(alpha);
   });
 });
@@ -1680,7 +1689,7 @@ describe("C7AR3: the proof check's environment refresh keeps the same owner boun
 // journey: no target is contacted and no proof is published anywhere.
 describe("CUSTOMER-TRACK-UX: a new customer registers one target through the existing ownership-proof contract", () => {
   const TARGET = "https://staging.customer.example.test";
-  const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+  const BOUNDARY = "Target verified. Heel Cloud contacts it only to check your ownership proof. Rehearsals run only from a runner on your own machine, using the read-only GET and HEAD requests of a plan you approve; credentials and raw evidence stay on that machine.";
   const FORBIDDEN = /credential|identit|secret|discover|scan|crawl|pairing|install|openapi|route-inventory|plan|finding/i;
 
   function selection(): { ws: string; prj: string } {
@@ -1823,7 +1832,7 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     await bindingsShown([`${ALPHA_ORIGIN} · runner-1 · active`]);
     // An account with a private connector is told how authorization and local credentials differ, not that they are unavailable.
     expect(within(screen.getByRole("region", { name: "Your target" })).getByRole("status").textContent)
-      .toMatch(/^Target verified\. Managed scanning and discovery are not available in this build\. Target authorization is separate from test credentials:/);
+      .toMatch(/^Target verified\. Heel Cloud contacts it only to check your ownership proof; your paired runner sends only the read-only GET and HEAD requests of a plan you approve\. Target authorization is separate from test credentials:/);
     const activation = screen.getByRole("region", { name: /launch activation/i });
     expect(within(activation).getAllByRole("listitem").map((step) => step.querySelector("h2")?.textContent))
       .toEqual(["Verify staging", "Pair runner", "Add canary access", "Run first rehearsal"]);
@@ -1836,7 +1845,7 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
 
 // SEAM (CUSTOMER-TRACK-UX-F1): the same in-memory control plane; `/v1/me` is held to observe the loading state.
 describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before a private connector exists", () => {
-  const INTRO = "Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Managed scanning is not available in this build.";
+  const INTRO = "Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Heel Cloud only checks that ownership proof: approved read-only GET and HEAD rehearsals run from a runner on your own machine, and credentials and raw evidence stay there.";
 
   function expectNoRunnerFunnel(): void {
     expect(screen.queryByRole("region", { name: /launch activation/i })).toBeNull();
@@ -1851,7 +1860,7 @@ describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before
     expect(intro?.textContent).toContain(INTRO);
     expect(intro?.textContent).not.toMatch(/runner onboarding|canary rehearsal/i);
     const rail = screen.getByRole("complementary", { name: "Safety boundaries" });
-    expect(rail.textContent).toMatch(/No scan traffic is sent in this build\./);
+    expect(rail.textContent).toMatch(/Heel Cloud only verifies ownership; rehearsals run on your machine\./);
     expect(rail.textContent).toMatch(/Ownership check.*One proof file or DNS record/);
     expect(rail.textContent).toMatch(/Operational status only/);
     expect(rail.textContent).not.toMatch(/runner owns target traffic|GET \+ HEAD|:443/i);
@@ -1922,7 +1931,7 @@ describe("CUSTOMER-TRACK-UX-F1: no visitor is sent into runner onboarding before
 describe("CUSTOMER-TRACK-UX-F1: a pending ownership proof survives a reload and is resumed explicitly", () => {
   const TARGET = "https://staging.customer.example.test";
   const OTHER = "https://sandbox.customer.example.test";
-  const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+  const BOUNDARY = "Target verified. Heel Cloud contacts it only to check your ownership proof. Rehearsals run only from a runner on your own machine, using the read-only GET and HEAD requests of a plan you approve; credentials and raw evidence stay on that machine.";
   const EXPIRED = "This pending proof expired. Issue a replacement proof for the same target.";
   const RECENT_AUTH = "For your security, showing or replacing a pending proof needs a sign-in from the last 15 minutes. The proof is kept on the server: sign out, sign in again, then resume it.";
 
@@ -2520,7 +2529,7 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
 
   // CUSTOMER-ONBOARDING-STATE: the live journey's state. The bound runner is absent from the bindable list (the
   // server omits a runner while it is bound); its active binding names the project's exact verified environment.
-  const CONNECTOR_BOUNDARY = "Target verified. Managed scanning and discovery are not available in this build. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
+  const CONNECTOR_BOUNDARY = "Target verified. Heel Cloud contacts it only to check your ownership proof; your paired runner sends only the read-only GET and HEAD requests of a plan you approve. Target authorization is separate from test credentials: credentials are stored only on your paired runner's machine and are never entered in this browser. A rehearsal appears here only after that runner submits a valid signed plan, and runs only if you approve it.";
 
   function exactEnvironment(ws: string, prj: string, n: string): void {
     server.environments.set(`${ws}/${prj}`, [environmentWire(`env_${n.repeat(32)}`, TARGET, "https-file", true)]);

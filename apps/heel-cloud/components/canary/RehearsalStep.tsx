@@ -33,7 +33,7 @@ export function RehearsalStep({ state, scenarioCount = 0, recovery, onReviewAppr
           {state === "locked" ? <p className="step-recovery">Complete the first three steps to prepare a read-only plan with fixed routes, time, request, and egress ceilings.</p> : null}
           {state === "ready" || state === "awaiting_approval" ? <p className="step-recovery">{scenarioCount} safe scenarios are ready. Review the immutable plan before anything runs.</p> : null}
           {state === "running" ? <p className="step-success" role="status">The paired runner is executing the approved plan. You can stop it at any time.</p> : null}
-          {state === "complete" ? <p className="step-success">Operational receipt complete. Open the detailed result on the runner machine.</p> : null}
+          {state === "complete" ? <p className="step-success">Rehearsal complete. Review the result and the sharing choice on this page; heel runner findings on the runner machine stays available as an optional local view.</p> : null}
           {state === "error" ? <p className="step-recovery" role="alert">{recovery ?? "The rehearsal did not start. No additional action was sent; review setup and retry."}</p> : null}
           <div className="step-actions">
             {(state === "ready" || state === "awaiting_approval") && onReviewApproval ? <button className="button button-primary"

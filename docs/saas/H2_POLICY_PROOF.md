@@ -24,6 +24,9 @@ The 14 `STAGE_FILES`, the profile, the reviewed ref, the wheel closure and every
 **Runner rc3 integration amendment:** the public runner module `heel/runner/regressions.py` makes the
 tree 111 paths (closure 111 + 14 = 125), and the accepted plan-submit change re-pins the TLS harness
 (`edge_tls_harness.py`, test support only) at `b8887b86…`; that closure is likewise **UNRUN**.
+**Runner rc4 integration amendment:** the accepted H2 result-handoff change re-pins the TLS harness
+(`edge_tls_harness.py`, test support only, disclosure-poll route family) at `846bc9d4…`, and the
+1.3.0-rc.4 npm root re-pins the runtime lock; the heel tree stays 111 paths and that closure is **UNRUN**.
 The new staged closure digest is **UNRUN**: no earlier run, including the cycles above and any H2-3
 run, covers it. It becomes evidence only after a fresh, unfiltered launcher run on the literal proof
 branch (all 18 cases, eight p0-p7 records, zero skips) and an independent runtime review. Earlier

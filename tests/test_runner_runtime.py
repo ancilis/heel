@@ -640,9 +640,9 @@ def test_runtime_upgrades_v1_metadata_without_rewriting_existing_sealed_rows(tmp
     assert runtime.load_chain("claim", None).state_digest == core["state_digest"]
     assert RunnerRuntimeState(path, identity, signer).load_chain("claim", None).state_digest == core["state_digest"]
     with sqlite3.connect(path) as check:
-        # v1 -> v2 -> v3 -> v4 (T2b2R1 recovery records) -> v5 (C retired claims) in one transaction;
-        # sealed rows are untouched.
-        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v5"
+        # v1 -> v2 -> v3 -> v4 (T2b2R1 recovery records) -> v5 (C retired claims) -> v6 (H2
+        # poll-disclosure registration) in one transaction; sealed rows are untouched.
+        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v6"
         assert check.execute("SELECT sealed_blob FROM control_chains WHERE chain=?", (chain,)).fetchone()[0] == sealed
     check.close()
 
@@ -1575,6 +1575,7 @@ def test_runtime_v3_to_v4_migration_preserves_every_prior_row_and_rejects_a_tamp
         before = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
                   for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs")}
         metadata = conn.execute("SELECT * FROM metadata").fetchone()
+        _restore_v5_pending_calls(conn)
         conn.execute("DROP TABLE retired_claims")
         conn.execute("DROP TABLE chain_recovery")
         conn.execute("ALTER TABLE metadata RENAME TO metadata_v4")
@@ -1592,12 +1593,12 @@ def test_runtime_v3_to_v4_migration_preserves_every_prior_row_and_rejects_a_tamp
     assert migrated.load_chain("claim", None) == cursor
     assert migrated.load_pending_calls() == (pending,)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v5"
+        assert conn.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v6"
         after = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
                  for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs")}
         assert after == before
         migrated_metadata = conn.execute("SELECT * FROM metadata").fetchone()
-        assert migrated_metadata[2:] == metadata[2:] and migrated_metadata[1] == "heel.runner-runtime-state.v5"
+        assert migrated_metadata[2:] == metadata[2:] and migrated_metadata[1] == "heel.runner-runtime-state.v6"
         assert conn.execute("SELECT COUNT(*) FROM chain_recovery").fetchone()[0] == 0
     conn.close()
 
@@ -2372,8 +2373,21 @@ def test_retired_state_digest_uses_its_own_domain_over_the_archive_bytes():
 
 # --------------------------------------------------------------------- schema v5 (T-U1)
 
+def _restore_v5_pending_calls(conn):
+    """Rebuild pending_calls with its pre-v6 CHECK (no ``poll-disclosure``), rows verbatim."""
+    conn.execute("DROP INDEX idx_pending_calls_created")
+    conn.execute("DROP INDEX idx_pending_calls_run_operation")
+    conn.execute("ALTER TABLE pending_calls RENAME TO pending_calls_v6")
+    conn.execute(runtime_module._V5_PENDING_SQL)
+    for statement in runtime_module._PENDING_INDEX_SQL:
+        conn.execute(statement)
+    conn.execute("INSERT INTO pending_calls SELECT * FROM pending_calls_v6")
+    conn.execute("DROP TABLE pending_calls_v6")
+
+
 def _downgrade_to_v4(path):
     with contextlib.closing(sqlite3.connect(path)) as conn:
+        _restore_v5_pending_calls(conn)
         conn.execute("DROP INDEX idx_retired_claims_created")
         conn.execute("DROP TABLE retired_claims")
         conn.execute("ALTER TABLE metadata RENAME TO metadata_v5")
@@ -2413,13 +2427,13 @@ def test_runtime_v4_to_v5_upgrade_preserves_every_row_and_rejects_permissive_pre
 
     upgraded = RunnerRuntimeState(variants["plain"], fixture.identity, fixture.signer)
     after = _semantic_rows(variants["plain"])
-    assert after["metadata"][0][1] == "heel.runner-runtime-state.v5"
+    assert after["metadata"][0][1] == "heel.runner-runtime-state.v6"
     assert after["metadata"][0][2:] == before["plain"]["metadata"][0][2:]
     for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs", "chain_recovery"):
         assert after[table] == before["plain"][table]
     assert after["retired_claims"] == []
     with contextlib.closing(sqlite3.connect(variants["plain"])) as conn:
-        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V5_SCHEMA_SQL)
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V6_SCHEMA_SQL)
     assert [item.run_id for item in upgraded.load_active_run_controls()] == [fixture.run_id]
     assert len(upgraded.load_superseded_calls()) == 1
 
@@ -3389,7 +3403,7 @@ _SERVER_BODY_CAPS = {
     "claim": 256, "list-contexts": 128, "claim-context": 256,
     "heartbeat": 36 * 1024, "progress": 36 * 1024, "stop-ack": 36 * 1024,
     "result": 36 * 1024 + 64 * 1024 + 1024, "submit-context-approval-projection": 69_632,
-    "upload-findings": 272 * 1024,
+    "upload-findings": 272 * 1024, "poll-disclosure": 2 * 1024,
 }
 
 
@@ -3509,13 +3523,17 @@ def _stage_on_claim_chain(runtime, signer, identity, operation, body, *, path=No
     )
 
 
-def _signed_disclosure(runtime, signer, identity, run_id, available, body, *, timestamp_ms=13, lease=None):
+def _signed_disclosure(
+    runtime, signer, identity, run_id, available, body, *, timestamp_ms=13, lease=None,
+    operation="upload-findings",
+):
     lease = lease or runtime.lease_terminal_disclosure(
         run_id, expected_project_id=available.project_id, expected_grant_id=available.grant_id,
         expected_approval_projection_digest=available.approval_projection_digest, now_ms=12,
     )
     nonce, sequence = available.result_chain["next_nonce_b64"], available.result_chain["next_sequence"]
-    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/result-projection"
+    suffix = "disclosure-poll" if operation == "poll-disclosure" else "result-projection"
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/runs/{run_id}/{suffix}"
     proof = {
         "schema_version": "heel.runner-request-proof.v1", "workspace_id": identity.workspace_id,
         "runner_id": identity.runner_id, "key_id": identity.key_id, "capability": "runner_result",
@@ -3579,11 +3597,13 @@ def test_pending_body_cap_table_is_the_server_route_budget_and_the_reader_keeps_
     assert dict(runtime_module._PENDING_BODY_CAPS) == _SERVER_BODY_CAPS
     assert _SERVER_BODY_CAPS["result"] == http_api.DISCOVERY_RESULT_MAX_BYTES
     assert _SERVER_BODY_CAPS["upload-findings"] == canary_disclosure.MAX_UPLOAD_BYTES == http_api.MAX_UPLOAD_BYTES
+    assert _SERVER_BODY_CAPS["poll-disclosure"] == http_api.RUNNER_DISCLOSURE_POLL_MAX_BYTES
     source = inspect.getsource(http_api._Handler._runner_request)
     for literal in (
         '128 if operation == "context-list"', '256 if operation in {"claim", "context-claim"}',
         '69632 if operation == "context-approval-projections"',
         'MAX_UPLOAD_BYTES if operation == "result-projection"',
+        'RUNNER_DISCLOSURE_POLL_MAX_BYTES if operation == "disclosure-poll"',
         'DISCOVERY_RESULT_MAX_BYTES if operation == "result"', "else 36 * 1024",
     ):
         assert literal in source
@@ -3602,13 +3622,19 @@ def test_stage_call_and_stage_disclosure_call_enforce_exact_per_operation_body_c
     """
     cap = _SERVER_BODY_CAPS[operation]
     over, exact = _canonical_body_of(cap + 1), _canonical_body_of(cap)
-    if operation == "upload-findings":
+    if operation in {"upload-findings", "poll-disclosure"}:
         runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
-        lease, _path, _headers = _signed_disclosure(runtime, signer, identity, run_id, available, b"")
+        lease, _path, _headers = _signed_disclosure(
+            runtime, signer, identity, run_id, available, b"", operation=operation,
+        )
 
         def stage(body):
-            _lease, path, headers = _signed_disclosure(runtime, signer, identity, run_id, available, body, lease=lease)
-            return runtime.stage_disclosure_call(lease, path=path, headers=headers, body=body, now_ms=13)
+            _lease, path, headers = _signed_disclosure(
+                runtime, signer, identity, run_id, available, body, lease=lease, operation=operation,
+            )
+            return runtime.stage_disclosure_call(
+                lease, path=path, headers=headers, body=body, now_ms=13, request_operation=operation,
+            )
     elif operation in _RUN_OPERATIONS:
         fixture = _retirable(tmp_path)
         runtime, signer, identity = fixture.runtime, fixture.signer, fixture.identity
@@ -3917,6 +3943,7 @@ def _assert_legacy_row_opens_unchanged(runtime, call_id, plaintext, blob, body):
 def _rebuild_v3(path):
     """The exact v3 layout of ``test_runtime_v3_to_v4_migration_preserves_every_prior_row_...``."""
     with contextlib.closing(sqlite3.connect(path)) as conn:
+        _restore_v5_pending_calls(conn)
         conn.execute("DROP TABLE retired_claims")
         conn.execute("DROP TABLE chain_recovery")
         conn.execute("ALTER TABLE metadata RENAME TO metadata_v4")
@@ -4258,3 +4285,84 @@ def test_load_retired_claim_authenticates_a_real_pending_component_over_4096_bas
             f"\n[T-P9 measured] heartbeat body {len(body)} B; pending blob {len(source_blob)} B; archived pending "
             f"text {len(pending_text)} chars; decryptions shallow 1 / authenticated 7, before and after rotation",
         )
+
+
+# --------------------------------------------------------------------- schema v6 (H2 result handoff)
+
+def test_runtime_v5_to_v6_registers_poll_disclosure_and_keeps_every_row_byte_for_byte(tmp_path):
+    runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+    body = canonical_bytes({"schema_version": "heel.runner-findings-upload.v1"})
+    lease, path, headers = _signed_disclosure(runtime, signer, identity, run_id, available, body)
+    staged = runtime.stage_disclosure_call(lease, path=path, headers=headers, body=body, now_ms=13)
+    runtime.close()
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        _restore_v5_pending_calls(conn)
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v6")
+        conn.execute(runtime_module._V5_SCHEMA_SQL[0])
+        conn.execute(
+            "INSERT INTO metadata SELECT singleton,'heel.runner-runtime-state.v5',workspace_id,runner_id,"
+            "runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,"
+            "rotation_fence_digest,state_key_ciphertext FROM metadata_v6"
+        )
+        conn.execute("DROP TABLE metadata_v6")
+        conn.commit()
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V5_SCHEMA_SQL)
+        # A v5 pending_calls refuses the new operation by its own CHECK.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO pending_calls VALUES(?,?,?,?,?,?,?,?)",
+                ("f" * 64, "e" * 64, "d" * 64, "poll-disclosure", 1, 0, b"\0" * 29, 1),
+            )
+    before = _semantic_rows(runtime.path)
+
+    upgraded = RunnerRuntimeState(runtime.path, identity, signer)
+    after = _semantic_rows(runtime.path)
+    assert after["metadata"][0][1] == "heel.runner-runtime-state.v6"
+    assert after["metadata"][0][2:] == before["metadata"][0][2:]
+    for table in before:
+        if table != "metadata":
+            assert after[table] == before[table], table
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V6_SCHEMA_SQL)
+    assert upgraded.load_pending_calls() == (staged,)
+
+
+def test_disclosure_poll_commit_advances_only_the_sealed_result_cursor(tmp_path):
+    runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+    body = canonical_bytes({"schema_version": "heel.runner-disclosure-poll.v1"})
+    lease, path, headers = _signed_disclosure(
+        runtime, signer, identity, run_id, available, body, operation="poll-disclosure",
+    )
+    assert path.endswith(f"/runs/{run_id}/disclosure-poll")
+    # The generic stager never accepts the disclosure poll; only the leased disclosure stager does.
+    with pytest.raises(runtime_module.RunnerRuntimeStateError):
+        runtime.stage_call(
+            request_operation="poll-disclosure", chain_operation="result", run_id=run_id,
+            path=path, capability="runner_result", headers=headers, body=body,
+            expected_state_digest=available.state_digest, now_ms=13,
+        )
+    staged = runtime.stage_disclosure_call(
+        lease, path=path, headers=headers, body=body, now_ms=13, request_operation="poll-disclosure",
+    )
+    assert staged.request_operation == "poll-disclosure" and staged.chain_operation == "result"
+    with pytest.raises(RunnerRuntimeCorrupt):
+        runtime.commit_disclosure_poll(
+            staged.call_id, lease, next_nonce_b64=available.result_chain["next_nonce_b64"], now_ms=14,
+        )
+    next_nonce = _b64(b"\x07" * 32)
+    advanced = runtime.commit_disclosure_poll(staged.call_id, lease, next_nonce_b64=next_nonce, now_ms=14)
+    assert advanced.state == "available" and advanced.revision == available.revision == 2
+    assert advanced.prior_state_digest == available.prior_state_digest
+    assert advanced.result_chain["next_nonce_b64"] == next_nonce
+    assert advanced.result_chain["next_sequence"] == available.result_chain["next_sequence"] + 1
+    assert advanced.result_chain["generation"] == available.result_chain["generation"]
+    assert (advanced.permit_id, advanced.receipt_digest, advanced.disclosed_at_ms) == (None, None, None)
+    assert advanced.available_at_ms == available.available_at_ms
+    assert runtime.load_pending_calls() == ()
+    assert runtime.load_terminal_state(run_id) == advanced
+    # A replay of the consumed call cannot commit twice.
+    with pytest.raises(RunnerRuntimeConflict):
+        runtime.commit_disclosure_poll(staged.call_id, lease, next_nonce_b64=_b64(b"\x08" * 32), now_ms=15)
+    page = runtime.load_available_disclosures(now_ms=14)
+    assert [item.run_id for item in page.items] == [run_id] and page.has_more is False
+    assert runtime.load_available_disclosures(now_ms=available.retention_expires_at_ms).items == ()

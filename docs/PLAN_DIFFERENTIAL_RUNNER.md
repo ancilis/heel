@@ -32,11 +32,11 @@ widen or re-sign a scope.
 
 Run these in order. Replace the values in capitals.
 
-The wheel below is the unreleased 1.3.0rc3 runner preview candidate, which is checked in
+The wheel below is the unreleased 1.3.0rc4 runner preview candidate, which is checked in
 under `apps/heel-cloud/public/downloads/` with its source archive and manifest. It is not yet
 published as a GitHub release or to PyPI, so no public download URL, registry command or
-release-asset digest is given here. (The earlier 1.3.0rc2 and 1.3.0rc1 previews are public GitHub
-prereleases; the [README](../README.md) gives the hash-pinned rc2 install and
+release-asset digest is given here. (The earlier 1.3.0rc3, 1.3.0rc2 and 1.3.0rc1 previews are public
+GitHub prereleases; the [README](../README.md) gives the hash-pinned rc2 install and
 [the export demo](EXPORT_DEMO.md) the rc1 `error_envelope` and `hardened` errata.) Run the
 command in a directory that holds that local wheel. This journey is the standalone CLI. It
 does not use Heel Cloud pairing, which is still an incomplete public journey (see
@@ -45,7 +45,7 @@ does not use Heel Cloud pairing, which is still an incomplete public journey (se
 ```sh
 python3 -m venv --copies .venv
 . .venv/bin/activate
-python -m pip install './heel_sim-1.3.0rc3-py3-none-any.whl[runner]'
+python -m pip install './heel_sim-1.3.0rc4-py3-none-any.whl[runner]'
 export HEEL_HOME="$PWD/.heel"
 ```
 
@@ -89,6 +89,43 @@ export HEEL_HOME="$PWD/.heel"
    header leaves chunk items that are not a credential; the next credential recovery deletes
    them (and retries later if the Keychain refuses), and removing a credential deletes the
    header, all eight chunk slots and any v1 item.
+
+   Linux `secret-service` uses the freedesktop Secret Service through `/usr/bin/secret-tool`
+   (the runner signing key in `pair` uses the same helper). Prerequisites, in the shell that
+   runs Heel:
+
+   ```sh
+   sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
+   dbus-run-session -- bash                                   # headless: private session bus
+   read -rs pw && printf '%s' "$pw" \
+       | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
+   ```
+
+   The keyring password is typed at the hidden `read -rs` prompt and reaches the daemon only
+   on standard input (`printf` is a shell builtin and `pw` is never exported); never put it in
+   process arguments, an environment variable or a file. A desktop login session already has
+   a session bus and an unlocked keyring.
+
+   `secret-tool` runs with only `PATH`, `LC_ALL` and `DBUS_SESSION_BUS_ADDRESS`; nothing else
+   (`HOME`, `XDG_*`, `DISPLAY`, `LD_PRELOAD`, `PYTHONPATH`, …) is forwarded. The address is
+   accepted only as one local `unix:path=<absolute path>` entry, optionally with
+   `,guid=<32 lowercase hex>`, naming an existing socket (not a symlink) owned by your user,
+   at most 1024 ASCII bytes, and is passed on re-serialised. `tcp:`, `nonce-tcp:`,
+   `unixexec:`, `autolaunch:`, `unix:abstract=`, `unix:tmpdir=`, `unix:runtime=`, lists
+   (`;`), `%` escapes and any other key are refused before `secret-tool` starts and before a
+   secret is written, with the generic `secure credential vault unavailable` (or
+   `runner OS secret service unavailable`); the value itself is never printed. Heel trusts
+   the session bus as your user's uid-authenticated session, the same model as the macOS
+   login keychain: any process of your user on that bus can read the keyring.
+
+   Before a credential or signing key is reported missing or created, Heel searches the
+   Secret Service for that item's own attributes: only exit 0 with no output counts as
+   missing. A **locked** keyring still lists the item, so it reads as unavailable, never as
+   missing, and an existing item is never overwritten (a `secret-tool store` can otherwise
+   replace it once the collection is unlocked, for example through the desktop unlock
+   prompt). Any search output is kept only in Heel's bounded capture and discarded; it is
+   never returned or logged. Unlock the keyring and retry. An unreachable bus is likewise
+   unavailable, not missing.
 
    Optional for this standalone CLI, required for the self-serve (Heel Cloud) path:
    `--plan-label <your name for the plan>`, for example `--plan-label free` on `lower_plan`
@@ -338,6 +375,10 @@ pair with a new invitation).
   secret service (`secret-tool`). Without either, `pair` fails with
   `no supported runner OS secret service`; there is no file fallback and no flag or
   variable that selects another store.
+- On Linux the Secret Service prerequisites, the single forwarded `DBUS_SESSION_BUS_ADDRESS`
+  and the locked-keyring behaviour are those of the `secret-service` credential backend
+  above: an unset, remote or otherwise refused bus address, an unreachable service or a
+  locked keyring fails `pair` closed and never creates or replaces the signing key.
 - On macOS the seed is written with one `security -i` command on standard input (never in
   process arguments) and is kept only after it reads back as exactly the generated seed;
   otherwise the new item is deleted and `pair` fails closed. Earlier releases stored an
@@ -377,7 +418,7 @@ pair with a new invitation).
   before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
   installed it is unknown; this path is tested, not assumed unused. The current checked-in
-  artifact is the unreleased 1.3.0rc3 runner preview candidate. It reports `1.3.0rc3` and,
+  artifact is the unreleased 1.3.0rc4 runner preview candidate. It reports `1.3.0rc4` and,
   like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no

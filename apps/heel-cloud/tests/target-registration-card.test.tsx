@@ -15,7 +15,7 @@ import { TargetRegistrationCard, type TargetRegistrationCardProps } from "../com
 
 afterEach(cleanup);
 
-const BOUNDARY = "Target verified. Managed scanning, credentials, discovery, and scan approval are not available in this build.";
+const BOUNDARY = "Target verified. Heel Cloud contacts it only to check your ownership proof. Rehearsals run only from a runner on your own machine, using the read-only GET and HEAD requests of a plan you approve; credentials and raw evidence stay on that machine.";
 
 function props(overrides: Partial<TargetRegistrationCardProps> = {}): TargetRegistrationCardProps {
   return {

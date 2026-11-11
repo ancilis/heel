@@ -747,6 +747,33 @@ def validate_disclosure_permit(value: Any) -> dict[str, Any]:
     _signature(obj, "permit_digest"); return copy.deepcopy(obj)
 
 
+RUNNER_DISCLOSURE_POLL_SCHEMA = "heel.runner-disclosure-poll.v1"
+CANARY_DISCLOSURE_STATE_SCHEMA = "heel.canary-disclosure-state.v1"
+RUNNER_DISCLOSURE_POLL_MAX_BYTES = 2048
+DISCLOSURE_POLL_STATES = frozenset({
+    "local_result_ready", "awaiting_disclosure_approval", "local_only", "synchronized",
+})
+
+
+def validate_runner_disclosure_poll_request(value: Any) -> dict[str, Any]:
+    """Metadata-only runner poll (result-handoff §3.3): never a findings byte."""
+    obj = _contract(value, RUNNER_DISCLOSURE_POLL_MAX_BYTES)
+    obj = _object(obj, {"schema_version", "run_id", "projection"})
+    _enum(obj["schema_version"], {RUNNER_DISCLOSURE_POLL_SCHEMA}); _id_fields(obj, ("run_id",))
+    projection = _object(obj["projection"], {"schema_version", "projection_digest", "byte_count", "scenario_count", "finding_count"})
+    _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA}); _hash(projection["projection_digest"])
+    _integer(projection["byte_count"], lower=1, upper=262144)
+    scenarios = _integer(projection["scenario_count"], lower=0, upper=4)
+    if _integer(projection["finding_count"], lower=0, upper=4) > scenarios: _fail("invalid disclosure counts")
+    return copy.deepcopy(obj)
+
+
+def validate_canary_disclosure_state(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 512); obj = _object(obj, {"schema_version", "run_id", "status"})
+    _enum(obj["schema_version"], {CANARY_DISCLOSURE_STATE_SCHEMA}); _id_fields(obj, ("run_id",))
+    _enum(obj["status"], set(DISCLOSURE_POLL_STATES)); return copy.deepcopy(obj)
+
+
 # --- discovery authorization, v2 plan object, inventory provenance (C2 contract §2) ---
 
 DISCOVERY_SEED_DIGEST = canonical_digest(list(DISCOVERY_SEED_PATHS))

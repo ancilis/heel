@@ -641,3 +641,269 @@ def test_upload_rolls_back_permit_projection_receipt_state_and_audit_together():
         conn.execute("SELECT status FROM canary_disclosure_requests").fetchone()[0]
         == "permitted"
     )
+
+
+# --- H2 metadata-only disclosure poll (result-handoff-completion spec §3.3/§3.5) ---
+#
+# Contract under test (proposed in the accepted spec, implemented in task A):
+# ``CanaryDisclosureService.poll(workspace_id, project_ref, run_id, runner_id, request,
+# *, runner_key_id)`` runs inside the caller's PoP transaction, registers exactly the
+# metadata ``preview`` registers, and answers either the closed disclosure state or the
+# stored, byte-identical one-use permit.  No findings bytes travel on this call.
+
+DISCLOSURE_STATE_SCHEMA = "heel.canary-disclosure-state.v1"
+DISCLOSURE_POLL_SCHEMA = "heel.runner-disclosure-poll.v1"
+
+
+def _poll_request(grant, findings, **overrides):
+    projection = {
+        "schema_version": findings["schema_version"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)),
+        "scenario_count": len(findings["scenario_results"]),
+        "finding_count": sum(
+            item["finding"] is not None for item in findings["scenario_results"]
+        ),
+    }
+    projection.update(overrides)
+    return {
+        "schema_version": DISCLOSURE_POLL_SCHEMA,
+        "run_id": grant["run_id"],
+        "projection": projection,
+    }
+
+
+def _poll(service, grant, findings, *, workspace=WORKSPACE, runner_id=RUNNER,
+          runner_key_id=None, **overrides):
+    return service.poll(
+        workspace,
+        PROJECT,
+        grant["run_id"],
+        runner_id,
+        _poll_request(grant, findings, **overrides),
+        runner_key_id=runner_key_id or findings["signing_key_id"],
+    )
+
+
+def _state(grant, status):
+    return {
+        "schema_version": DISCLOSURE_STATE_SCHEMA,
+        "run_id": grant["run_id"],
+        "status": status,
+    }
+
+
+def test_disclosure_poll_registers_metadata_once_and_reports_state():
+    conn, _, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+
+    first = _poll(service, grant, findings)
+    second = _poll(service, grant, findings)
+
+    assert first == second == _state(grant, "local_result_ready")
+    rows = conn.execute(
+        "SELECT run_id,runner_id,runner_key_id,projection_digest,maximum_bytes,"
+        "scenario_count,finding_count,status FROM canary_disclosure_requests"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(
+        grant["run_id"], RUNNER, runner.key_id, findings["projection_digest"],
+        len(canonical_bytes(findings)), 1, 1, "local_result_ready",
+    )]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_audit_records WHERE action='local_result_ready'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_findings_projections"
+    ).fetchone()[0] == 0
+    # The human ceremony reads the very request the runner registered.
+    preview = _preview(service, grant, findings)
+    assert preview["status"] == "local_result_ready"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_disclosure_requests"
+    ).fetchone()[0] == 1
+
+
+def test_disclosure_poll_returns_the_byte_identical_permit_until_consumed_then_synchronized():
+    conn, _, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    assert _poll(service, grant, findings) == _state(grant, "local_result_ready")
+    permit = _permit(service, grant, _preview(service, grant, findings))
+
+    polled = _poll(service, grant, findings)
+    replayed = _poll(service, grant, findings)
+
+    assert validate_disclosure_permit(polled) == permit
+    assert canonical_bytes(polled) == canonical_bytes(permit)
+    assert canonical_bytes(replayed) == canonical_bytes(permit)
+    assert canonical_bytes(polled).decode() == conn.execute(
+        "SELECT permit_json FROM canary_disclosure_permits WHERE permit_id=?",
+        (permit["permit_id"],),
+    ).fetchone()[0]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_disclosure_permits"
+    ).fetchone()[0] == 1
+
+    service.upload(
+        WORKSPACE, PROJECT, grant["run_id"], RUNNER, _upload(grant, polled, findings),
+    )
+    assert _poll(service, grant, findings) == _state(grant, "synchronized")
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_permits"
+    ).fetchone()[0] == "consumed"
+
+
+def test_disclosure_poll_reports_local_only_and_never_a_permit():
+    conn, _, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    preview = _preview(service, grant, findings)
+    service.local_only(
+        WORKSPACE, PROJECT, grant["run_id"],
+        request_id=preview["request_id"], actor="user_owner",
+    )
+
+    assert _poll(service, grant, findings) == _state(grant, "local_only")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_disclosure_permits"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_findings_projections"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"projection_digest": "f" * 64},
+        {"byte_count": 1},
+        {"scenario_count": 2},
+        {"finding_count": 0},
+    ],
+)
+def test_disclosure_poll_refuses_metadata_that_differs_from_the_registered_request(override):
+    conn, _, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    permit = _permit(service, grant, _preview(service, grant, findings))
+
+    with pytest.raises(ValueError) as forged:
+        _poll(service, grant, findings, **override)
+
+    assert forged.value.code == "canary_state_conflict"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_disclosure_requests"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_permits WHERE permit_id=?",
+        (permit["permit_id"],),
+    ).fetchone()[0] == "permitted"
+
+
+def test_disclosure_poll_from_another_runner_key_or_workspace_is_not_found():
+    conn, _, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    _permit(service, grant, _preview(service, grant, findings))
+
+    with pytest.raises(ValueError) as other_workspace:
+        _poll(service, grant, findings, workspace="ws_other")
+    assert other_workspace.value.code == "canary_run_not_found"
+    with pytest.raises(ValueError) as other_runner:
+        _poll(service, grant, findings, runner_id="runr_other")
+    assert other_runner.value.code == "canary_run_not_found"
+    with pytest.raises(ValueError) as other_key:
+        _poll(service, grant, findings, runner_key_id="key_other_runner_123456")
+    assert other_key.value.code == "canary_authority_unavailable"
+    with pytest.raises(ValueError) as foreign_run:
+        service.poll(
+            WORKSPACE, PROJECT, "crun_" + "0" * 32, RUNNER,
+            _poll_request(grant, findings), runner_key_id=runner.key_id,
+        )
+    assert foreign_run.value.code in {"canary_run_not_found", "invalid_canary_projection"}
+
+
+def test_disclosure_poll_after_key_revocation_or_before_terminal_result_is_refused():
+    from heel.saas.runner_auth import RunnerAuthStore, initialize_runner_auth_schema
+
+    conn = connect()
+    runner = seed_authority(conn)
+    initialize_runner_auth_schema(conn)
+    clock = Clock()
+    auth = RunnerAuthStore(conn, pepper=b"d" * 32, now=clock)
+    coordinator, _, approved = submit_and_approve(conn, clock, runner, runner_auth=auth)
+    coordinator.claim(WORKSPACE, RUNNER, runner.key_id)
+    grant = approved["grant"]
+    service = _service(conn, clock)
+    terminal = operational_projection(
+        runner, grant, sequence=0, phase="terminal", disposition="completed",
+    )
+    findings = _findings(runner, grant, terminal)
+    with pytest.raises(ValueError) as early:
+        _poll(service, grant, findings)
+    assert early.value.code == "canary_state_conflict"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canary_disclosure_requests"
+    ).fetchone()[0] == 0
+
+    conn2, _, runner2, service2, grant2, operational2 = _terminal_setup()
+    findings2 = _findings(runner2, grant2, operational2)
+    _permit(service2, grant2, _preview(service2, grant2, findings2))
+    conn2.execute(
+        "UPDATE canary_runner_keys SET status='revoked',revoked_at=1 WHERE workspace_id=? "
+        "AND runner_id=? AND key_id=?",
+        (WORKSPACE, RUNNER, runner2.key_id),
+    )
+    conn2.commit()
+    with pytest.raises(ValueError) as revoked:
+        _poll(service2, grant2, findings2)
+    assert revoked.value.code == "canary_authority_unavailable"
+
+
+def test_expired_permit_is_not_returned_and_a_fresh_human_permit_is_polled_next():
+    conn, clock, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    preview = _preview(service, grant, findings)
+    first = _permit(service, grant, preview)
+    clock.value += 601
+
+    assert _poll(service, grant, findings) == _state(
+        grant, "awaiting_disclosure_approval",
+    )
+    assert conn.execute(
+        "SELECT status FROM canary_disclosure_permits WHERE permit_id=?",
+        (first["permit_id"],),
+    ).fetchone()[0] == "expired"
+
+    fresh = _permit(
+        service, grant, preview, recent_auth_at_ms=int(clock.value * 1000),
+    )
+    polled = _poll(service, grant, findings)
+    assert fresh["permit_id"] != first["permit_id"]
+    assert canonical_bytes(polled) == canonical_bytes(fresh)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra_key", "schema", "projection_extra", "bool_count", "run_mismatch"],
+)
+def test_disclosure_poll_request_validator_is_closed(mutation):
+    from heel.canary_contracts import validate_runner_disclosure_poll_request
+
+    conn, _, runner, service, grant, operational = _terminal_setup()
+    findings = _findings(runner, grant, operational)
+    request = _poll_request(grant, findings)
+    assert validate_runner_disclosure_poll_request(copy.deepcopy(request)) == request
+    if mutation == "extra_key":
+        request["findings_projection"] = findings
+    elif mutation == "schema":
+        request["schema_version"] = "heel.runner-disclosure-poll.v2"
+    elif mutation == "projection_extra":
+        request["projection"]["scenario_results"] = []
+    elif mutation == "bool_count":
+        request["projection"]["finding_count"] = True
+    if mutation == "run_mismatch":
+        with pytest.raises(ValueError):
+            service.poll(
+                WORKSPACE, PROJECT, grant["run_id"], RUNNER,
+                {**request, "run_id": "crun_" + "1" * 32}, runner_key_id=runner.key_id,
+            )
+        return
+    with pytest.raises(ValueError):
+        validate_runner_disclosure_poll_request(request)

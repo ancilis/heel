@@ -3559,3 +3559,729 @@ def test_tls_edge_recovery_uses_the_production_transport_and_archives_the_edge_w
         assert set(seen["hosts"]) <= {"localhost", "127.0.0.1"} and seen["forbidden"] == []  # client and edge hop
     finally:
         cloud.close()
+
+
+# --------------------------------------------------------------------------- H2 result handoff
+#
+# Accepted result-handoff design (2026-11-11 §3.3/§3.5): while ``heel runner serve`` is idle the
+# runner polls ``POST …/runs/{run}/disclosure-poll`` on the run's result chain with metadata
+# only (digest, bytes, counts of the local findings projection), uploads the exact local
+# projection once through the existing permit-verified ``upload_findings`` when the poll answers
+# a human-issued permit, and stops polling on ``local_only``/``synchronized``.  Contract names
+# used below: ``RunnerCoordinator.advance_disclosures()`` (one bounded serve step),
+# ``RunnerControlClient.poll_disclosure(run_id=…, findings_projection=…)`` (staged
+# ``poll-disclosure`` call on the result chain), and the ``advance_disclosures`` serve hook.
+
+import contextlib  # noqa: E402
+
+_STATE_SCHEMA = "heel.canary-disclosure-state.v1"
+_POLL_SCHEMA = "heel.runner-disclosure-poll.v1"
+_TEN_MINUTES_MS = 10 * 60 * 1000
+
+
+def _handoff_coordinator(tmp_path, tail, *, now=None):
+    """A real-executor terminal run in runtime state ``available`` and its local findings.
+
+    ``tail(grant, findings, authority, coordinator)`` returns the scripted control answers
+    after the claim and terminal result.  ``now`` (a one-item list) drives both clocks.
+    """
+    clock = now if now is not None else [2_000]
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    grant = signed_grant(manifest, projection, identity, authority)
+    holder: dict = {}
+    transport = ScriptedControlTransport([
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"n")}, _claim(manifest, projection, grant)),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"x")}, _status(
+            grant["run_id"], approval_id=projection["projection_id"], status="terminal",
+        )),
+    ])
+    runtime = _control_runtime(tmp_path / "runtime.sqlite3", identity, signer)
+
+    def build(runtime_state, nonce_byte=b"c"):
+        client = RunnerControlClient(
+            origin="https://control.example", workspace_id=identity.workspace_id,
+            runner_id=identity.runner_id, signer=signer, clock=lambda: clock[0],
+            transport=transport, nonce_source=lambda _key: _nonce(nonce_byte),
+            trusted_disclosure_keys={authority.key_id: authority.public_key},
+            runtime=runtime_state,
+        )
+        coordinator = RunnerCoordinator(
+            control=client, store=store, identity=identity, signer=signer,
+            trusted_grant_keys={authority.key_id: authority.public_key},
+            clock_ms=lambda: clock[0], monotonic=lambda: 1.0,
+        )
+        return coordinator, client
+
+    coordinator, client = build(runtime)
+    lease = coordinator.claim()
+    assert lease is not None
+    completed = LocalCanaryExecutor(
+        store=coordinator.store, identity=identity, signer=signer,
+        trusted_grant_keys={authority.key_id: authority.public_key},
+        vaults={"ephemeral_env": StaticVault()}, clock_ms=lambda: 2_000,
+        monotonic=lambda: 1.0,
+    ).execute(lease.bundle, transport=ScriptedTransport([401, 200, 200, 403]), gate_source=active_gate)
+    coordinator.result(grant["run_id"], completed.operational_projection)
+    assert client.runtime.load_terminal_state(grant["run_id"]).state == "available"
+    findings = coordinator.store.load_final_projections(grant["run_id"])["local_view"][
+        "findings_projection"
+    ]
+    transport.responses.extend(tail(grant, findings, authority, coordinator, holder))
+    return SimpleNamespace(
+        coordinator=coordinator, client=client, transport=transport, grant=grant,
+        findings=findings, authority=authority, clock=clock, build=build, holder=holder,
+    )
+
+
+def _handoff_counts(findings):
+    return {
+        "scenario_count": len(findings["scenario_results"]),
+        "finding_count": sum(
+            item["finding"] is not None for item in findings["scenario_results"]
+        ),
+    }
+
+
+def _handoff_poll_body(grant, findings):
+    return canonical_bytes({
+        "schema_version": _POLL_SCHEMA,
+        "run_id": grant["run_id"],
+        "projection": {
+            "schema_version": findings["schema_version"],
+            "projection_digest": findings["projection_digest"],
+            "byte_count": len(canonical_bytes(findings)),
+            **_handoff_counts(findings),
+        },
+    })
+
+
+def _handoff_permit(authority, coordinator, grant, findings, **overrides):
+    return _permit(
+        authority, coordinator, grant, findings, **{**_handoff_counts(findings), **overrides},
+    )
+
+
+def _handoff_receipt(grant, findings, permit):
+    return {
+        "schema_version": "heel.canary-findings-receipt.v1",
+        "receipt_id": "cfr_runner_handoff",
+        "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
+        "run_id": grant["run_id"], "grant_id": grant["grant_id"],
+        "permit_id": permit["permit_id"], "projection_id": findings["projection_id"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)),
+        **_handoff_counts(findings),
+        "accepted_at_ms": 2_001, "status": "synchronized",
+    }
+
+
+def _handoff_state(grant, status):
+    return {"schema_version": _STATE_SCHEMA, "run_id": grant["run_id"], "status": status}
+
+
+def _paths(transport, start=0):
+    return [path.rsplit("/", 1)[-1] for path, _headers, _body in transport.requests[start:]]
+
+
+def test_serve_poll_uploads_once_on_permit_and_marks_the_terminal_disclosure_consumed(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")},
+             _handoff_receipt(grant, findings, permit)),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    poll_path, poll_headers, poll_body = h.transport.requests[start]
+    assert poll_path == (
+        f"/v1/workspaces/{h.grant['workspace_id']}/runners/{h.coordinator.identity.runner_id}"
+        f"/runs/{h.grant['run_id']}/disclosure-poll"
+    )
+    assert poll_body == _handoff_poll_body(h.grant, h.findings)
+    assert len(poll_body) <= 2048 and b"scenario_results" not in poll_body
+    assert b"local_evidence_refs" not in poll_body
+    assert poll_headers["X-Heel-Runner-Nonce"] == _nonce(b"x")
+    assert poll_headers["X-Heel-Runner-Sequence"] == "7"
+    _upload_path, upload_headers, upload_body = h.transport.requests[start + 1]
+    assert upload_headers["X-Heel-Runner-Nonce"] == _nonce(b"p")
+    assert upload_headers["X-Heel-Runner-Sequence"] == "8"
+    assert upload_body == canonical_bytes({
+        "schema_version": "heel.runner-findings-upload.v1",
+        "run_id": h.grant["run_id"], "permit": h.holder["permit"],
+        "findings_projection": h.findings,
+    })
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == "consumed"
+    assert state.permit_id == h.holder["permit"]["permit_id"]
+    assert state.findings_projection_digest == h.findings["projection_digest"]
+    assert h.client.runtime.load_pending_calls() == ()
+
+    # Consumed is terminal for the serve step: no further poll, no second upload.
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+
+
+def test_serve_poll_keeps_polling_on_the_advancing_result_chain_while_awaiting_a_decision(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")},
+             _handoff_state(grant, "local_result_ready")),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")},
+             _handoff_state(grant, "awaiting_disclosure_approval")),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    h.coordinator.advance_disclosures()
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
+    first, second = h.transport.requests[start:start + 2]
+    assert first[2] == second[2] == _handoff_poll_body(h.grant, h.findings)
+    assert (first[1]["X-Heel-Runner-Nonce"], first[1]["X-Heel-Runner-Sequence"]) == (_nonce(b"x"), "7")
+    assert (second[1]["X-Heel-Runner-Nonce"], second[1]["X-Heel-Runner-Sequence"]) == (_nonce(b"p"), "8")
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    assert h.client.runtime.load_pending_calls() == ()
+
+
+@pytest.mark.parametrize("status", ["local_only", "synchronized"])
+def test_serve_poll_stops_after_local_only_or_synchronized(tmp_path, status):
+    def tail(grant, findings, authority, coordinator, holder):
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, _handoff_state(grant, status))]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+
+    for _ in range(3):
+        h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    # No receipt is ever fabricated for a run whose bytes were not uploaded by this runner.
+    assert state is None or state.receipt_digest is None or status == "synchronized"
+    if status == "local_only":
+        assert state is None or state.state != "consumed"
+
+
+def test_staged_disclosure_poll_replays_without_a_second_registration_or_upload(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            # The first answer is lost (unreadable), leaving the sealed poll staged.
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, {"malformed": True}),
+            # Restart replays the exact sealed poll; the server answers the same state.
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")},
+             _handoff_state(grant, "awaiting_disclosure_approval")),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")},
+             _handoff_receipt(grant, findings, permit)),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    with contextlib.suppress(ValueError):
+        h.coordinator.advance_disclosures()
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    assert pending.chain_operation == "result" and pending.run_id == h.grant["run_id"]
+    sealed_path, sealed_headers, sealed_body = h.transport.requests[-1]
+
+    restarted, restarted_client = h.build(h.client.runtime, nonce_byte=b"z")
+    replay_path, replay_headers, replay_body = h.transport.requests[-1]
+    assert (replay_path, replay_body) == (sealed_path, sealed_body)
+    assert replay_headers == sealed_headers
+    assert restarted_client.runtime.load_pending_calls() == ()
+    assert "result-projection" not in _paths(h.transport, start)
+
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start) == [
+        "disclosure-poll", "disclosure-poll", "disclosure-poll", "result-projection",
+    ]
+    assert h.transport.requests[-2][1]["X-Heel-Runner-Nonce"] == _nonce(b"p")
+    assert restarted_client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start).count("result-projection") == 1
+
+
+@pytest.mark.parametrize("kind", ["other-run", "other-workspace", "expired", "wrong-key", "wrong-counts", "wrong-digest"])
+def test_permit_for_another_run_workspace_or_expired_is_refused_locally_before_any_bytes_are_sent(tmp_path, kind):
+    def tail(grant, findings, authority, coordinator, holder):
+        if kind == "other-run":
+            permit = _handoff_permit(authority, coordinator, {**grant, "run_id": "crun_" + "b" * 32}, findings)
+        elif kind == "other-workspace":
+            permit = _handoff_permit(authority, coordinator, {**grant, "workspace_id": "ws_other_123456"}, findings)
+        elif kind == "expired":
+            permit = _handoff_permit(authority, coordinator, grant, findings, issued_at_ms=1_000, expires_at_ms=2_000)
+        elif kind == "wrong-key":
+            permit = _handoff_permit(SigningAuthority.generate(), coordinator, grant, findings)
+        elif kind == "wrong-counts":
+            permit = _handoff_permit(authority, coordinator, grant, findings, finding_count=1)
+        else:
+            other = copy.deepcopy(findings)
+            other["projection_digest"] = "f" * 64
+            permit = _handoff_permit(authority, coordinator, grant, other)
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, permit)]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    with contextlib.suppress(ValueError):
+        h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+    assert all(b"scenario_results" not in body for _p, _h, body in h.transport.requests[start:])
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    assert all(
+        item.request_operation != "upload-findings"
+        for item in h.client.runtime.load_pending_calls()
+    )
+
+
+def test_serve_poll_backs_off_to_sixty_seconds_after_ten_minutes_and_stops_at_retention_expiry(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": bytes_nonce}, _handoff_state(grant, "awaiting_disclosure_approval"))
+            for bytes_nonce in (_nonce(b"1"), _nonce(b"2"), _nonce(b"3"), _nonce(b"4"), _nonce(b"5"))
+        ]
+
+    now = [2_000]
+    h = _handoff_coordinator(tmp_path, tail, now=now)
+    terminal_at = h.client.runtime.load_terminal_state(h.grant["run_id"]).terminal_at_ms
+    retention = h.client.runtime.load_terminal_state(h.grant["run_id"]).retention_expires_at_ms
+    start = len(h.transport.requests)
+
+    # Within ten minutes of terminal every idle step (the service paces steps at 2 s) polls.
+    now[0] = terminal_at + 2_000
+    h.coordinator.advance_disclosures()
+    now[0] = terminal_at + 4_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 2
+
+    # After ten minutes, at most one poll per 60 s.
+    now[0] = terminal_at + _TEN_MINUTES_MS + 1
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 3
+    now[0] += 2_000
+    h.coordinator.advance_disclosures()
+    now[0] += 30_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 3
+    now[0] += 30_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 4
+
+    # At retention expiry polling stops for good.
+    now[0] = retention
+    h.coordinator.advance_disclosures()
+    now[0] = retention + 120_000
+    h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 4
+
+
+def test_runner_service_advances_disclosures_on_each_idle_poll_and_serve_owner_gates_it():
+    from heel.runner.daemon import RunnerServeError, _ServeCoordinator
+
+    calls = []
+    coordinator = SimpleNamespace(
+        claim=lambda: None, advance_disclosures=lambda: calls.append("advance"),
+    )
+    service = RunnerService(coordinator=coordinator, executor=object(), idle_poll_interval=2.0)
+    assert service.run_once() is False
+    assert service.run_once() is False
+    assert calls == ["advance", "advance"]
+
+    inner = SimpleNamespace(advance_disclosures=lambda: calls.append("owned"))
+    owner = _ServeCoordinator(inner, lambda: None)
+    owner.advance_disclosures()
+    assert calls[-1] == "owned"
+    owner.close()
+    with pytest.raises(RunnerServeError):
+        owner.advance_disclosures()
+
+
+@pytest.mark.parametrize("status", ["local_only", "synchronized"])
+def test_process_local_stop_rereads_once_after_restart_and_ends_at_retention(tmp_path, status):
+    """Astra decision (CONTROLLER-LOCAL-STOP-DECISION): the stop is process-local and bounded.
+
+    A restarted serve process may send exactly one idempotent metadata-only poll that reads the
+    unchanged server state back, then stops again; at retention expiry no process polls at all.
+    No local state, receipt or table records the stop.
+    """
+    def tail(grant, findings, authority, coordinator, holder):
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, _handoff_state(grant, status)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")}, _handoff_state(grant, status)),
+        ]
+
+    now = [2_000]
+    h = _handoff_coordinator(tmp_path, tail, now=now)
+    before = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"]
+    after_stop = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    # The stop is not persisted: the sealed row is still the same `available` record, apart from
+    # the advanced result-chain cursor that the accepted poll consumed.
+    assert after_stop.state == "available" and after_stop.receipt_digest is None
+    assert after_stop.permit_id is None and after_stop.disclosed_at_ms is None
+    assert after_stop.retention_expires_at_ms == before.retention_expires_at_ms
+
+    restarted, restarted_client = h.build(h.client.runtime, nonce_byte=b"z")
+    restarted.advance_disclosures()
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
+    assert h.transport.requests[-1][2] == _handoff_poll_body(h.grant, h.findings)
+    assert h.transport.requests[-1][1]["X-Heel-Runner-Nonce"] == _nonce(b"p")
+
+    # At and past retention no process polls; the process-local stop set is pruned with it.
+    # (Constructing a further coordinator here would enter the base runtime/store retention prune
+    # of a never-shared ``available`` row, which is outside this handoff and reported separately.)
+    now[0] = before.retention_expires_at_ms
+    restarted.advance_disclosures()
+    now[0] += 120_000
+    restarted.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll"]
+    assert h.grant["run_id"] not in restarted._disclosure_stopped
+
+
+# --------------------------------------------------------------------------- retention prune lineage
+#
+# Base defect (task A report, CONFIRMED by probe): a run whose terminal disclosure reached
+# ``available`` (never shared) or ``consumed`` (shared) can never finish its retention prune: the
+# Store compares the detached record's ``local_terminal`` digest with the prune-pending state's
+# *immediate* predecessor, which is that later state.  Fresh synthetic fixtures only.
+
+def _shared_tail(grant, findings, authority, coordinator, holder):
+    permit = _handoff_permit(authority, coordinator, grant, findings)
+    return [
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+        (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, _handoff_receipt(grant, findings, permit)),
+    ]
+
+
+@pytest.mark.parametrize("lineage", ["available", "consumed"])
+def test_retention_prune_finishes_an_unshared_or_shared_run_from_its_exact_detached_lineage(tmp_path, lineage):
+    h = _handoff_coordinator(tmp_path, _shared_tail if lineage == "consumed" else (lambda *_: []))
+    if lineage == "consumed":
+        h.coordinator.advance_disclosures()
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == lineage
+    requests = len(h.transport.requests)
+
+    result = h.coordinator.maintenance_once(now_ms=state.retention_expires_at_ms)
+
+    assert (result.processed, result.has_more) == (1, False)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]) is None
+    assert h.coordinator.store.probe_run_reservation(h.grant["run_id"]).value == "absent"
+    assert len(h.transport.requests) == requests  # retention prune is local-only
+
+
+def test_retention_prune_refuses_a_prune_state_whose_terminal_lineage_differs_from_the_detached_record(tmp_path):
+    from heel.runner import runtime as runtime_module
+
+    h = _handoff_coordinator(tmp_path, lambda *_: [])
+    runtime = h.client.runtime
+    state = runtime.load_terminal_state(h.grant["run_id"])
+    (pending,) = runtime.claim_due_prune(now_ms=state.retention_expires_at_ms).items
+    # Re-seal the prune-pending row with one root lineage field changed and a self-consistent
+    # state digest: only the Store's binding to the detached local_terminal digest can refuse it.
+    with runtime._connection() as conn:
+        row = conn.execute(
+            "SELECT sealed_blob FROM terminal_disclosures WHERE run_hash=?", (pending.run_hash,),
+        ).fetchone()
+        core = dict(runtime._open(
+            row["sealed_blob"], schema="heel.runner-terminal-disclosure-state.v1",
+            primary_fields=(pending.run_hash,),
+        ))
+        core["terminal_at_ms"] += 1
+        core.pop("state_digest")
+        core["state_digest"] = runtime_module._state_digest(core)
+        changed = conn.execute(
+            "UPDATE terminal_disclosures SET sealed_blob=? WHERE run_hash=?",
+            (runtime._seal(core, schema=core["schema_version"], primary_fields=(pending.run_hash,)),
+             pending.run_hash),
+        ).rowcount
+        if conn.in_transaction:
+            conn.execute("COMMIT")
+    assert changed == 1
+    forged = runtime.load_terminal_state(h.grant["run_id"])
+    assert forged.state == "prune_pending" and forged.terminal_at_ms == pending.terminal_at_ms + 1
+    assert forged.state_digest != pending.state_digest
+    with pytest.raises(RunnerStoreError, match="local terminal prune authority is invalid"):
+        h.coordinator.store.prune_runtime_terminal(
+            h.grant["run_id"], runtime=runtime, expected_runtime_state_digest=forged.state_digest,
+            now_ms=forged.retention_expires_at_ms,
+        )
+    with pytest.raises(RunnerStoreError, match="local runtime prune receipt is unavailable"):
+        h.coordinator.store.load_pruned_run_receipt(
+            h.grant["run_id"], expected_runtime_state_digest=forged.state_digest,
+        )
+
+
+# --------------------------------------------------------------------------- staged poll recovery (F1)
+#
+# Fable H2 source review F1 (CONFIRMED, probe P4a): a non-200 or unreadable answer to a disclosure
+# poll leaves the sealed poll staged, and the serve step skipped every row with a pending call, so
+# the run was never polled again until ``heel runner serve`` restarted.  A row whose only pending
+# call is that poll stays due on the same cadence and is replayed byte-identically through the
+# existing pending path; nothing new is minted and every other staged call still parks the row.
+
+def _transient_poll_tail(first):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            first,
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, _handoff_receipt(grant, findings, permit)),
+        ]
+    return tail
+
+
+@pytest.mark.parametrize("first", [
+    (503, {}, {"error": "edge"}),
+    (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, {"malformed": True}),
+], ids=["edge-503", "unreadable-200"])
+def test_staged_poll_after_a_transient_answer_is_replayed_byte_identically_on_the_next_due_step(tmp_path, first):
+    h = _handoff_coordinator(tmp_path, _transient_poll_tail(first))
+    start = len(h.transport.requests)
+    assert h.coordinator.advance_disclosures() == 1
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure" and pending.run_id == h.grant["run_id"]
+    staged = h.transport.requests[-1]
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+    h.clock[0] += 2_000
+    assert h.coordinator.advance_disclosures() == 1  # same serve process, no restart
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "disclosure-poll", "result-projection"]
+    replay = h.transport.requests[start + 1]
+    assert replay == staged  # exact path, headers (nonce/sequence/signature) and body
+    upload_headers = h.transport.requests[start + 2][1]
+    assert upload_headers["X-Heel-Runner-Nonce"] == _nonce(b"p")
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == "consumed" and state.permit_id == h.holder["permit"]["permit_id"]
+    assert h.client.runtime.load_pending_calls() == ()
+    h.clock[0] += 2_000
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start).count("result-projection") == 1
+
+
+def test_staged_poll_replay_keeps_the_slow_cadence_and_stops_at_retention(tmp_path):
+    now = [2_000]
+    h = _handoff_coordinator(
+        tmp_path, lambda *_: [(503, {}, {"error": "edge"}) for _ in range(4)], now=now,
+    )
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+
+    now[0] = state.terminal_at_ms + _TEN_MINUTES_MS + 1
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    for step in (2_000, 30_000):  # not yet 60 s since the last attempt
+        now[0] += step
+        assert h.coordinator.advance_disclosures() == 0
+    assert len(h.transport.requests) - start == 1
+    now[0] += 30_000
+    assert h.coordinator.advance_disclosures() == 1
+    assert h.transport.requests[-1] == staged
+    assert len(h.transport.requests) - start == 2
+
+    now[0] = state.retention_expires_at_ms
+    assert h.coordinator.advance_disclosures() == 0
+    now[0] += 120_000
+    assert h.coordinator.advance_disclosures() == 0
+    assert len(h.transport.requests) - start == 2
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+def test_a_staged_poll_the_server_refuses_on_replay_never_uploads_and_still_blocks_startup(tmp_path):
+    conflict = {"schema_version": "heel.canary-error.v1", "code": "canary_state_conflict"}
+    h = _handoff_coordinator(
+        tmp_path, lambda *_: [(503, {}, {"error": "edge"})] + [(409, {}, dict(conflict)) for _ in range(3)],
+    )
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    for _ in range(2):
+        h.clock[0] += 2_000
+        h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll"] * 3
+    assert all(request == staged for request in h.transport.requests[start:])
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    # Pre-existing fail-closed policy (P4b): a refused staged replay keeps startup refused.
+    with pytest.raises(ValueError):
+        h.build(h.client.runtime, nonce_byte=b"z")
+
+
+# --------------------------------------------------------------------------- upload transient recovery
+#
+# Fable R1 Gate 2 (CONFIRMED): a 502/503/504 on the automatic findings upload parked the row until
+# ``heel runner serve`` restarted.  Only those three statuses are classified ``RunnerUploadDeferred``
+# (after the 401 authority check, before the next-nonce header and any body decode); the serve step
+# re-sends the exact sealed upload through the unchanged ``upload_findings`` on the slow cadence
+# only, and stops for the process on any other refusal, an unreadable answer or an expired permit.
+
+def _upload_tail(*answers):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        receipt = _handoff_receipt(grant, findings, permit)
+        return [(200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit))] + [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, receipt) if answer == "receipt" else answer
+            for answer in answers
+        ]
+    return tail
+
+
+def _staged_upload(h):
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "upload-findings" and pending.run_id == h.grant["run_id"]
+    return pending
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_a_transient_upload_status_is_resent_byte_identically_on_the_slow_cadence_to_consumed(tmp_path, status):
+    h = _handoff_coordinator(tmp_path, _upload_tail((status, {}, {"error": "edge"}), "receipt"))
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    staged = h.transport.requests[-1]
+    _staged_upload(h)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+    h.clock[0] += 60_000  # same serve process, no restart
+    assert h.coordinator.advance_disclosures() == 1
+
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection", "result-projection"]
+    assert h.transport.requests[-1] == staged  # exact path, headers and sealed body
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert state.state == "consumed" and state.permit_id == h.holder["permit"]["permit_id"]
+    assert h.client.runtime.load_pending_calls() == ()
+    for _ in range(3):
+        h.clock[0] += 60_000
+        h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 3
+
+
+def test_a_headerless_upload_503_is_classified_deferred_before_the_nonce_header_and_body(tmp_path):
+    from heel.runner.control_client import RunnerUploadDeferred
+
+    h = _handoff_coordinator(tmp_path, lambda *_: [
+        (503, {}, b"<html>edge</html>"),
+        (504, {"X-Heel-Runner-Next-Nonce": "not-a-nonce"}, None),
+        (401, {}, {"code": "invalid_runner_auth"}),
+    ])
+    permit = _handoff_permit(h.authority, h.coordinator, h.grant, h.findings)
+    for _ in range(2):
+        with pytest.raises(RunnerUploadDeferred) as raised:
+            h.coordinator.upload_findings(h.grant["run_id"], permit=permit, findings_projection=h.findings)
+        assert isinstance(raised.value, ValueError)
+    # 401 still wins over the deferral classification.
+    with pytest.raises(RunnerChainRecoveryRequired):
+        h.coordinator.upload_findings(h.grant["run_id"], permit=permit, findings_projection=h.findings)
+    _staged_upload(h)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+@pytest.mark.parametrize("answer", [
+    (409, {}, {"schema_version": "heel.canary-error.v1", "code": "canary_state_conflict"}),
+    (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, {"malformed": True}),
+], ids=["refused-409", "unreadable-200"])
+def test_a_refused_or_unreadable_upload_answer_stops_in_process_and_startup_stays_closed(tmp_path, answer):
+    h = _handoff_coordinator(tmp_path, _upload_tail(answer))
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    for _ in range(4):
+        h.clock[0] += 60_000
+        h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 2
+    _staged_upload(h)
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+    # Pre-existing fail-closed startup policy (P4b) is unchanged.
+    h.transport.responses.append(answer)
+    with pytest.raises(ValueError):
+        h.build(h.client.runtime, nonce_byte=b"z")
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+def test_a_permit_that_expires_while_its_upload_is_staged_is_never_resent(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        permit = _handoff_permit(authority, coordinator, grant, findings, expires_at_ms=32_000)
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (503, {}, {"error": "edge"}),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"]
+    for _ in range(4):
+        h.clock[0] += 60_000
+        h.coordinator.advance_disclosures()
+    assert len(h.transport.requests) - start == 2
+    _staged_upload(h)
+    with pytest.raises(ValueError, match="expired"):
+        h.build(h.client.runtime, nonce_byte=b"z")
+    assert len(h.transport.requests) - start == 2  # zero bytes on restart either
+
+
+def test_a_staged_upload_at_or_after_retention_is_never_resent_and_leaves_the_listing(tmp_path):
+    now = [2_000]
+    h = _handoff_coordinator(tmp_path, _upload_tail((503, {}, {"error": "edge"})), now=now)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    _staged_upload(h)
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    for at in (state.retention_expires_at_ms, state.retention_expires_at_ms + 120_000):
+        now[0] = at
+        assert h.coordinator.advance_disclosures() == 0
+        assert h.client.runtime.load_available_disclosures(now_ms=at).items == ()
+    assert len(h.transport.requests) - start == 2
+    _staged_upload(h)
+
+
+def test_a_staged_findings_upload_is_resent_and_never_polled_over(tmp_path):
+    edge = (503, {}, {"error": "edge"})
+    h = _handoff_coordinator(tmp_path, _upload_tail(edge, edge, edge, "receipt"))
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    assert h.client.runtime.load_available_disclosures(now_ms=h.clock[0]).items != ()
+    for _ in range(3):
+        h.clock[0] += 60_000
+        assert h.coordinator.advance_disclosures() == 1
+    assert _paths(h.transport, start) == ["disclosure-poll"] + ["result-projection"] * 4
+    assert all(request == staged for request in h.transport.requests[start + 1:])
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
+
+
+def test_a_staged_upload_is_not_resent_inside_sixty_seconds_even_in_the_fast_window(tmp_path):
+    h = _handoff_coordinator(tmp_path, _upload_tail((503, {}, {"error": "edge"}), "receipt"))
+    state = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = h.transport.requests[-1]
+    for step in (2_000, 30_000, 27_999):  # 59.999 s since the last attempt
+        h.clock[0] += step
+        assert h.clock[0] < state.terminal_at_ms + _TEN_MINUTES_MS
+        assert h.coordinator.advance_disclosures() == 0
+    assert len(h.transport.requests) - start == 2
+    h.clock[0] += 1
+    assert h.coordinator.advance_disclosures() == 1
+    assert h.transport.requests[-1] == staged
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"

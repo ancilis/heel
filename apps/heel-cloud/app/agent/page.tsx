@@ -6,7 +6,7 @@ import releaseManifest from "../../public/downloads/heel-open-core-manifest.json
 
 
 const WHEEL_SHA256 = releaseManifest.artifacts.find(
-  ({ name }) => name === "heel_sim-1.3.0rc3-py3-none-any.whl",
+  ({ name }) => name === "heel_sim-1.3.0rc4-py3-none-any.whl",
 )?.sha256;
 
 if (WHEEL_SHA256 === undefined) {
@@ -14,7 +14,7 @@ if (WHEEL_SHA256 === undefined) {
 }
 
 const INSTALL_AGENT = `python3 -m venv heel-rc2
-./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc3-py3-none-any.whl`;
+./heel-rc2/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl`;
 
 const PUBLIC_WHEEL_SHA256 = "f8698204e1d38aa80b8ca31dedd743c3d42e28d02c5153bddb4f02b44ecdf01c";
 
@@ -125,21 +125,21 @@ export default function AgentQuickstart() {
             </p>
             <p>
               The downloads below are this build&apos;s bundled files, not themselves a verified
-              public release: they are the 1.3.0rc3 candidate, which is not yet published as a
+              public release: they are the 1.3.0rc4 candidate, which is not yet published as a
               public release. The public command above is the recommended install.
             </p>
             <div className="hero-actions" aria-label="Heel Agent downloads">
               <a
                 className="button button-primary"
                 download
-                href="/downloads/heel_sim-1.3.0rc3-py3-none-any.whl"
+                href="/downloads/heel_sim-1.3.0rc4-py3-none-any.whl"
               >
-                Download Heel Agent 1.3.0rc3 candidate
+                Download Heel Agent 1.3.0rc4 candidate
               </a>
               <a
                 className="button button-secondary"
                 download
-                href="/downloads/heel_sim-1.3.0rc3.tar.gz"
+                href="/downloads/heel_sim-1.3.0rc4.tar.gz"
               >
                 Download source archive
               </a>

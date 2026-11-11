@@ -36,7 +36,8 @@ _SCHEMA_V1 = "heel.runner-runtime-state.v1"
 _SCHEMA_V2 = "heel.runner-runtime-state.v2"
 _SCHEMA_V3 = "heel.runner-runtime-state.v3"
 _SCHEMA_V4 = "heel.runner-runtime-state.v4"
-_SCHEMA = "heel.runner-runtime-state.v5"
+_SCHEMA_V5 = "heel.runner-runtime-state.v5"
+_SCHEMA = "heel.runner-runtime-state.v6"
 _SEAL_DOMAIN = b"heel.runner-runtime-state-seal.v1\0"
 _STATE_KEY_WRAP_DOMAIN = b"heel.runner-runtime-state-key-wrap.v1\0"
 _DIGEST_DOMAIN = b"heel.runner-runtime-state-digest.v1\0"
@@ -89,9 +90,11 @@ _PENDING_BODY_CAPS = MappingProxyType({
     "claim": 256, "list-contexts": 128, "claim-context": 256,
     "heartbeat": 36_864, "progress": 36_864, "stop-ack": 36_864,
     "result": 103_424, "submit-context-approval-projection": 69_632,
-    "upload-findings": 278_528,
+    "upload-findings": 278_528, "poll-disclosure": 2_048,
 })
 _PENDING_BODY_MAX = 278_528
+# Calls staged on a terminal run's sealed result cursor while its disclosure is ``available``.
+_RESULT_CHAIN_DISCLOSURE_OPERATIONS = frozenset({"upload-findings", "poll-disclosure"})
 _PENDING_BODY_B64_TEXT_CAP = 4 * -(-_PENDING_BODY_MAX // 3)
 _PENDING_BLOB_BOUND = 393_216   # pending_calls CHECK, nonce and tag included
 assert max(_PENDING_BODY_CAPS.values()) == _PENDING_BODY_MAX and _PENDING_BODY_B64_TEXT_CAP == 371_372
@@ -248,6 +251,30 @@ _V5_RETIRED_SQL = (
     "CREATE INDEX idx_retired_claims_created ON retired_claims(created_at_ms,run_hash)",
 )
 _V5_SCHEMA_SQL = (_V5_METADATA_SQL, *_V4_SCHEMA_SQL[1:], *_V5_RETIRED_SQL)
+
+# v6 (H2 result handoff) = v5 with one closed operation registered on pending_calls: the
+# metadata-only ``poll-disclosure`` call staged on a run's result chain.  Every other table,
+# index and row is unchanged; the upgrade rebuilds only pending_calls, copying rows verbatim.
+_V6_METADATA_SQL = _V5_METADATA_SQL.replace(
+    "CHECK(schema_version='heel.runner-runtime-state.v5')",
+    "CHECK(schema_version='heel.runner-runtime-state.v6')",
+)
+assert _V6_METADATA_SQL != _V5_METADATA_SQL
+_V5_PENDING_SQL = _V5_SCHEMA_SQL[2]
+assert _V5_PENDING_SQL.startswith("CREATE TABLE pending_calls(")
+_V6_PENDING_SQL = _V5_PENDING_SQL.replace(
+    "'stop-ack','upload-findings','list-contexts'",
+    "'stop-ack','upload-findings','poll-disclosure','list-contexts'",
+).replace(
+    "operation IN ('heartbeat','progress','result','stop-ack','upload-findings')))",
+    "operation IN ('heartbeat','progress','result','stop-ack','upload-findings','poll-disclosure')))",
+)
+assert _V6_PENDING_SQL.count("'poll-disclosure'") == 2
+_PENDING_INDEX_SQL = tuple(
+    statement for statement in _V5_SCHEMA_SQL if statement.startswith("CREATE INDEX idx_pending_calls_")
+)
+assert len(_PENDING_INDEX_SQL) == 2
+_V6_SCHEMA_SQL = (_V6_METADATA_SQL, _V5_SCHEMA_SQL[1], _V6_PENDING_SQL, *_V5_SCHEMA_SQL[3:])
 
 # Tier A load guards: index columns only, never an archive blob.  CROSS JOIN fixes the bounded live
 # table as the outer loop, so retired_claims is reached only by primary-key search.
@@ -1571,6 +1598,8 @@ class RunnerRuntimeState:
             return "v4"
         if self._schema_matches(conn, _V5_SCHEMA_SQL):
             return "v5"
+        if self._schema_matches(conn, _V6_SCHEMA_SQL):
+            return "v6"
         raise RunnerRuntimeCorrupt("runtime state schema is invalid")
 
     @staticmethod
@@ -1670,13 +1699,53 @@ class RunnerRuntimeState:
             "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
             "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v4 "
             "WHERE schema_version=?",
-            (_SCHEMA, _SCHEMA_V4),
+            (_SCHEMA_V5, _SCHEMA_V4),
         )
         if changed.rowcount != 1:
             raise RunnerRuntimeCorrupt("runtime state schema is invalid")
         conn.execute("DROP TABLE metadata_v4")
         self._execute_schema(conn, _V5_RETIRED_SQL)
         self._assert_schema_parity(conn, _V5_SCHEMA_SQL)
+
+    def _upgrade_v5_to_v6(self, conn: sqlite3.Connection) -> None:
+        """Register ``poll-disclosure`` on pending_calls; every v5 row is kept byte for byte."""
+        if not self._schema_matches(conn, _V5_SCHEMA_SQL):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._validate_opaque_authority_rows(conn)
+        before = conn.execute(
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms "
+            "FROM pending_calls ORDER BY call_id"
+        ).fetchall()
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v5")
+        conn.execute(_V6_METADATA_SQL)
+        changed = conn.execute(
+            "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
+            "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v5 "
+            "WHERE schema_version=?",
+            (_SCHEMA, _SCHEMA_V5),
+        )
+        if changed.rowcount != 1:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        conn.execute("DROP TABLE metadata_v5")
+        conn.execute("DROP INDEX idx_pending_calls_created")
+        conn.execute("DROP INDEX idx_pending_calls_run_operation")
+        conn.execute("ALTER TABLE pending_calls RENAME TO pending_calls_v5")
+        conn.execute(_V6_PENDING_SQL)
+        self._execute_schema(conn, _PENDING_INDEX_SQL)
+        copied = conn.execute(
+            "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms FROM pending_calls_v5"
+        )
+        if copied.rowcount != len(before):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        conn.execute("DROP TABLE pending_calls_v5")
+        after = conn.execute(
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms "
+            "FROM pending_calls ORDER BY call_id"
+        ).fetchall()
+        if [tuple(row) for row in after] != [tuple(row) for row in before]:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._assert_schema_parity(conn, _V6_SCHEMA_SQL)
 
     def _validate_opaque_authority_rows(self, conn: sqlite3.Connection) -> None:
         """Authenticate the legacy opaque index before a byte-for-byte v3 copy."""
@@ -1722,7 +1791,7 @@ class RunnerRuntimeState:
                 raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
 
     def _validate_open_runtime(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
-        self._assert_schema_parity(conn, _V5_SCHEMA_SQL)
+        self._assert_schema_parity(conn, _V6_SCHEMA_SQL)
         if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal" or conn.execute(
             "PRAGMA secure_delete"
         ).fetchone()[0] != 1 or conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
@@ -1780,7 +1849,7 @@ class RunnerRuntimeState:
         try:
             state = self._classify_schema(conn)
             if state == "none":
-                self._execute_schema(conn, _V5_SCHEMA_SQL)
+                self._execute_schema(conn, _V6_SCHEMA_SQL)
                 state_key = self._random_source(32)
                 if type(state_key) is not bytes or len(state_key) != 32:
                     raise RunnerRuntimeCorrupt("runtime state random source returned an invalid key")
@@ -1807,9 +1876,12 @@ class RunnerRuntimeState:
                 self._upgrade_v2_to_v3(conn)
                 self._upgrade_v3_to_v4(conn)
                 self._upgrade_v4_to_v5(conn)
-            elif state in {"v3", "v4", "v5"}:
+                self._upgrade_v5_to_v6(conn)
+            elif state in {"v3", "v4", "v5", "v6"}:
                 row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
-                expected_version = {"v3": _SCHEMA_V3, "v4": _SCHEMA_V4, "v5": _SCHEMA}[state]
+                expected_version = {
+                    "v3": _SCHEMA_V3, "v4": _SCHEMA_V4, "v5": _SCHEMA_V5, "v6": _SCHEMA,
+                }[state]
                 if row is None or row["schema_version"] != expected_version or tuple(
                     row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
                 ) != self._identity_values():
@@ -1819,6 +1891,8 @@ class RunnerRuntimeState:
                     self._upgrade_v3_to_v4(conn)
                 if state in {"v3", "v4"}:
                     self._upgrade_v4_to_v5(conn)
+                if state in {"v3", "v4", "v5"}:
+                    self._upgrade_v5_to_v6(conn)
             self._validate_open_runtime(conn, allow_rotation_fence=allow_rotation_fence)
             conn.execute("COMMIT")
         except BaseException:
@@ -3283,7 +3357,7 @@ class RunnerRuntimeState:
         chain_operation = value["chain_operation"]
         valid_requests = {
             "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings",
-            "list-contexts", "claim-context", "submit-context-approval-projection",
+            "poll-disclosure", "list-contexts", "claim-context", "submit-context-approval-projection",
         }
         if request_operation not in valid_requests or chain_operation not in {
             "claim", "heartbeat", "progress", "result", "stop-ack",
@@ -3292,7 +3366,7 @@ class RunnerRuntimeState:
         run_id = _run_id(value["run_id"], nullable=True)
         expected_chain = (
             "claim" if request_operation in {"claim", "list-contexts", "claim-context", "submit-context-approval-projection"}
-            else "result" if request_operation == "upload-findings" else request_operation
+            else "result" if request_operation in _RESULT_CHAIN_DISCLOSURE_OPERATIONS else request_operation
         )
         if chain_operation != expected_chain or ((chain_operation == "claim") != (run_id is None)):
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
@@ -3398,6 +3472,8 @@ class RunnerRuntimeState:
             return run_id is not None and path == f"{prefix}/runs/{run_id}/{request_operation}"
         if request_operation == "upload-findings":
             return run_id is not None and path == f"{prefix}/runs/{run_id}/result-projection"
+        if request_operation == "poll-disclosure":
+            return run_id is not None and path == f"{prefix}/runs/{run_id}/disclosure-poll"
         if request_operation == "list-contexts":
             return path == f"{prefix}/contexts/list"
         if request_operation == "claim-context":
@@ -4134,6 +4210,73 @@ class RunnerRuntimeState:
                 raise
         return TerminalDisclosureBatch(items=states, has_more=len(rows) > limit)
 
+    def terminal_root_state_digest(self, state: TerminalDisclosureState) -> str:
+        """Recompute the exact ``local_terminal`` digest a later terminal state descends from.
+
+        Every root field is retained unchanged by ``available``, ``consumed`` and
+        ``prune_pending``; the Store binds this value to its signed detach record.
+        """
+        if type(state) is not TerminalDisclosureState or state.workspace_id != self.identity.workspace_id \
+                or state.runner_id != self.identity.runner_id or state.runner_key_id != self.identity.key_id:
+            raise RunnerRuntimeStateError("invalid runtime terminal state")
+        core = self._terminal_core(
+            state="local_terminal", workspace_id=state.workspace_id,
+            runner_id=state.runner_id, runner_key_id=state.runner_key_id,
+            run_id=state.run_id, run_hash=state.run_hash, project_id=state.project_id,
+            grant_id=state.grant_id, approval_projection_digest=state.approval_projection_digest,
+            terminal_projection_digest=state.terminal_projection_digest,
+            terminal_record_digest=state.terminal_record_digest, terminal_at_ms=state.terminal_at_ms,
+            retention_expires_at_ms=state.retention_expires_at_ms, result_chain=None,
+            available_at_ms=None, permit_id=None, findings_projection_digest=None,
+            receipt_digest=None, disclosed_at_ms=None, revision=1, prior_state_digest=None,
+        )
+        return self._validate_terminal_core(core).state_digest
+
+    def load_available_disclosures(
+        self, *, now_ms: int, after: tuple[int, str] | None = None, limit: int = 16,
+    ) -> TerminalDisclosureBatch:
+        """Return one bounded keyset page of unexpired ``available`` disclosures that the serve step may poll.
+
+        Read-only.  Pages are ordered by (retention, run hash) so a caller can walk every retained
+        row without an unbounded read.  A row whose only staged call is its own metadata-only
+        ``poll-disclosure`` or its sealed ``upload-findings`` stays listed so the caller replays
+        that exact sealed call on its cadence (the result chain admits at most one staged call);
+        a row with any other staged call is left to startup replay.
+        """
+        if type(limit) is not int or not 1 <= limit <= 16:
+            raise RunnerRuntimeStateError("invalid runtime disclosure page limit")
+        now_ms = _safe_int(now_ms, "runtime disclosure time")
+        if after is None:
+            cursor_retention, cursor_hash = -1, ""
+        else:
+            if type(after) is not tuple or len(after) != 2:
+                raise RunnerRuntimeStateError("invalid runtime disclosure page cursor")
+            cursor_retention = _safe_int(after[0], "runtime disclosure page cursor")
+            cursor_hash = _digest(after[1], "runtime disclosure page cursor")
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = conn.execute(
+                    "SELECT run_hash,retention_expires_at_ms,state,sealed_blob,updated_at_ms "
+                    "FROM terminal_disclosures INDEXED BY idx_terminal_disclosures_state_retention "
+                    "WHERE state='available' AND retention_expires_at_ms>? "
+                    "AND (retention_expires_at_ms>? OR (retention_expires_at_ms=? AND run_hash>?)) "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM pending_calls INDEXED BY idx_pending_calls_run_operation "
+                    "WHERE pending_calls.run_hash=terminal_disclosures.run_hash "
+                    "AND pending_calls.operation NOT IN ('poll-disclosure','upload-findings')"
+                    ") ORDER BY retention_expires_at_ms,run_hash LIMIT ?",
+                    (now_ms, cursor_retention, cursor_retention, cursor_hash, limit + 1),
+                ).fetchall()
+                states = tuple(self._load_terminal_row_locked(row) for row in rows[:limit])
+                if any(state.state != "available" for state in states):
+                    raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return TerminalDisclosureBatch(items=states, has_more=len(rows) > limit)
+
     def _terminal_core(self, **values: Any) -> dict[str, Any]:
         core_without_digest = {
             "schema_version": "heel.runner-terminal-disclosure-state.v1", **values,
@@ -4771,10 +4914,12 @@ class RunnerRuntimeState:
 
     def stage_disclosure_call(
         self, lease: _TerminalDisclosureLease, *, path: str, headers: Mapping[str, str],
-        body: bytes, now_ms: int,
+        body: bytes, now_ms: int, request_operation: str = "upload-findings",
     ) -> PendingSignedCall:
         lease = self._require_lease(lease, require_unused=True)
-        if type(body) is not bytes or len(body) > _PENDING_BODY_CAPS["upload-findings"]:
+        if request_operation not in _RESULT_CHAIN_DISCLOSURE_OPERATIONS:
+            raise RunnerRuntimeStateError("invalid runtime pending call")
+        if type(body) is not bytes or len(body) > _PENDING_BODY_CAPS[request_operation]:
             raise RunnerRuntimeStateError("invalid runtime pending body")
         now_ms = _safe_int(now_ms, "runtime disclosure time")
         with self._connection() as conn:
@@ -4795,7 +4940,7 @@ class RunnerRuntimeState:
                 ):
                     raise TerminalDisclosureUnavailable("terminal disclosure is unavailable")
                 run_id = state.run_id
-                if not self._expected_path("upload-findings", run_id, path):
+                if not self._expected_path(request_operation, run_id, path):
                     raise RunnerRuntimeStateError("invalid runtime pending call")
                 sequence = state.result_chain["next_sequence"]
                 generation = state.result_chain["generation"]
@@ -4813,7 +4958,7 @@ class RunnerRuntimeState:
                 call_id = hashlib.sha256(
                     b"heel.runner-pending-call-id.v1\0" + canonical_bytes({
                         "workspace_id": self.identity.workspace_id, "runner_id": self.identity.runner_id,
-                        "runner_key_id": self.identity.key_id, "request_operation": "upload-findings",
+                        "runner_key_id": self.identity.key_id, "request_operation": request_operation,
                         "chain_operation": "result", "run_id": run_id, "path": path,
                         "body_sha256": body_digest, "server_nonce_b64": nonce,
                         "sequence": sequence, "generation": generation,
@@ -4822,7 +4967,7 @@ class RunnerRuntimeState:
                 core_without_digest = {
                     "schema_version": "heel.runner-pending-call.v1", "workspace_id": self.identity.workspace_id,
                     "runner_id": self.identity.runner_id, "runner_key_id": self.identity.key_id,
-                    "call_id": call_id, "request_operation": "upload-findings", "chain_operation": "result",
+                    "call_id": call_id, "request_operation": request_operation, "chain_operation": "result",
                     "run_id": run_id, "path": path, "capability": "runner_result", "method": "POST",
                     "headers": validated_headers, "body_b64": self._canonical_b64(body),
                     "body_sha256": body_digest, "server_nonce_b64": nonce,
@@ -4833,11 +4978,83 @@ class RunnerRuntimeState:
                 conn.execute(
                     "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
                     "VALUES(?,?,?,?,?,?,?,?)",
-                    (call_id, chain, state.run_hash, "upload-findings", sequence, generation, blob, now_ms),
+                    (call_id, chain, state.run_hash, request_operation, sequence, generation, blob, now_ms),
                 )
                 conn.execute("COMMIT")
                 lease._used = True
                 return pending
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def commit_disclosure_poll(
+        self, call_id: str, lease: _TerminalDisclosureLease, *, next_nonce_b64: str, now_ms: int,
+    ) -> TerminalDisclosureState:
+        """Advance the sealed result cursor after an accepted metadata-only poll.
+
+        The disclosure stays ``available`` at the same revision: a poll moves no findings byte,
+        records no permit and no receipt.  Only the exact staged call for the exact leased state
+        may commit, and the server's next nonce must differ from the consumed one.
+        """
+        call_id = _digest(call_id, "runtime pending call ID")
+        lease = self._require_lease(lease, require_unused=False)
+        next_nonce_b64 = _nonce(next_nonce_b64)
+        now_ms = _safe_int(now_ms, "runtime disclosure time")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT chain,run_hash,operation,sealed_blob FROM pending_calls WHERE call_id=?", (call_id,),
+                ).fetchone()
+                if row is None:
+                    raise RunnerRuntimeConflict("runtime pending call is unavailable")
+                pending, _pending_core = self._validate_pending_core(self._open(
+                    row["sealed_blob"], schema="heel.runner-pending-call.v1", primary_fields=(call_id,),
+                ))
+                if (
+                    pending.request_operation != "poll-disclosure" or row["operation"] != "poll-disclosure"
+                    or pending.chain_operation != "result" or pending.run_id is None
+                    or row["run_hash"] != lease._run_hash
+                    or row["chain"] != self._chain_key("result", pending.run_id)
+                ):
+                    raise RunnerRuntimeCorrupt("runtime pending disclosure poll is invalid")
+                state = self._load_terminal_locked(conn, pending.run_id)
+                if (
+                    state is None or state.state != "available" or state.state_digest != lease._state_digest
+                    or state.result_chain is None or pending.prior_chain_state_digest != state.state_digest
+                    or pending.sequence != state.result_chain["next_sequence"]
+                    or pending.generation != state.result_chain["generation"]
+                    or pending.headers["X-Heel-Runner-Nonce"] != state.result_chain["next_nonce_b64"]
+                    or next_nonce_b64 == state.result_chain["next_nonce_b64"]
+                ):
+                    raise RunnerRuntimeCorrupt("runtime disclosure poll does not match local authority")
+                result_chain = {
+                    "operation": "result", "run_id": state.run_id, "next_nonce_b64": next_nonce_b64,
+                    "next_sequence": state.result_chain["next_sequence"] + 1,
+                    "generation": state.result_chain["generation"],
+                }
+                core = self._terminal_core(
+                    state="available", workspace_id=self.identity.workspace_id,
+                    runner_id=self.identity.runner_id, runner_key_id=self.identity.key_id,
+                    run_id=state.run_id, run_hash=state.run_hash, project_id=state.project_id,
+                    grant_id=state.grant_id, approval_projection_digest=state.approval_projection_digest,
+                    terminal_projection_digest=state.terminal_projection_digest,
+                    terminal_record_digest=state.terminal_record_digest,
+                    terminal_at_ms=state.terminal_at_ms,
+                    retention_expires_at_ms=state.retention_expires_at_ms,
+                    result_chain=result_chain, available_at_ms=state.available_at_ms, permit_id=None,
+                    findings_projection_digest=None, receipt_digest=None, disclosed_at_ms=None,
+                    revision=2, prior_state_digest=state.prior_state_digest,
+                )
+                advanced = self._validate_terminal_core(core)
+                blob = self._seal(core, schema=core["schema_version"], primary_fields=(state.run_hash,))
+                conn.execute(
+                    "UPDATE terminal_disclosures SET state=?,sealed_blob=?,updated_at_ms=? WHERE run_hash=?",
+                    (advanced.state, blob, max(now_ms, state.available_at_ms or 0), state.run_hash),
+                )
+                conn.execute("DELETE FROM pending_calls WHERE call_id=?", (call_id,))
+                conn.execute("COMMIT")
+                return advanced
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
@@ -5084,7 +5301,8 @@ class RunnerRuntimeState:
                             call = pending_calls[0]
                             result = state.result_chain
                             if (
-                                result is None or call.request_operation != "upload-findings"
+                                result is None
+                                or call.request_operation not in _RESULT_CHAIN_DISCLOSURE_OPERATIONS
                                 or call.chain_operation != "result"
                                 or call.prior_chain_state_digest != state.state_digest
                                 or call.sequence != result["next_sequence"]

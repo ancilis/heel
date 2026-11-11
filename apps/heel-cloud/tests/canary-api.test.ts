@@ -753,3 +753,105 @@ describe("pending ownership-proof recovery", () => {
     expect(transport).not.toHaveBeenCalled();
   });
 });
+
+
+// CUSTOMER-RESULT-HANDOFF-B: the human disclosure read and the synchronized findings read, both strict and closed.
+describe("disclosure state and synchronized findings reads", () => {
+  const disclosurePath = `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/disclosure`;
+  const findingsPath = `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/findings`;
+
+  function disclosure(overrides: Record<string, unknown> = {}, projection: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      schema_version: "heel.canary-disclosure-preview.v1", request_id: `cdr_${"1".repeat(32)}`, run_id: run,
+      status: "awaiting_disclosure_approval",
+      projection: { schema_version: "heel.canary-findings-projection.v1", projection_digest: digest, byte_count: 1840, scenario_count: 1, finding_count: 1, ...projection },
+      ...overrides,
+    };
+  }
+
+  function findings(): Record<string, unknown> {
+    return {
+      schema_version: "heel.canary-findings-projection.v1", projection_id: "cfp_synthetic", run_id: run,
+      grant_id: "cgr_synthetic", workspace_id: workspace, project_id: project, environment_id: `env_${"e".repeat(32)}`,
+      manifest_digest: "1".repeat(64), approval_projection_digest: "2".repeat(64), grant_digest: "3".repeat(64),
+      engine_version: "heel-1.3.0", adapter_versions: ["plan-differential.v1"], started_at_ms: 1, finished_at_ms: 2,
+      assessment_outcome: "observed",
+      scenario_results: [{
+        ordinal: 0, scenario_id: "plan-differential-export", adapter_version: "plan-differential.v1",
+        assessment_outcome: "observed", route: { method: "GET", route_template: "/api/export" },
+        observations: [
+          { semantic_role: "higher_plan", status_code: 200, body_shape: "json_object", truncation_state: "complete" },
+          { semantic_role: "lower_plan", status_code: 200, body_shape: "json_object", truncation_state: "complete" },
+        ],
+        finding: { title: "Synthetic finding title", reachability_rationale: "Synthetic rationale.", confidence: "medium", recommended_control: "Synthetic control.", regression_suggestion: "Synthetic regression." },
+        containment_codes: ["action_completed", "redacted"], redaction_count: 2, local_evidence_refs: [`ev1_${"4".repeat(64)}`],
+      }],
+      containment_codes: ["action_completed", "redacted"], redaction_count: 2, projection_digest: digest,
+      signing_key_id: "runner_key_synthetic", signature_b64: "A".repeat(86) + "==",
+    };
+  }
+
+  it("getDisclosure reads the fixed view route and returns the server metadata unchanged", async () => {
+    const calls: Array<[string, RequestInit]> = [];
+    const api = new CanaryApi({ transport: async (path, init) => { calls.push([path, init]); return jsonResponse(disclosure()); } });
+    const controller = new AbortController();
+    const state = await api.getDisclosure(workspace, project, run, controller.signal);
+    expect(calls.map(([path, init]) => [path, init.method, init.body])).toEqual([[disclosurePath, "GET", undefined]]);
+    expect(state).toEqual({
+      requestId: `cdr_${"1".repeat(32)}`, runId: run, status: "awaiting_disclosure_approval",
+      projection: { projectionDigest: digest, projectionBytes: 1840, scenarioCount: 1, findingCount: 1 },
+    });
+    expect(Object.isFrozen(state) && Object.isFrozen(state.projection)).toBe(true);
+    for (const status of ["local_result_ready", "permitted", "synchronized", "local_only", "expired"]) {
+      const value = await new CanaryApi({ transport: async () => jsonResponse(disclosure({ status })) }).getDisclosure(workspace, project, run);
+      expect(value.status).toBe(status);
+    }
+  });
+
+  it("getDisclosure refuses any extra, missing or out-of-range field and another run", async () => {
+    const malformed: Record<string, unknown>[] = [
+      disclosure({ extra: true }),
+      disclosure({ schema_version: "heel.canary-disclosure-state.v1" }),
+      disclosure({ run_id: `crun_${"f".repeat(32)}` }),
+      disclosure({ status: "consumed" }),
+      disclosure({ request_id: "cdr_short" }),
+      disclosure({}, { byte_count: 0 }),
+      disclosure({}, { byte_count: 256 * 1024 + 1 }),
+      disclosure({}, { scenario_count: 5 }),
+      disclosure({}, { finding_count: 2 }),
+      disclosure({}, { projection_digest: "A".repeat(64) }),
+      disclosure({}, { findings: [] }),
+      { schema_version: "heel.canary-disclosure-state.v1", run_id: run, status: "local_only" },
+    ];
+    for (const value of malformed) {
+      await expect(new CanaryApi({ transport: async () => jsonResponse(value) }).getDisclosure(workspace, project, run))
+        .rejects.toMatchObject({ code: "invalid_response" });
+    }
+    const notFound = new CanaryApi({ transport: async () => jsonResponse({ schema_version: "heel.canary-error.v1", code: "canary_run_not_found" }, 404) });
+    await expect(notFound.getDisclosure(workspace, project, run)).rejects.toMatchObject({ code: "canary_run_not_found", status: 404 });
+    const transport = vi.fn(async () => jsonResponse(disclosure()));
+    await expect(new CanaryApi({ transport }).getDisclosure(workspace, project, "crun_../x")).rejects.toMatchObject({ code: "invalid_request" });
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it("getFindings returns the exact validated projection on the fixed route and honors an abort", async () => {
+    const calls: string[] = [];
+    const api = new CanaryApi({ transport: async (path) => { calls.push(path); return jsonResponse(findings()); } });
+    const value = await api.getFindings(workspace, project, run);
+    expect(calls).toEqual([findingsPath]);
+    expect(value).toEqual(findings());
+    expect(Object.isFrozen(value.scenario_results[0].finding)).toBe(true);
+
+    const aborted = new AbortController();
+    aborted.abort();
+    const abortable = new CanaryApi({ transport: async (_path, init) => {
+      if ((init.signal as AbortSignal).aborted) throw new DOMException("aborted", "AbortError");
+      return jsonResponse(findings());
+    } });
+    await expect(abortable.getFindings(workspace, project, run, aborted.signal)).rejects.toMatchObject({ code: "unavailable" });
+
+    const derived = { ...findings(), derived_findings: [] };
+    await expect(new CanaryApi({ transport: async () => jsonResponse(derived) }).getFindings(workspace, project, run))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+});

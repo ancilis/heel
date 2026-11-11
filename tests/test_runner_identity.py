@@ -1,7 +1,11 @@
 import base64
 import hashlib
 import io
+import os
+import shutil
+import socket
 import subprocess
+import tempfile
 
 import pytest
 
@@ -19,6 +23,99 @@ from heel.runner.identity import (
 
 
 WORDS = [f"word{i:04d}" for i in range(2048)]
+_BUS_GUID = "0123456789abcdef0123456789abcdef"
+_SEARCH_ARGV = ("/usr/bin/secret-tool", "search", "heel", "runner", "label", "runner-linux")
+
+
+class SessionBus:
+    def __init__(self, root: str, path: str, guid: str):
+        self.root, self.path, self.guid = root, path, guid
+        self.address = f"unix:path={path},guid={guid}"
+
+
+@pytest.fixture
+def session_bus(monkeypatch):
+    """A real user-owned AF_UNIX socket under an owned, short, private temporary root.
+
+    Workspace TMPDIR paths can exceed the AF_UNIX path limit, so the root is created directly
+    under /private/tmp (macOS) or /tmp (Linux) with mkdtemp's owner-only mode.
+    """
+    base = "/private/tmp" if os.path.isdir("/private/tmp") else "/tmp"
+    root = tempfile.mkdtemp(prefix="heelbus-", dir=base)
+    path = os.path.join(root, "bus")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(path)
+        bus = SessionBus(root, path, _BUS_GUID)
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", bus.address)
+        yield bus
+    finally:
+        listener.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# Each entry is (case id, address template or None for unset, patch getuid to another uid).
+# Templates use {sock} (the real socket), {root} (its directory), {file} (a regular file) and
+# {link} (a symlink to the socket).
+UNSUPPORTED_BUS_ADDRESSES = [
+    ("unset", None, False),
+    ("empty", "", False),
+    ("tcp", "tcp:host=127.0.0.1,port=1", False),
+    ("nonce_tcp", "nonce-tcp:host=127.0.0.1,port=1,noncefile={root}/nonce", False),
+    ("unixexec", "unixexec:path=/bin/sh", False),
+    ("autolaunch", "autolaunch:", False),
+    ("abstract", "unix:abstract=heel-bus", False),
+    ("tmpdir", "unix:tmpdir={root}", False),
+    ("runtime", "unix:runtime=yes", False),
+    ("list", "unix:path={sock};tcp:host=127.0.0.1,port=1", False),
+    ("list_trailing", "unix:path={sock};", False),
+    ("relative", "unix:path=heel/bus", False),
+    ("not_normalized", "unix:path={root}/./bus", False),
+    ("dotdot", "unix:path={root}/../{rootname}/bus", False),
+    ("regular_file", "unix:path={file}", False),
+    ("directory", "unix:path={root}", False),
+    ("symlink", "unix:path={link}", False),
+    ("missing", "unix:path={root}/absent", False),
+    ("foreign_uid", "unix:path={sock}", True),
+    ("percent_escape", "unix:path={root}%2fbus", False),
+    ("oversized", "unix:path={sock},guid=" + "0" * 2048, False),
+    ("guid_short", "unix:path={sock},guid=0123", False),
+    ("guid_upper", "unix:path={sock},guid=0123456789ABCDEF0123456789ABCDEF", False),
+    ("guid_nonhex", "unix:path={sock},guid=" + "g" * 32, False),
+    ("duplicate_path", "unix:path={sock},path={sock}", False),
+    ("duplicate_guid", "unix:path={sock},guid=" + _BUS_GUID + ",guid=" + _BUS_GUID, False),
+    ("unknown_key", "unix:path={sock},extra=1", False),
+    ("empty_pair", "unix:path={sock},", False),
+    ("no_path", "unix:guid=" + _BUS_GUID, False),
+    ("bare_key", "unix:path", False),
+    ("whitespace", " unix:path={sock}", False),
+    ("upper_scheme", "UNIX:path={sock}", False),
+    ("non_ascii", "unix:path={root}/b\u00fcs", False),
+    ("control_char", "unix:path={sock}\t", False),
+]
+
+
+def apply_bus_address(monkeypatch, bus: SessionBus, template, foreign_uid: bool) -> list[str]:
+    """Install one unsupported address; return the strings that must never appear in errors."""
+    regular = os.path.join(bus.root, "file")
+    link = os.path.join(bus.root, "link")
+    if not os.path.exists(regular):
+        with open(regular, "wb"):
+            pass
+    if not os.path.lexists(link):
+        os.symlink(bus.path, link)
+    if template is None:
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    else:
+        value = template.format(
+            sock=bus.path, root=bus.root, file=regular, link=link,
+            rootname=os.path.basename(bus.root),
+        )
+        monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", value)
+    if foreign_uid:
+        real_uid = os.getuid()
+        monkeypatch.setattr("heel.runner.identity.os.getuid", lambda: real_uid + 1)
+    return [bus.path, bus.root, bus.guid, "heelbus-"]
 
 
 class FakeRandom:
@@ -339,7 +436,7 @@ def test_macos_first_create_never_overwrites_a_racing_keychain_account(monkeypat
     assert base64.b64encode(generated_seed).decode() not in str(caught.value)
 
 
-def test_linux_first_create_uses_only_verified_helper_and_stdin_for_seed(monkeypatch):
+def test_linux_first_create_uses_only_verified_helper_and_stdin_for_seed(monkeypatch, session_bus):
     expected_seed = b"l" * 32
     encoded_seed = base64.b64encode(expected_seed)
     calls = []
@@ -361,6 +458,7 @@ def test_linux_first_create_uses_only_verified_helper_and_stdin_for_seed(monkeyp
     assert signer.public_key and encoded_seed not in repr(signer).encode()
     assert [call[0] for call in calls] == [
         ("/usr/bin/secret-tool", "lookup", "heel", "runner", "label", "runner-linux"),
+        _SEARCH_ARGV,
         ("/usr/bin/secret-tool", "store", "--label=Heel runner signing key",
          "heel", "runner", "label", "runner-linux"),
     ]
@@ -369,14 +467,16 @@ def test_linux_first_create_uses_only_verified_helper_and_stdin_for_seed(monkeyp
         assert kwargs == {
             "stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
             "stderr": subprocess.DEVNULL, "shell": False, "bufsize": 0,
-            "env": {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            "env": {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                    "DBUS_SESSION_BUS_ADDRESS": session_bus.address},
         }
         assert process.wait_timeouts == [5]
     assert bytes(calls[0][2].stdin.data) == b""
-    assert bytes(calls[1][2].stdin.data) == encoded_seed
+    assert bytes(calls[1][2].stdin.data) == b""
+    assert bytes(calls[2][2].stdin.data) == encoded_seed
 
 
-def test_linux_helper_output_is_bounded_and_never_exposed(monkeypatch):
+def test_linux_helper_output_is_bounded_and_never_exposed(monkeypatch, session_bus):
     secret_marker = b"linux-private-helper-output"
 
     def popen(argv, **kwargs):
@@ -388,6 +488,103 @@ def test_linux_helper_output_is_bounded_and_never_exposed(monkeypatch):
     with pytest.raises(RuntimeError, match="invalid material") as caught:
         backend.load("runner-linux")
     assert secret_marker.decode() not in str(caught.value)
+
+
+def _linux_backend(monkeypatch, popen):
+    monkeypatch.setattr("heel.runner.identity._verified_secret_tool_path",
+                        lambda: "/usr/bin/secret-tool")
+    return LinuxSecretServiceBackend(popen=popen)
+
+
+def test_linux_backend_forwards_only_validated_session_bus_address(monkeypatch, session_bus):
+    for name, value in {
+        "LD_PRELOAD": "/tmp/evil.so", "PYTHONPATH": "/tmp/evil", "DISPLAY": ":0",
+        "HOME": "/tmp/home", "XDG_RUNTIME_DIR": "/tmp/xdg", "DBUS_SYSTEM_BUS_ADDRESS": "tcp:host=x",
+    }.items():
+        monkeypatch.setenv(name, value)
+    # Closed grammar re-serialised canonically: path first, then the optional guid.
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS",
+                       f"unix:guid={session_bus.guid},path={session_bus.path}")
+    seen = []
+    seed = base64.b64encode(b"s" * 32) + b"\n"
+
+    def popen(argv, **kwargs):
+        seen.append(kwargs["env"])
+        return _FakeProcess(argv, returncode=0, stdout=seed)
+
+    assert _linux_backend(monkeypatch, popen).load("runner-linux") == b"s" * 32
+    assert seen == [{"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                     "DBUS_SESSION_BUS_ADDRESS": session_bus.address}]
+
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={session_bus.path}")
+    seen.clear()
+    _linux_backend(monkeypatch, popen).load("runner-linux")
+    assert seen[0]["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={session_bus.path}"
+
+
+@pytest.mark.parametrize(
+    "template,foreign_uid",
+    [(template, foreign) for _, template, foreign in UNSUPPORTED_BUS_ADDRESSES],
+    ids=[case for case, _, _ in UNSUPPORTED_BUS_ADDRESSES],
+)
+def test_linux_backend_refuses_unsupported_bus_address_before_launch(
+    monkeypatch, session_bus, template, foreign_uid,
+):
+    calls = []
+    backend = _linux_backend(monkeypatch, lambda *args, **kwargs: calls.append(args))
+    forbidden = apply_bus_address(monkeypatch, session_bus, template, foreign_uid)
+    with pytest.raises(RuntimeError) as loaded:
+        backend.load("runner-linux")
+    with pytest.raises(RuntimeError) as stored:
+        backend.store("runner-linux", b"z" * 32)
+    assert calls == []
+    for caught in (loaded, stored):
+        assert str(caught.value) == "runner OS secret service unavailable"
+        assert caught.value.__cause__ is None
+        assert all(item not in repr(caught.value) for item in forbidden)
+
+
+def test_linux_backend_load_distinguishes_missing_from_unavailable(monkeypatch, session_bus):
+    def scripted(*outcomes):
+        queue, calls = list(outcomes), []
+
+        def popen(argv, **kwargs):
+            code, out = queue.pop(0)
+            calls.append(tuple(argv))
+            return _FakeProcess(argv, returncode=code, stdout=out)
+        return popen, calls
+
+    popen, calls = scripted((1, b""), (0, b""))
+    assert _linux_backend(monkeypatch, popen).load("runner-linux") is None
+    assert calls[1] == _SEARCH_ARGV
+
+    for probe in ((1, b""), (0, b"[/org/freedesktop/secrets/collection/login/1]\n"), (4, b"")):
+        popen, calls = scripted((1, b""), probe)
+        with pytest.raises(RuntimeError) as caught:
+            _linux_backend(monkeypatch, popen).load("runner-linux")
+        assert str(caught.value) == "runner OS secret service unavailable"
+        assert "freedesktop" not in repr(caught.value)
+        assert len(calls) == 2
+
+    # An unreachable service never reaches the create-only ``store``.
+    popen, calls = scripted((1, b""), (1, b""))
+    monkeypatch.setattr("heel.runner.identity.secrets.token_bytes", lambda count: b"q" * 32)
+    with pytest.raises(RuntimeError, match="secret service unavailable"):
+        SystemSecureSigner("runner-linux", backend=_linux_backend(monkeypatch, popen))
+    assert [argv[1] for argv in calls] == ["lookup", "search"]
+
+
+def test_macos_backend_env_unchanged_by_session_bus_variable(monkeypatch, session_bus):
+    for address in (session_bus.address, "tcp:host=127.0.0.1,port=1", None):
+        if address is None:
+            monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        else:
+            monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", address)
+        persisted = {"runner-mac": base64.b64encode(b"m" * 32)}
+        popen, calls = _scripted_keychain(monkeypatch, persisted=persisted)
+        backend = MacOSKeychainSecretBackend(popen=popen)
+        assert backend.load("runner-mac") == b"m" * 32
+        assert [kwargs["env"] for _, kwargs, _ in calls] == [{"PATH": "/usr/bin:/bin", "LC_ALL": "C"}]
 
 
 @pytest.mark.parametrize("helper_path", ["secret-tool", "/tmp/not-allowlisted-secret-tool"])

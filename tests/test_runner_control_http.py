@@ -549,7 +549,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -4587,3 +4587,23 @@ def test_attestation_archives_the_servers_wire_bytes_and_refuses_oversize_raw_be
             _verify_attestation(live, json.loads(wire), base64.b64decode(json.loads(wire)["client_challenge_b64"]))
         finally:
             live.close()
+
+
+# --- H2 result handoff: the runner's disclosure poll is a closed, metadata-only result-chain op ---
+
+def test_poll_disclosure_is_a_named_closed_operation_that_never_sends_without_local_terminal_authority():
+    control, transport, _signer = client()
+    params = inspect.signature(control.poll_disclosure).parameters
+    assert set(params) == {"run_id", "findings_projection"}
+    assert all(item.kind is inspect.Parameter.KEYWORD_ONLY for item in params.values())
+    findings = {"schema_version": "heel.canary-findings-projection.v1", "run_id": RUN_ID}
+    before = len(transport.requests)
+    # No terminal disclosure row exists for this run: refused locally, nothing is staged or sent.
+    with pytest.raises(ValueError):
+        control.poll_disclosure(run_id=RUN_ID, findings_projection=findings)
+    with pytest.raises(ValueError):
+        control.poll_disclosure(run_id="crun_" + "b" * 32, findings_projection=findings)
+    assert len(transport.requests) == before
+    assert control.runtime.load_pending_calls() == ()
+    # The generic call surface stays closed; the poll is a named operation only.
+    assert not hasattr(control, "request")

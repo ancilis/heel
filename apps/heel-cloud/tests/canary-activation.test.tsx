@@ -10,7 +10,9 @@ import Runner from "../app/runner/page";
 import { ActivationCard, type ActivationSnapshot } from "../components/canary/ActivationCard";
 import { ApprovalDialog } from "../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../components/canary/DisclosureDialog";
+import { FindingsCard } from "../components/canary/FindingsCard";
 import { RunProgress } from "../components/canary/RunProgress";
+import type { CanaryFindingsProjection } from "../lib/canary-api";
 
 
 // SEAM: the dashboard reads its selection from the App Router; these render tests have no router.
@@ -99,7 +101,10 @@ describe("canary activation dashboard", () => {
 
     const content = document.body.textContent?.toLowerCase() ?? "";
     expect(content).toMatch(/operational status only/i);
-    expect(content).not.toMatch(/raw evidence|credential|fixture id|openapi|authorization header|access token/i);
+    // The one boundary statement that credentials and raw evidence stay on the runner machine names them; nothing else may.
+    const boundary = "and credentials and raw evidence stay there.";
+    expect(content.split(boundary).length - 1).toBe(1);
+    expect(content.replace(boundary, "")).not.toMatch(/raw evidence|credential|fixture id|openapi|authorization header|access token/i);
     expect(screen.queryByText(/finding|vulnerab/i)).toBeNull();
   });
 
@@ -311,5 +316,65 @@ describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual pair
       expect(document.body.textContent, canaryAccess).toMatch(/runner (credential add|status)/);
       expectNoDeadGuidance();
     }
+  });
+});
+
+
+describe("CUSTOMER-RESULT-HANDOFF-B: result sharing and the shared finding render only server values", () => {
+  test("the sharing review opens from the server's metadata counts alone and makes no choice by itself", () => {
+    const permit = vi.fn();
+    const local = vi.fn();
+    render(<DisclosureDialog open completedScenarios={1} findingCount={1} byteCount={1840} onKeepLocal={local} onPermit={permit} onClose={vi.fn()} />);
+    const dialog = screen.getByRole("dialog", { name: /share result summary/i });
+    expect(within(dialog).getByText("1 scenarios")).toBeTruthy();
+    expect(within(dialog).getByText("Findings").nextSibling?.textContent).toBe("1");
+    // No per-outcome counts are invented when the server metadata does not carry them.
+    expect(within(dialog).queryByText("Held")).toBeNull();
+    expect(within(dialog).queryByText("Crossed")).toBeNull();
+    expect(dialog.textContent).toMatch(/opaque ids/);
+    expect(dialog.textContent?.toLowerCase()).not.toMatch(/raw evidence|credential|fixture id|openapi/);
+    expect(permit).not.toHaveBeenCalled();
+    expect(local).not.toHaveBeenCalled();
+  });
+
+  test("a busy sharing review cannot submit a second decision", () => {
+    const permit = vi.fn();
+    render(<DisclosureDialog busy open completedScenarios={1} findingCount={0} byteCount={10} onKeepLocal={vi.fn()} onPermit={permit} onClose={vi.fn()} />);
+    const share = screen.getByRole("button", { name: /share this summary/i });
+    expect(share).toHaveProperty("disabled", true);
+    fireEvent.click(share);
+    expect(permit).not.toHaveBeenCalled();
+  });
+
+  test("a scenario without a server finding shows none, and observations are never presented as evidence", () => {
+    const findings = {
+      schema_version: "heel.canary-findings-projection.v1", projection_id: "cfp_x", run_id: `crun_${"c".repeat(32)}`,
+      grant_id: "cgr_x", workspace_id: `ws_${"a".repeat(16)}`, project_id: `prj_${"b".repeat(32)}`, environment_id: `env_${"e".repeat(32)}`,
+      manifest_digest: "1".repeat(64), approval_projection_digest: "2".repeat(64), grant_digest: "3".repeat(64),
+      engine_version: "heel-1.3.0", adapter_versions: ["a.v1"], started_at_ms: 1, finished_at_ms: 2, assessment_outcome: "blocked",
+      scenario_results: [{
+        ordinal: 0, scenario_id: "anonymous-read", adapter_version: "a.v1", assessment_outcome: "blocked",
+        route: { method: "HEAD", route_template: "/account" },
+        observations: [{ semantic_role: "anonymous", status_code: 401, body_shape: "json_object", truncation_state: "complete" }],
+        finding: null, containment_codes: ["action_completed"], redaction_count: 0, local_evidence_refs: [],
+      }],
+      containment_codes: ["action_completed"], redaction_count: 0, projection_digest: "d".repeat(64),
+      signing_key_id: "k", signature_b64: `${"A".repeat(86)}==`,
+    } as CanaryFindingsProjection;
+    render(<FindingsCard findings={findings} />);
+    const card = screen.getByRole("region", { name: "Rehearsal result" });
+    expect(within(card).getByText("No finding was reported for this scenario.")).toBeTruthy();
+    expect(within(card).queryByRole("article")).toBeNull();
+    expect(within(card).getByText("HEAD /account")).toBeTruthy();
+    expect(within(card).getByRole("list", { name: "Recorded responses" }).textContent).toBe("anonymous: 401 · json_object");
+    expect(within(card).getByText(/status and body shape only, no content/)).toBeTruthy();
+    expect(within(card).queryByRole("list", { name: "Local evidence references" })).toBeNull();
+    expect(card.textContent).not.toMatch(/vulnerab|severity|critical|exploit/i);
+  });
+
+  test("a completed rehearsal points to the result and the sharing choice, not to a manual runner hop", () => {
+    render(<ActivationCard completedSteps={4} snapshot={{ environment: "verified", runner: "paired", canaryAccess: "ready", rehearsal: "complete" }} />);
+    const next = screen.getByText(/next action: review the result below and choose whether to share its redacted summary/i);
+    expect(next.closest("[role=status]")?.textContent).not.toMatch(/runner machine|load local summary|upload/i);
   });
 });

@@ -2562,3 +2562,294 @@ def test_still_privileged_actor_and_logged_out_actor_keep_issuing_and_another_ow
         "POST", _env_base(fixture) + f"/discovery-authorizations/{driver.authorization_id}/revoke", headers=other, raw=b"")
     assert status == 200 and (revoked["state"], revoked["revoked_by"]) == ("revoked", other_user)
     assert revoked["actor_user_id"] == fixture.user and revoked["quota_state"] == "consumed"
+
+
+# --- H2 disclosure poll (runner PoP) and human disclosure read (view) over real HTTP ---
+
+def _http_terminal_run(fixture):
+    projection = approval_projection(
+        fixture.runner, workspace_id=fixture.workspace, project_ref=fixture.project,
+    )
+    base = f"/v1/workspaces/{fixture.workspace}/projects/{fixture.project}"
+    status, _, submitted = fixture.request(
+        "POST", base + "/canary-approval-projections", projection, fixture.browser,
+    )
+    assert status == 201
+    run_path = base + "/canary-runs/" + submitted["run_id"]
+    status, _, approved = fixture.request(
+        "POST",
+        run_path + "/approve",
+        {
+            "schema_version": "heel.canary-execution-approval.v1",
+            "projection_digest": projection["projection_digest"],
+            "hostname_retype": "canary.acme.dev",
+            "reason": "Hand the bounded result back without a manual copy",
+        },
+        {
+            **fixture.browser,
+            "Idempotency-Key": "ca1-" + "d" * 64,
+            "If-Heel-Control-Generation": "0",
+        },
+    )
+    assert status == 201
+    coordinator = CanaryRunService(
+        fixture.cp.store.conn, signing=fixture.cloud, runner_auth=fixture.cp.runner_auth,
+    )
+    claimed = coordinator.claim(fixture.workspace, fixture.runner_id, fixture.runner.key_id)
+    terminal = fixture.operational(
+        approved["grant"], sequence=0, phase="terminal", disposition="completed",
+    )
+    coordinator.result(
+        fixture.workspace, fixture.project, submitted["run_id"], fixture.runner_id, terminal,
+    )
+    findings = _findings(fixture.runner, approved["grant"], terminal)
+    findings["workspace_id"] = fixture.workspace
+    findings["project_id"] = fixture.project
+    unsigned = {
+        key: item for key, item in findings.items()
+        if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+    }
+    findings["projection_digest"] = canonical_digest(unsigned)
+    findings.update(fixture.runner.sign(canonical_bytes(unsigned)))
+    chain = claimed["chain_states"]["result"]
+    return submitted["run_id"], run_path, findings, chain
+
+
+def _poll_body(run_id, findings, **overrides):
+    projection = {
+        "schema_version": findings["schema_version"],
+        "projection_digest": findings["projection_digest"],
+        "byte_count": len(canonical_bytes(findings)),
+        "scenario_count": len(findings["scenario_results"]),
+        "finding_count": 1,
+    }
+    projection.update(overrides)
+    return canonical_bytes({
+        "schema_version": "heel.runner-disclosure-poll.v1",
+        "run_id": run_id,
+        "projection": projection,
+    })
+
+
+def _runner_poll(fixture, run_id, body, nonce, sequence, *, path=None):
+    path = path or (
+        f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/runs/"
+        f"{run_id}/disclosure-poll"
+    )
+    headers = fixture.pop(
+        path, body, capability="runner_result", nonce=nonce, sequence=sequence,
+    )
+    return fixture.request("POST", path, headers=headers, raw=body)
+
+
+def test_disclosure_poll_and_human_read_are_real_pop_and_view_scoped_routes(canary_http):
+    fixture = canary_http
+    run_id, run_path, findings, chain = _http_terminal_run(fixture)
+    disclosure_path = run_path + "/disclosure"
+
+    status, _, missing = fixture.request("GET", disclosure_path, headers=fixture.browser)
+    assert status == 404 and missing == {
+        "schema_version": "heel.canary-error.v1", "code": "canary_run_not_found",
+    }
+
+    body = _poll_body(run_id, findings)
+    status, headers, state = _runner_poll(
+        fixture, run_id, body, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status == 200 and state == {
+        "schema_version": "heel.canary-disclosure-state.v1",
+        "run_id": run_id,
+        "status": "local_result_ready",
+    }
+    next_nonce = headers["X-Heel-Runner-Next-Nonce"]
+    assert next_nonce != chain["next_nonce_b64"]
+
+    # The result-chain nonce is one-use: a byte-identical replay is not re-executed.
+    status, _, _ = _runner_poll(
+        fixture, run_id, body, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status == 401
+
+    viewer = fixture.cp.store.create_user("viewer@canary.test")
+    fixture.cp.store.add_member(fixture.workspace, viewer, Role.VIEWER)
+    viewer_session = fixture.cp.auth.create_session(viewer)
+    viewer_headers = {
+        "Cookie": f"heel_session={viewer_session.token}",
+        "Origin": "https://heel.test",
+        "X-Heel-Internal-Origin": "same-origin",
+    }
+    status, _, preview = fixture.request("GET", disclosure_path, headers=viewer_headers)
+    assert status == 200 and preview == {
+        "schema_version": "heel.canary-disclosure-preview.v1",
+        "request_id": preview["request_id"],
+        "run_id": run_id,
+        "status": "local_result_ready",
+        "projection": {
+            "schema_version": findings["schema_version"],
+            "projection_digest": findings["projection_digest"],
+            "byte_count": len(canonical_bytes(findings)),
+            "scenario_count": 1,
+            "finding_count": 1,
+        },
+    }
+    assert "scenario_results" not in json.dumps(preview)
+
+    outsider = fixture.cp.store.create_user("outsider@canary.test")
+    other_org = fixture.cp.store.create_org("Outsider")
+    other_workspace = fixture.cp.store.create_workspace(
+        other_org, "Outsider", "free", CATALOG_VERSION,
+    )
+    fixture.cp.store.add_member(other_workspace, outsider, Role.OWNER)
+    outsider_session = fixture.cp.auth.create_session(outsider)
+    status, _, _ = fixture.request(
+        "GET", disclosure_path,
+        headers={
+            "Cookie": f"heel_session={outsider_session.token}",
+            "Origin": "https://heel.test",
+            "X-Heel-Internal-Origin": "same-origin",
+        },
+    )
+    assert status in {403, 404}
+    wrong_project = disclosure_path.replace(
+        f"/projects/{fixture.project}/", "/projects/proj_other/",
+    )
+    assert fixture.request("GET", wrong_project, headers=fixture.browser)[0] == 404
+    # The read is GET-only (the server implements no PUT/DELETE handlers at all).
+    assert fixture.request("POST", disclosure_path, headers=fixture.browser)[0] in {404, 405}
+    for suffix in ("?status=1", "#x"):
+        assert fixture.request("GET", disclosure_path + suffix, headers=fixture.browser)[0] == 404
+
+    # The human permit is then polled byte-identically on the same result chain, and
+    # the existing upload consumes it on the following sequence.
+    status, _, permit = fixture.request(
+        "POST", run_path + "/disclosure-permits",
+        {
+            "schema_version": "heel.canary-disclosure-request.v1",
+            "projection_digest": findings["projection_digest"],
+            "projection_bytes": len(canonical_bytes(findings)),
+            "scenario_count": 1,
+            "finding_count": 1,
+        },
+        fixture.browser,
+    )
+    assert status == 201
+    status, headers, polled = _runner_poll(
+        fixture, run_id, body, next_nonce, chain["next_sequence"] + 1,
+    )
+    assert status == 200 and canonical_bytes(polled) == canonical_bytes(permit)
+    upload_path = (
+        f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/runs/"
+        f"{run_id}/result-projection"
+    )
+    upload_body = canonical_bytes({
+        "schema_version": "heel.runner-findings-upload.v1",
+        "run_id": run_id, "permit": polled, "findings_projection": findings,
+    })
+    status, headers, receipt = fixture.request(
+        "POST", upload_path,
+        headers=fixture.pop(
+            upload_path, upload_body, capability="runner_result",
+            nonce=headers["X-Heel-Runner-Next-Nonce"], sequence=chain["next_sequence"] + 2,
+        ),
+        raw=upload_body,
+    )
+    assert status == 200 and receipt["status"] == "synchronized"
+    status, _, synchronized = _runner_poll(
+        fixture, run_id, body, headers["X-Heel-Runner-Next-Nonce"], chain["next_sequence"] + 3,
+    )
+    assert status == 200 and synchronized["status"] == "synchronized"
+    status, _, read = fixture.request("GET", disclosure_path, headers=viewer_headers)
+    assert status == 200 and read["status"] == "synchronized"
+    status, _, shown = fixture.request("GET", run_path + "/findings", headers=viewer_headers)
+    assert status == 200 and shown == findings
+
+
+def test_disclosure_poll_route_is_allowlisted_capped_canonical_and_never_carries_findings(canary_http):
+    fixture = canary_http
+    run_id, _, findings, chain = _http_terminal_run(fixture)
+    handler = object.__new__(http_api._Handler)
+    poll_path = (
+        f"/v1/workspaces/{fixture.workspace}/runners/{fixture.runner_id}/runs/"
+        f"{run_id}/disclosure-poll"
+    )
+    handler._route_parts = poll_path.strip("/").split("/")
+    assert handler._is_runner_control_route("POST") is True
+    assert handler._is_runner_control_route("GET") is False
+
+    def requests_rows():
+        return fixture.cp.store.conn.execute(
+            "SELECT COUNT(*) FROM canary_disclosure_requests"
+        ).fetchone()[0]
+
+    # Non-canonical (reordered/whitespace) bytes are refused before any service write.
+    canonical = _poll_body(run_id, findings)
+    noncanonical = json.dumps(json.loads(canonical), indent=1).encode()
+    status, _, _ = _runner_poll(
+        fixture, run_id, noncanonical, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status == 401 and requests_rows() == 0
+
+    # A body that smuggles the findings projection is refused (closed schema).
+    smuggled = canonical_bytes({
+        **json.loads(canonical), "findings_projection": findings,
+    })
+    status, _, _ = _runner_poll(
+        fixture, run_id, smuggled, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status in {401, 413} and requests_rows() == 0
+
+    # 2048 bytes is the cap: a padded, otherwise valid-looking body above it is refused.
+    padded = canonical_bytes({
+        **json.loads(canonical), "padding": "x" * 2048,
+    })
+    assert len(padded) > 2048
+    status, _, _ = _runner_poll(
+        fixture, run_id, padded, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status in {401, 413} and requests_rows() == 0
+
+    # Path/body run disagreement and a body for another run are refused.
+    other = _poll_body("crun_" + "0" * 32, findings)
+    status, _, _ = _runner_poll(
+        fixture, run_id, other, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status == 401 and requests_rows() == 0
+
+    # Only the bare, query-free POST spelling is a runner route.
+    status, _, _ = fixture.request("GET", poll_path, headers=fixture.browser)
+    assert status in {401, 404, 405}
+    status, _, _ = _runner_poll(
+        fixture, run_id, canonical, chain["next_nonce_b64"], chain["next_sequence"],
+        path=poll_path + "?x=1",
+    )
+    assert status in {401, 404} and requests_rows() == 0
+
+    # Human browser credentials never authorize the runner operation.
+    status, _, _ = fixture.request(
+        "POST", poll_path, headers={**fixture.browser, "Content-Type": "application/json"},
+        raw=canonical,
+    )
+    assert status in {401, 403} and requests_rows() == 0
+
+    # The unspoiled nonce still works: refusals consumed nothing.
+    status, _, state = _runner_poll(
+        fixture, run_id, canonical, chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status == 200 and state["status"] == "local_result_ready"
+
+
+def test_disclosure_poll_metadata_forgery_returns_state_conflict_over_http(canary_http):
+    fixture = canary_http
+    run_id, _, findings, chain = _http_terminal_run(fixture)
+    status, headers, _ = _runner_poll(
+        fixture, run_id, _poll_body(run_id, findings),
+        chain["next_nonce_b64"], chain["next_sequence"],
+    )
+    assert status == 200
+    status, _, refused = _runner_poll(
+        fixture, run_id, _poll_body(run_id, findings, finding_count=0),
+        headers["X-Heel-Runner-Next-Nonce"], chain["next_sequence"] + 1,
+    )
+    assert status == 409 and refused == {
+        "schema_version": "heel.canary-error.v1", "code": "canary_state_conflict",
+    }
