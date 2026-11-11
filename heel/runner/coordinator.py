@@ -20,7 +20,7 @@ from heel.canary_contracts import (
     validate_operational_run,
 )
 from heel.crypto import verify_envelope
-from heel.runner.control_client import RunnerControlClient, RunnerUploadDeferred
+from heel.runner.control_client import RunnerControlClient, RunnerResultChainRecovered, RunnerUploadDeferred
 from heel.runner.execution import (
     ExecutionBundle,
     ExecutionGate,
@@ -66,9 +66,15 @@ class RunnerMaintenanceResult:
 
 
 # Result handoff (H2 §3.3): poll every idle step (the service paces steps at >= 2 s) for ten
-# minutes after a run's terminal time, then at most once per minute until retention expiry.
+# minutes after a run's terminal time, then every 30 s until retention expiry.  The slow cadence
+# stays below the server's 60 s result-chain nonce lifetime with margin (rc5): it is measured
+# from the previous send, the server lifetime from the previous consumption.
 DISCLOSURE_FAST_POLL_WINDOW_MS = 10 * 60 * 1000
-DISCLOSURE_SLOW_POLL_INTERVAL_MS = 60 * 1000
+DISCLOSURE_SLOW_POLL_INTERVAL_MS = 30 * 1000
+# A findings upload left staged by a 502/503/504 is re-sent byte-identically no sooner than this:
+# never inside the server's 30 s proof window (a race on one nonce), and a never-consumed upload
+# is then recovered by the result-chain resync rather than by beating the timestamp window.
+DISCLOSURE_UPLOAD_RETRY_INTERVAL_MS = 60 * 1000
 # Network polls one serve step may send; local index pages are walked to the end.
 DISCLOSURE_POLLS_PER_STEP = 16
 _DISCLOSURE_STOP_STATES = frozenset({"local_only", "synchronized"})
@@ -170,20 +176,30 @@ class RunnerCoordinator:
             for item in pending:
                 if item.request_operation == "poll-disclosure":
                     # Replay the sealed metadata-only poll byte-identically; its answer is a read
-                    # the next serve step repeats, so it is never acted on here.
-                    self.poll_disclosure(
-                        item.run_id, findings_projection=self._local_findings(item.run_id),
-                    )
+                    # the next serve step repeats, so it is never acted on here.  A poll whose
+                    # result-chain authority was lost is retired only under the server's resync
+                    # proof; the next due step then polls afresh.
+                    try:
+                        self.poll_disclosure(
+                            item.run_id, findings_projection=self._local_findings(item.run_id),
+                        )
+                    except RunnerResultChainRecovered:
+                        pass
                     continue
                 if item.request_operation == "upload-findings":
                     # Findings recovery remains lease/permit bound.  Re-enter
                     # the coordinator rather than allowing the client to infer
                     # disclosure authority from an available runtime row alone.
                     request = self._staged_upload_request(item)
-                    self.upload_findings(
-                        item.run_id, permit=request["permit"],
-                        findings_projection=request["findings_projection"],
-                    )
+                    try:
+                        self.upload_findings(
+                            item.run_id, permit=request["permit"],
+                            findings_projection=request["findings_projection"],
+                        )
+                    except RunnerResultChainRecovered:
+                        # Retired as never consumed: the next due step polls and re-verifies the
+                        # human's current permit; the retired permit is never reused here.
+                        pass
                     continue
                 self.control.replay_pending_call(
                     item, now_ms=self._now_ms(),
@@ -1007,7 +1023,8 @@ class RunnerCoordinator:
         if not upload_staged and now < state.terminal_at_ms + DISCLOSURE_FAST_POLL_WINDOW_MS:
             return True
         last = self._disclosure_last_poll_ms.get(state.run_id)
-        return last is None or now - last >= DISCLOSURE_SLOW_POLL_INTERVAL_MS
+        interval = DISCLOSURE_UPLOAD_RETRY_INTERVAL_MS if upload_staged else DISCLOSURE_SLOW_POLL_INTERVAL_MS
+        return last is None or now - last >= interval
 
     def _advance_one_disclosure(self, run_id: str) -> None:
         findings = self._local_findings(run_id)
@@ -1076,6 +1093,10 @@ class RunnerCoordinator:
                 else:
                     self._advance_one_disclosure(run_id)
             except RunnerUploadDeferred:
+                continue
+            except RunnerResultChainRecovered:
+                # Retired under the server's resync proof; this step's send time paces the next
+                # fresh poll, which re-verifies any permit before an upload.
                 continue
             except ValueError:
                 if run_id in staged_uploads or any(

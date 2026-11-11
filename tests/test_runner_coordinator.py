@@ -3844,7 +3844,7 @@ def test_permit_for_another_run_workspace_or_expired_is_refused_locally_before_a
     )
 
 
-def test_serve_poll_backs_off_to_sixty_seconds_after_ten_minutes_and_stops_at_retention_expiry(tmp_path):
+def test_serve_poll_backs_off_to_thirty_seconds_after_ten_minutes_and_stops_at_retention_expiry(tmp_path):
     def tail(grant, findings, authority, coordinator, holder):
         return [
             (200, {"X-Heel-Runner-Next-Nonce": bytes_nonce}, _handoff_state(grant, "awaiting_disclosure_approval"))
@@ -3864,16 +3864,16 @@ def test_serve_poll_backs_off_to_sixty_seconds_after_ten_minutes_and_stops_at_re
     h.coordinator.advance_disclosures()
     assert len(h.transport.requests) - start == 2
 
-    # After ten minutes, at most one poll per 60 s.
+    # After ten minutes, at most one poll per 30 s (rc5: below the server's 60 s nonce lifetime).
     now[0] = terminal_at + _TEN_MINUTES_MS + 1
     h.coordinator.advance_disclosures()
     assert len(h.transport.requests) - start == 3
     now[0] += 2_000
     h.coordinator.advance_disclosures()
-    now[0] += 30_000
+    now[0] += 27_999
     h.coordinator.advance_disclosures()
     assert len(h.transport.requests) - start == 3
-    now[0] += 30_000
+    now[0] += 1
     h.coordinator.advance_disclosures()
     assert len(h.transport.requests) - start == 4
 
@@ -4088,11 +4088,11 @@ def test_staged_poll_replay_keeps_the_slow_cadence_and_stops_at_retention(tmp_pa
     staged = h.transport.requests[-1]
     (pending,) = h.client.runtime.load_pending_calls()
     assert pending.request_operation == "poll-disclosure"
-    for step in (2_000, 30_000):  # not yet 60 s since the last attempt
+    for step in (2_000, 27_999):  # not yet 30 s since the last attempt
         now[0] += step
         assert h.coordinator.advance_disclosures() == 0
     assert len(h.transport.requests) - start == 1
-    now[0] += 30_000
+    now[0] += 1
     assert h.coordinator.advance_disclosures() == 1
     assert h.transport.requests[-1] == staged
     assert len(h.transport.requests) - start == 2
@@ -4179,19 +4179,25 @@ def test_a_transient_upload_status_is_resent_byte_identically_on_the_slow_cadenc
 def test_a_headerless_upload_503_is_classified_deferred_before_the_nonce_header_and_body(tmp_path):
     from heel.runner.control_client import RunnerUploadDeferred
 
+    from heel.runner.control_client import RunnerAuthenticationRejected
+
     h = _handoff_coordinator(tmp_path, lambda *_: [
         (503, {}, b"<html>edge</html>"),
         (504, {"X-Heel-Runner-Next-Nonce": "not-a-nonce"}, None),
         (401, {}, {"code": "invalid_runner_auth"}),
+        (401, {}, {"code": "invalid_runner_auth"}),   # rc5: the result-chain resync start is refused
     ])
     permit = _handoff_permit(h.authority, h.coordinator, h.grant, h.findings)
     for _ in range(2):
         with pytest.raises(RunnerUploadDeferred) as raised:
             h.coordinator.upload_findings(h.grant["run_id"], permit=permit, findings_projection=h.findings)
         assert isinstance(raised.value, ValueError)
-    # 401 still wins over the deferral classification.
-    with pytest.raises(RunnerChainRecoveryRequired):
+    # 401 still wins over the deferral classification: it is lost authority, recovered only by a
+    # result-chain resync; a refused fresh start keeps the staged upload.
+    start = len(h.transport.requests)
+    with pytest.raises(RunnerAuthenticationRejected):
         h.coordinator.upload_findings(h.grant["run_id"], permit=permit, findings_projection=h.findings)
+    assert [path.rsplit("/", 1)[-1] for path, *_ in h.transport.requests[start:]] == ["result-projection", "start"]
     _staged_upload(h)
     assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
 
@@ -4285,3 +4291,241 @@ def test_a_staged_upload_is_not_resent_inside_sixty_seconds_even_in_the_fast_win
     assert h.coordinator.advance_disclosures() == 1
     assert h.transport.requests[-1] == staged
     assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
+
+
+# --------------------------------------------------------------------------- rc5 result-chain recovery
+# Scripted transport here; the real HTTP/CP path for every branch is in test_runner_control_http.py.
+
+def _rc_cursor(coordinator, grant):
+    return coordinator.control.runtime.load_terminal_state(grant["run_id"]).result_chain
+
+
+def _rc_challenge(run_id, next_sequence, generation):
+    return (200, {}, {
+        "schema_version": "heel.runner-resync-challenge.v2", "challenge_id": "rrs_" + "e" * 32,
+        "chain": {"operation": "result", "run_id": run_id}, "server_challenge_b64": _nonce(b"s"),
+        "next_sequence": next_sequence, "expires_at_ms": 10 ** 12, "generation": generation,
+    })
+
+
+def _rc_completed(run_id, next_sequence, generation, nonce=b"r"):
+    return (200, {}, {
+        "schema_version": "heel.runner-resync-completed.v2",
+        "chain": {"operation": "result", "run_id": run_id}, "next_sequence": next_sequence,
+        "next_nonce_b64": _nonce(nonce), "expires_at_ms": 10 ** 12, "generation": generation,
+    })
+
+
+_RC_REFUSED = (401, {}, {"schema_version": "heel.runner-error.v1", "code": "invalid_runner_auth"})
+
+
+def _rc_names(transport, start=0):
+    return [path.rsplit("/", 1)[-1] for path, *_ in transport.requests[start:]]
+
+
+def test_refused_staged_poll_disclosure_is_retired_only_on_result_chain_resync_proof(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        holder["cursor"] = dict(cursor)
+        return [
+            _RC_REFUSED,
+            _rc_challenge(grant["run_id"], cursor["next_sequence"], cursor["generation"]),
+            _rc_completed(grant["run_id"], cursor["next_sequence"], cursor["generation"] + 1),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"2")}, _handoff_state(grant, "local_result_ready")),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    cursor, start = h.holder["cursor"], len(h.transport.requests)
+    assert h.coordinator.advance_disclosures() == 1
+    assert _rc_names(h.transport, start) == ["disclosure-poll", "start", "complete"]
+    assert h.client.runtime.load_pending_calls() == ()
+    [tombstone] = h.client.runtime.load_superseded_calls()
+    assert (tombstone.request_operation, tombstone.reason, tombstone.sequence) == (
+        "poll-disclosure", "chain_authority_lost", cursor["next_sequence"],
+    )
+    terminal = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert terminal.state == "available"
+    assert (terminal.result_chain["next_sequence"], terminal.result_chain["generation"]) == (
+        cursor["next_sequence"], cursor["generation"] + 1,
+    )
+    # Nothing was re-signed inside the recovery; the next due step polls on the new nonce.
+    h.clock[0] += 2_000
+    assert h.coordinator.advance_disclosures() == 1
+    path, headers, _body = h.transport.requests[-1]
+    assert path.endswith("/disclosure-poll") and headers["X-Heel-Runner-Nonce"] == _nonce(b"r")
+    assert headers["X-Heel-Runner-Sequence"] == str(cursor["next_sequence"])
+
+
+def test_a_refused_result_chain_completion_keeps_the_staged_poll(tmp_path):
+    from heel.runner.control_client import RunnerAuthenticationRejected
+
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        return [
+            _RC_REFUSED, _rc_challenge(grant["run_id"], cursor["next_sequence"], cursor["generation"]),
+            _RC_REFUSED, _RC_REFUSED,   # completion refused, then its exact start: no pending challenge
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    terminal = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    with pytest.raises(RunnerAuthenticationRejected):
+        h.coordinator.advance_disclosures()
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]) == terminal
+    assert h.client.runtime.load_superseded_calls() == ()
+    assert h.client.runtime.load_resync_attempt("result", h.grant["run_id"]) is None
+
+
+def test_restart_with_a_parked_poll_disclosure_recovers_and_serves(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        return [
+            (503, {}, {"error": "edge"}),       # the poll is parked (no answer reached the runner)
+            _RC_REFUSED,                        # restart: the byte-identical replay is refused
+            _rc_challenge(grant["run_id"], cursor["next_sequence"], cursor["generation"]),
+            _rc_completed(grant["run_id"], cursor["next_sequence"], cursor["generation"] + 1),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"2")}, _handoff_state(grant, "local_only")),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    h.coordinator.advance_disclosures()
+    (parked,) = h.client.runtime.load_pending_calls()
+    start = len(h.transport.requests)
+    coordinator, _client = h.build(h.client.runtime)        # rc4: RunnerChainRecoveryRequired here
+    assert _rc_names(h.transport, start) == ["disclosure-poll", "start", "complete"]
+    assert h.transport.requests[start][2] == parked.body
+    assert h.client.runtime.load_pending_calls() == ()
+    assert coordinator.advance_disclosures() == 1
+    assert _rc_names(h.transport, start)[-1] == "disclosure-poll"
+    assert coordinator.advance_disclosures() == 0           # local_only stops polling (unchanged)
+
+
+def test_slow_poll_cadence_stays_below_the_server_nonce_ttl():
+    from heel.runner import coordinator as coordinator_module
+    from heel.saas.runner_auth import CLOCK_SKEW_MS, NONCE_TTL
+
+    assert coordinator_module.DISCLOSURE_SLOW_POLL_INTERVAL_MS == 30_000
+    assert coordinator_module.DISCLOSURE_SLOW_POLL_INTERVAL_MS <= NONCE_TTL * 1000 // 2
+    # The byte-identical upload re-send keeps its 60 s bound: never inside the 30 s proof window.
+    assert getattr(coordinator_module, "DISCLOSURE_UPLOAD_RETRY_INTERVAL_MS", None) == 60_000 > CLOCK_SKEW_MS
+    assert coordinator_module.DISCLOSURE_FAST_POLL_WINDOW_MS == 10 * 60 * 1000
+    assert coordinator_module.DISCLOSURE_POLLS_PER_STEP == 16
+
+
+def test_deferred_upload_never_consumed_is_retired_then_the_current_permit_is_polled_and_reverified(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        holder["permit"] = permit
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (503, {}, {"error": "edge"}),
+            _RC_REFUSED,
+            _rc_challenge(grant["run_id"], cursor["next_sequence"] + 1, cursor["generation"]),
+            _rc_completed(grant["run_id"], cursor["next_sequence"] + 1, cursor["generation"] + 1),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"q")}, copy.deepcopy(permit)),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"y")}, _handoff_receipt(grant, findings, permit)),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = _staged_upload(h)
+    for _ in range(2):                               # 2 s and 59.998 s: no re-send inside 60 s
+        h.clock[0] += 29_999
+        assert h.coordinator.advance_disclosures() == 0
+    h.clock[0] += 2
+    assert h.coordinator.advance_disclosures() == 1  # the 60 s exact re-send, refused, then recovered
+    assert _rc_names(h.transport, start) == [
+        "disclosure-poll", "result-projection", "result-projection", "start", "complete",
+    ]
+    assert h.transport.requests[start + 2][2] == staged.body
+    assert h.client.runtime.load_pending_calls() == ()
+    [tombstone] = h.client.runtime.load_superseded_calls()
+    assert (tombstone.request_operation, tombstone.reason) == ("upload-findings", "chain_authority_lost")
+    # The next due step polls first (never re-uses the retired permit blindly), then uploads.
+    h.clock[0] += 30_000
+    h.coordinator.advance_disclosures()
+    assert _rc_names(h.transport, start)[-2:] == ["disclosure-poll", "result-projection"]
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "consumed"
+
+
+def test_consumed_upload_without_receipt_fails_closed_without_completing_the_resync(tmp_path):
+    from heel.runner.daemon import _serve_failure
+
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        permit = _handoff_permit(authority, coordinator, grant, findings)
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (503, {}, {"error": "edge"}),
+            _RC_REFUSED,
+            _rc_challenge(grant["run_id"], cursor["next_sequence"] + 2, cursor["generation"]),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    h.coordinator.advance_disclosures()
+    staged = _staged_upload(h)
+    terminal = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    start = len(h.transport.requests)
+    h.clock[0] += 60_000
+    with pytest.raises(RunnerChainRecoveryRequired) as raised:
+        h.coordinator.advance_disclosures()
+    assert (raised.value.operation, raised.value.reason) == ("upload-findings", "sequence_consumed")
+    assert _serve_failure(raised.value) == ("failed", "recovery_required")
+    assert _rc_names(h.transport, start) == ["result-projection", "start"]   # never completed
+    assert _staged_upload(h) == staged
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]) == terminal
+    assert h.client.runtime.load_superseded_calls() == ()
+
+
+def test_a_rate_limited_result_chain_resync_is_deferred_with_state_preserved(tmp_path):
+    from heel.runner.control_client import RunnerChainRecoveryDeferred
+    from heel.runner.daemon import _recovery_delay_seconds, _serve_failure
+
+    def tail(grant, findings, authority, coordinator, holder):
+        return [_RC_REFUSED, (429, {}, {"code": "runner_resync_rate_limited", "retry_after_ms": 20_000})]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    terminal = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    with pytest.raises(RunnerChainRecoveryDeferred) as raised:
+        h.coordinator.advance_disclosures()
+    assert _serve_failure(raised.value) == ("offline", "recovery_rate_limited")
+    assert _recovery_delay_seconds(raised.value) == 20.0
+    (pending,) = h.client.runtime.load_pending_calls()
+    assert pending.request_operation == "poll-disclosure"
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]) == terminal
+    assert h.client.runtime.load_resync_attempt("result", h.grant["run_id"]) is None
+
+
+def test_retention_prunes_a_recovered_result_chain_with_its_tombstone_and_keeps_the_root_binding(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        return [
+            _RC_REFUSED,
+            _rc_challenge(grant["run_id"], cursor["next_sequence"], cursor["generation"]),
+            _rc_completed(grant["run_id"], cursor["next_sequence"], cursor["generation"] + 1),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    run_id, runtime = h.grant["run_id"], h.client.runtime
+    before = runtime.load_terminal_state(run_id)
+    h.coordinator.advance_disclosures()
+    after = runtime.load_terminal_state(run_id)
+    assert len(runtime.load_superseded_calls()) == 1
+    # Root binding: the Store's signed detach anchor still verifies the re-sealed ``available`` state.
+    assert runtime.terminal_root_state_digest(after) == runtime.terminal_root_state_digest(before)
+    anchor = h.coordinator.store.load_terminal_disclosure_anchor(
+        run_id, runtime=runtime, expected_runtime_state_digest=after.state_digest,
+    )
+    assert anchor["grant_id"] == h.grant["grant_id"]
+    # Past retention the startup prune removes the disclosure and its result-chain recovery rows,
+    # sends nothing, and the reopened runtime still passes its load guards.
+    sent = len(h.transport.requests)
+    h.clock[0] = after.retention_expires_at_ms + 1
+    coordinator, client = h.build(runtime)
+    assert len(h.transport.requests) == sent
+    assert client.runtime.load_terminal_state(run_id) is None
+    assert client.runtime.load_superseded_calls() == ()
+    assert coordinator.advance_disclosures() == 0

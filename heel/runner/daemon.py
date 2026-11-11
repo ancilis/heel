@@ -138,6 +138,7 @@ _AUTH_REJECTED_STEPS = [
     "If the runner was revoked or removed in Heel Cloud, run: heel runner unpair, then pair it again"
     " with a new invitation",
 ]
+_DISCLOSURE_OPERATIONS = frozenset({"poll-disclosure", "upload-findings"})
 _RECOVERY_REQUIRED_STEPS = [
     "A staged control request of this kind cannot be recovered automatically by this version;"
     " it is kept unchanged. Contact Heel support before unpairing this runner.",
@@ -1262,7 +1263,22 @@ class RunnerDaemon:
             )
             # Staged calls replay first (a recorded reply needs no resync); lost claim-chain
             # authority is recovered inside the client, exactly as in serve.
-            if runtime.load_pending_calls():
+            pending = runtime.load_pending_calls()
+            disclosure = [
+                item for item in pending if item.request_operation in _DISCLOSURE_OPERATIONS
+            ]
+            if disclosure:
+                # A staged result-handoff call is replayed (and, if its result-chain authority
+                # was lost, recovered) only by serve under its terminal-disclosure lease and the
+                # store's findings anchor.  Status sends it nowhere and reports it as it is.
+                for item in pending:
+                    if item.request_operation not in _DISCLOSURE_OPERATIONS:
+                        client.replay_pending_call(item, now_ms=self._clock_ms())
+                return {
+                    "state": "disclosure_pending", "reason": "serve_replay_required",
+                    "operation": disclosure[0].request_operation,
+                }
+            if pending:
                 client.replay_all_pending(now_ms=self._clock_ms())
             listed = client.list_contexts()
         except ControlTransportError as error:
