@@ -204,6 +204,11 @@ jobs:
       - name: Actual Pyodide wheel under Node 26 security confinement
         working-directory: apps/heel-cloud
         run: node --test tests/browser-engine.test.mjs
+      - name: Controlled staging target fixture (component proof, not deployment)
+        working-directory: ${{ github.workspace }}
+        env:
+          HEEL_FIXTURE_PYTHON: python
+        run: node --test tests/fixtures/customer_staging/target.test.mjs
       - name: Application unit tests and static checks
         working-directory: apps/heel-cloud
         run: |
