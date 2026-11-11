@@ -44,6 +44,44 @@ describe('deployment boundaries', () => {
   });
 });
 
+describe('private upstream transport', () => {
+  const full = { HEEL_PUBLIC_ORIGIN: origin, HEEL_CONTROL_PLANE_VPC_SERVICE_ID: service };
+  const binding = [{ binding: 'CONTROL_PLANE', service_id: service }];
+  it('keeps the legacy HTTPS configuration shape when the setting is missing or explicitly https', () => {
+    for (const command of ['build', 'serve']) {
+      expect(deploymentConfig(full, command)).toEqual({ vars: { PUBLIC_ORIGIN: origin }, vpc_services: binding });
+      expect(deploymentConfig({ ...full, HEEL_CONTROL_PLANE_TRANSPORT: 'https' }, command))
+        .toEqual({ vars: { PUBLIC_ORIGIN: origin }, vpc_services: binding });
+    }
+  });
+  it('emits the Worker-only setting only when private HTTP is explicitly selected', () => {
+    for (const command of ['build', 'serve']) {
+      expect(deploymentConfig({ ...full, HEEL_CONTROL_PLANE_TRANSPORT: 'http' }, command))
+        .toEqual({ vars: { PUBLIC_ORIGIN: origin, CONTROL_PLANE_TRANSPORT: 'http' }, vpc_services: binding });
+    }
+  });
+  it('keeps the public origin canonical HTTPS when private HTTP is selected', () => {
+    for (const value of ['http://heel.example', 'http://localhost', origin + '/']) {
+      expect(() => deploymentConfig({ ...full, HEEL_PUBLIC_ORIGIN: value, HEEL_CONTROL_PLANE_TRANSPORT: 'http' }, 'build'))
+        .toThrow(/canonical HTTPS/);
+    }
+  });
+  it('fails closed on every malformed setting in every command', () => {
+    for (const value of ['', ' ', 'HTTP', 'Http', 'HTTPS', ' http', 'http ', 'http\n', 'http:', 'https:', 'http://', 'tcp', 'h2', 'http2', 'tls', 'plain', '8080', 'http:8080']) {
+      for (const command of ['build', 'serve']) {
+        expect(() => deploymentConfig({ ...full, HEEL_CONTROL_PLANE_TRANSPORT: value }, command), JSON.stringify(value))
+          .toThrow(/HEEL_CONTROL_PLANE_TRANSPORT/);
+      }
+    }
+  });
+  it('refuses a private transport in local-review mode, which has no private service', () => {
+    for (const value of ['http', 'https']) {
+      expect(() => deploymentConfig({ HEEL_PUBLIC_ORIGIN: origin, HEEL_DEPLOYMENT_MODE: 'local_review', HEEL_CONTROL_PLANE_TRANSPORT: value }, 'build'))
+        .toThrow(/cannot bind/);
+    }
+  });
+});
+
 // Reserved example/test names are syntax fixtures only; acceptance is not evidence of domain ownership.
 const accepted = [
   'https://heel.example',

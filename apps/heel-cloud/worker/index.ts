@@ -18,6 +18,7 @@ interface Env {
   ASSETS: AssetFetcher;
   CONTROL_PLANE?: PrivateControlPlaneFetcher;
   CONTROL_PLANE_EDGE_SECRET?: string;
+  CONTROL_PLANE_TRANSPORT?: string;
   PUBLIC_ORIGIN?: string;
   IMAGES: {
     input(stream: ReadableStream): {
@@ -571,6 +572,7 @@ async function proxyControlPlane(
   const outcome = await dispatchControlPlane({
     binding: env.CONTROL_PLANE,
     publicOrigin: env.PUBLIC_ORIGIN,
+    privateTransport: env.CONTROL_PLANE_TRANSPORT,
     upstreamPath,
     method: request.method,
     headers: requestContract.headers,

@@ -205,6 +205,82 @@ describe("control-plane dispatch module (explicit inputs only)", () => {
     }
   });
 
+  it("keeps the canonical HTTPS URL when the private transport is missing or explicitly https", async () => {
+    for (const privateTransport of [undefined, "https"]) {
+      const spy = bindingSpy();
+      const outcome = await dispatchControlPlane(input({ binding: spy.target, privateTransport }));
+      expect(outcome.kind, String(privateTransport)).toBe("response");
+      expect(spy.observed.map((record) => record.url)).toEqual([`${CONFIGURED_ORIGINS[0]}/v1/me`]);
+    }
+  });
+
+  it("selects the fixed service's HTTP port for explicit private HTTP while origin, path and headers stay canonical", async () => {
+    for (const origin of CONFIGURED_ORIGINS) {
+      for (const route of ROUTES) {
+        const spy = bindingSpy();
+        const sent = new Headers({
+          "X-Heel-Edge-Auth": edge, "X-Heel-Internal-Origin": "same-origin", Origin: origin,
+          "Content-Type": "application/json", Cookie: "heel_session=private",
+        });
+        const expectedHeaders = [...sent].sort(([a], [b]) => a.localeCompare(b));
+        const outcome = await dispatchControlPlane(input({
+          binding: spy.target, publicOrigin: origin, privateTransport: "http", upstreamPath: route.path,
+          method: route.method, headers: sent,
+          contentLength: route.method === "POST" ? 2 : 0, body: route.method === "POST" ? body("{}") : null,
+        }));
+        expect(outcome.kind, route.path).toBe("response");
+        expect(spy.target.fetch, route.path).toHaveBeenCalledTimes(1);
+        const forwarded = new URL(spy.observed[0].url);
+        expect(forwarded.protocol, route.path).toBe("http:");
+        expect(forwarded.host, route.path).toBe(new URL(origin).host);
+        expect(forwarded.port, route.path).toBe("");
+        expect(`${forwarded.pathname}${forwarded.search}${forwarded.hash}`, route.path).toBe(route.path);
+        expect(spy.observed[0], route.path).toEqual({
+          url: `http://${new URL(origin).host}${route.path}`,
+          method: route.method,
+          redirect: "manual",
+          headers: expectedHeaders,
+          body: route.method === "POST" ? "{}" : "",
+          receiverIsBinding: true,
+        });
+        expect(new Headers(spy.observed[0].headers).get("Origin"), route.path).toBe(origin);
+        expect(origin.startsWith("https://"), route.path).toBe(true);
+      }
+    }
+  });
+
+  it("returns unavailable without any call for every malformed private transport", async () => {
+    for (const malformed of [
+      null, "", " ", "HTTP", "Https", " http", "http ", "http:", "https:", "http://", "tcp", "h2", "8080",
+      0, 1, true, false, {}, ["http"], new String("http"),
+    ]) {
+      const spy = bindingSpy();
+      for (const route of [ROUTES[2], ROUTES[1]]) {
+        const outcome = await dispatchControlPlane(input({
+          binding: spy.target, privateTransport: malformed, upstreamPath: route.path, method: route.method,
+          contentLength: route.method === "POST" ? 2 : 0, body: route.method === "POST" ? body("{}") : null,
+        }));
+        expect(outcome, `${String(malformed)} ${route.path}`).toEqual({ kind: "unavailable" });
+      }
+      expect(spy.target.fetch, String(malformed)).not.toHaveBeenCalled();
+    }
+  });
+
+  it("ignores caller-supplied scheme, host and forwarding headers when choosing the upstream URL", async () => {
+    for (const privateTransport of [undefined, "https", "http"]) {
+      const spy = bindingSpy();
+      const sent = new Headers({
+        "X-Heel-Edge-Auth": edge, Origin: "http://attacker.invalid", Host: "attacker.invalid",
+        "X-Forwarded-Proto": privateTransport === "http" ? "https" : "http",
+        "X-Forwarded-Host": "attacker.invalid", Forwarded: "proto=http;host=attacker.invalid",
+      });
+      const outcome = await dispatchControlPlane(input({ binding: spy.target, privateTransport, headers: sent }));
+      expect(outcome.kind).toBe("response");
+      const scheme = privateTransport === "http" ? "http" : "https";
+      expect(spy.observed[0].url).toBe(`${scheme}://${new URL(CONFIGURED_ORIGINS[0]).host}/v1/me`);
+    }
+  });
+
   it("returns the upstream response object itself for a non-redirect status", async () => {
     for (const status of [200, 201, 204, 400, 401, 403, 404, 409, 429, 500, 503]) {
       const upstream = new Response(null, { status });

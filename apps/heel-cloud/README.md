@@ -176,6 +176,11 @@ packages are bundled into the Worker but are outside this check.
    `deploy/.env.production` and fill it through the deployment secret manager.
 2. Provision the domain, Cloudflare Tunnel, and VPC service. The VPC service UUID
    supplied to the Worker build must identify the private control-plane service.
+   The Worker calls that service over HTTPS by default. Only when the VPC service
+   exposes the control plane on a private HTTP port inside the encrypted Tunnel, set
+   `HEEL_CONTROL_PLANE_TRANSPORT=http` for the build and deploy commands (the only
+   other accepted value is `https`). This selects the service's HTTP port only; the
+   public origin, cookies and browser traffic stay HTTPS.
 3. Set the Worker's `CONTROL_PLANE_EDGE_SECRET` to the same canonical base64url
    value used as `HEEL_EDGE_AUTH_SECRET_B64` by the control plane.
 4. Validate and start the private services:
