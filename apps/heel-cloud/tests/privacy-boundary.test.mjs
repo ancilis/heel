@@ -369,7 +369,7 @@ function analyzeSource(fileName, text) {
     || RUNNER_ROTATION_PUBLIC.test(upstreamPath)
     || RUNNER_CONTROL.test(upstreamPath)
     || RUNNER_CONTEXT_CONTROL.test(upstreamPath)
-    || RUNNER_RESULT_PROJECTION.test(upstreamPath)
+    || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_DISCLOSURE_POLL.test(upstreamPath)
     || RUNNER_RESYNC.test(upstreamPath)
     || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath);
 }
@@ -391,7 +391,7 @@ function controlPlaneRoute(method: string, pathname: string): string | null {
   if (RUNNER_PAIRING_MANAGE.test(upstreamPath) && (method === "GET" || method === "POST" || method === "DELETE")) return upstreamPath;
   if ((RUNNER_ROTATION_START.test(upstreamPath) || RUNNER_ROTATION_APPROVE.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (RUNNER_REVOKE.test(upstreamPath) && method === "POST") return upstreamPath;
-  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath)) && method === "POST") return upstreamPath;
+  if ((RUNNER_CONTROL.test(upstreamPath) || RUNNER_CONTEXT_CONTROL.test(upstreamPath) || RUNNER_RESULT_PROJECTION.test(upstreamPath) || RUNNER_DISCLOSURE_POLL.test(upstreamPath) || RUNNER_RESYNC.test(upstreamPath) || RUNNER_INACTIVE_CLAIM_ATTESTATION.test(upstreamPath)) && method === "POST") return upstreamPath;
   if (isHumanCanaryRoute(method, upstreamPath) || isHumanEnvironmentRoute(method, upstreamPath)) return upstreamPath;
   if (PROJECTS_ROUTE.test(upstreamPath) && (method === "GET" || method === "POST")) {
     return upstreamPath;
@@ -2582,7 +2582,8 @@ test("the edge keeps the result-handoff poll and disclosure read on exact route 
   assert.equal(read[1], "^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/disclosure$");
   assert.equal(poll[1], "^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/disclosure-poll$");
   // The runner poll joins the runner-proof family on every list that admits a runner route.
-  for (const line of worker.split("\n").filter((text) => text.includes("RUNNER_RESULT_PROJECTION.test(upstreamPath)"))) {
+  for (const line of worker.split("\n").filter((text) => text.includes("RUNNER_RESULT_PROJECTION.test(upstreamPath)")
+    && !text.includes("const runnerResultProjection ="))) {
     assert.ok(line.includes("RUNNER_DISCLOSURE_POLL.test(upstreamPath)"), `poll missing beside result projection: ${line.trim()}`);
   }
 });

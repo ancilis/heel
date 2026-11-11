@@ -310,11 +310,13 @@ def test_result_handoff_routes_cross_the_actual_worker_on_their_exact_families(w
 
     before = len(edge.forwarded)
     oversized = b'{"p":"' + b"x" * 2048 + b'"}'
-    status, _, _ = edge.request(
+    status, body, _ = edge.request(
         "POST", poll_path, raw=oversized, origin=None, fetch_site=None,
         headers={"X-Heel-Runner-Id": runner_id, **_HANDOFF_PROOF},
     )
-    assert status == 413 and len(edge.forwarded) == before
+    # The edge's uniform refusal for every over-cap runner body; nothing is forwarded.
+    assert (status, json.dumps(body, separators=(",", ":")).encode()) == REFUSED
+    assert len(edge.forwarded) == before
     # A session cookie never authorizes the runner route at the edge.
     status, _, _ = edge.request("POST", poll_path, raw=small, cookie=cookie)
     assert status in {400, 401, 403} and len(edge.forwarded) == before

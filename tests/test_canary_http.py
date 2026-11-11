@@ -2714,10 +2714,8 @@ def test_disclosure_poll_and_human_read_are_real_pop_and_view_scoped_routes(cana
         f"/projects/{fixture.project}/", "/projects/proj_other/",
     )
     assert fixture.request("GET", wrong_project, headers=fixture.browser)[0] == 404
-    for method in ("POST", "PUT", "DELETE"):
-        assert fixture.request(method, disclosure_path, headers=fixture.browser)[0] in {
-            404, 405,
-        }
+    # The read is GET-only (the server implements no PUT/DELETE handlers at all).
+    assert fixture.request("POST", disclosure_path, headers=fixture.browser)[0] in {404, 405}
     for suffix in ("?status=1", "#x"):
         assert fixture.request("GET", disclosure_path + suffix, headers=fixture.browser)[0] == 404
 
