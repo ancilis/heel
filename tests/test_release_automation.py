@@ -232,6 +232,13 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             # No clean-room result is claimed for the rc4 command before its evidence exists.
             self.assertNotRegex(unwrapped, r"passed on Apple silicon macOS with Python", path)
         self.assertIn(PUBLIC_CLI, (ROOT / PAIRED_RUNNER_SURFACES[0]).read_text(encoding="utf-8"))
+        # The plan-differential customer journey builds HEEL_HOME from the physical path, never a
+        # logical $PWD that may contain a symbolic link (the synthetic source-checkout section is separate).
+        guide = (ROOT / "docs/PLAN_DIFFERENTIAL_RUNNER.md").read_text(encoding="utf-8")
+        journey = guide[guide.index("## Real staging journey"):guide.index("## Synthetic journey")]
+        self.assertIn('export HEEL_HOME="$(pwd -P)/.heel"', journey)
+        self.assertNotIn('"$PWD/.heel', journey)
+        self.assertIn("no component is a symbolic link", " ".join(journey.split()))
         page = (ROOT / "apps/heel-cloud/app/agent/page.tsx").read_text(encoding="utf-8")
         digest = re.search(r'const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";', page).group(1)
         template = re.search(r"const INSTALL_PUBLIC_AGENT = `([^`]*)`;", page).group(1)

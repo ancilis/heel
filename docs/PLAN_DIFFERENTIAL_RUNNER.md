@@ -47,8 +47,13 @@ journey (see [capabilities](CAPABILITIES.md)).
 ```sh
 python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version
 . ./heel-rc4/bin/activate
-export HEEL_HOME="$PWD/.heel"
+export HEEL_HOME="$(pwd -P)/.heel"
 ```
+
+`HEEL_HOME` must be an absolute physical path in which no component is a symbolic link;
+`pwd -P` prints that physical path and plain `$PWD` may not. On macOS, `/tmp` and `/var` are
+symbolic links to `/private/tmp` and `/private/var`. Use the same `HEEL_HOME`, in the same
+shell, for every command below.
 
 1. Create the signed scope. The allowlist entry is the bare host.
 
