@@ -12,7 +12,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import Dashboard from "../app/dashboard/page";
-import { CanaryApi, CanaryApiError } from "../lib/canary-api";
+import { CanaryApi, CanaryApiError, type CanaryDisclosureState } from "../lib/canary-api";
 
 
 const nav = vi.hoisted(() => ({ search: "", replace: vi.fn() }));
@@ -938,7 +938,7 @@ describe("C7AR1 R3: same-document navigation is revalidated and applied", () => 
 
 // SEAM (C7AR2): besides the fake transport above, `CanaryApi` methods are replaced only to hold or settle a
 // component's async action at a chosen moment. No proof, binding, approval, run or target request is real; the
-// terminal run below is component metadata so the existing local-summary input renders.
+// terminal run below is component metadata so the result-sharing status read starts.
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -974,12 +974,13 @@ async function requestProof(): Promise<void> {
 
 const BLOCKED_NOTICE = /Project created\. Canary setup is unavailable right now/;
 const RUN_ID = `crun_${"1".repeat(32)}`;
-const SUMMARY = JSON.stringify({
-  schema_version: "heel.canary-findings-projection.v1", projection_digest: "a".repeat(64),
-  scenario_results: [{ assessment_outcome: "observed", finding: null }],
-});
+const AWAITING_SHARE: CanaryDisclosureState = {
+  requestId: `cdr_${"2".repeat(32)}`, runId: RUN_ID, status: "awaiting_disclosure_approval",
+  projection: { projectionDigest: "a".repeat(64), projectionBytes: 25, scenarioCount: 1, findingCount: 0 },
+};
+const UNREADABLE_SHARING = /returned no readable sharing status/;
 
-/** Shows a terminal local-result run only where `owns(projectRef)` holds, so the summary input renders there. */
+/** Shows a terminal local-result run only where `owns(projectRef)` holds, so its sharing status is read there. */
 function terminalRunWhere(owns: (projectRef: string) => boolean): void {
   vi.spyOn(CanaryApi.prototype, "listPendingApprovalRequests").mockImplementation(async (_workspaceRef, projectRef) =>
     ({ hasMore: false, request: owns(projectRef) ? { runId: RUN_ID, approvalId: "old-approval" } : null }) as never);
@@ -989,18 +990,21 @@ function terminalRunWhere(owns: (projectRef: string) => boolean): void {
   } as never);
 }
 
-/** Chooses a local summary whose read settles only when the returned promise is settled. */
-async function chooseHeldSummary(): Promise<ReturnType<typeof deferred<string>>> {
-  await screen.findByText("Load local summary to review separate sharing →");
-  const read = deferred<string>();
-  fireEvent.change(document.querySelector("input[type=file]") as HTMLInputElement, { target: { files: [{ size: 25, text: () => read.promise }] } });
+/** Holds the shown run's disclosure status read; it settles only when the returned promise is settled. */
+async function holdSharingRead(): Promise<ReturnType<typeof deferred<CanaryDisclosureState>>> {
+  const read = deferred<CanaryDisclosureState>();
+  const spy = vi.spyOn(CanaryApi.prototype, "getDisclosure").mockImplementation(() => read.promise);
+  await screen.findByRole("region", { name: "Result sharing" });
+  await waitFor(() => expect(spy).toHaveBeenCalled());
   return read;
 }
 
-function expectNoLocalSummaryState(): void {
+function expectNoSharingState(): void {
   expect(screen.queryByRole("dialog", { name: "Share result summary?" })).toBeNull();
   expect(screen.queryByText("Share result summary?")).toBeNull();
-  expect(screen.queryByText("That file is not a closed signed canary summary.")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Review sharing" })).toBeNull();
+  expect(screen.queryByRole("region", { name: "Result sharing" })).toBeNull();
+  expect(screen.queryByText(UNREADABLE_SHARING)).toBeNull();
 }
 
 
@@ -1184,14 +1188,14 @@ describe("C7AR2 N2: busy state belongs to the operation and context that started
 });
 
 
-describe("C7AR2 N1: a local summary read belongs to the account and project that chose it", () => {
-  async function chooseThenSwitchAccount(): Promise<{ read: ReturnType<typeof deferred<string>>; second: Account }> {
+describe("C7AR2 N1: a result-sharing status read belongs to the account and project that started it", () => {
+  async function readThenSwitchAccount(): Promise<{ read: ReturnType<typeof deferred<CanaryDisclosureState>>; second: Account }> {
     const first = server.account("first@example.test", "first-password", [{ role: "owner", projects: ["First"] }]);
     const second = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Second"] }]);
     server.session = first;
     terminalRunWhere(() => server.session === first);
     render(<Dashboard />);
-    const read = await chooseHeldSummary();
+    const read = await holdSharingRead();
     fireEvent.click(signOutButton());
     await signInFromSignedOut(EMAIL, SECRET);
     await screen.findByRole("combobox", { name: /project/i });
@@ -1199,22 +1203,23 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     return { read, second };
   }
 
-  test("a previous account's summary that reads successfully opens nothing for the new account", async () => {
-    const { read, second } = await chooseThenSwitchAccount();
-    await act(async () => { read.resolve(SUMMARY); });
+  test("a previous account's status that reads successfully opens nothing for the new account", async () => {
+    const { read, second } = await readThenSwitchAccount();
+    await act(async () => { read.resolve(AWAITING_SHARE); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().selectedOptions[0].textContent).toBe("Second");
     expect(nav.search).toContain(second.memberships[0].workspace_id);
+    expect(nav.search).not.toContain(RUN_ID);
     expect(signOutButton().disabled).toBe(false);
     expectNoSecretLeak();
   });
 
-  test("a previous account's summary that fails to parse shows no error to the new account", async () => {
-    const { read } = await chooseThenSwitchAccount();
-    await act(async () => { read.resolve("not-json"); });
+  test("a previous account's status read that fails shows no error to the new account", async () => {
+    const { read } = await readThenSwitchAccount();
+    await act(async () => { read.reject(new CanaryApiError("invalid_response", 502)); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().selectedOptions[0].textContent).toBe("Second");
   });
 
@@ -1222,12 +1227,12 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     const { ws, alpha, beta } = alphaBeta();
     terminalRunWhere((projectRef) => projectRef === alpha);
     const view = render(<Dashboard />);
-    const read = await chooseHeldSummary();
+    const read = await holdSharingRead();
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
-    await act(async () => { read.resolve(SUMMARY); });
+    await act(async () => { read.resolve(AWAITING_SHARE); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().value).toBe(beta);
   });
 
@@ -1235,29 +1240,33 @@ describe("C7AR2 N1: a local summary read belongs to the account and project that
     const { ws, alpha, beta } = alphaBeta();
     terminalRunWhere((projectRef) => projectRef === alpha);
     const view = render(<Dashboard />);
-    const read = await chooseHeldSummary();
+    const read = await holdSharingRead();
     navigate(view, `workspace=${ws}&project=${beta}`);
     await waitFor(() => expect(projectSelect().value).toBe(beta));
-    await act(async () => { read.reject(new DOMException("read failed", "NotReadableError")); });
+    await act(async () => { read.reject(new CanaryApiError("unavailable", 0)); });
     await settle();
-    expectNoLocalSummaryState();
+    expectNoSharingState();
     expect(projectSelect().value).toBe(beta);
   });
 
-  test("in the current context an invalid summary is refused and a valid one opens the sharing review", async () => {
+  test("in the current context an unreadable status is reported and a valid one offers the sharing review", async () => {
     const { alpha } = alphaBeta();
     terminalRunWhere((projectRef) => projectRef === alpha);
+    const reads: Array<CanaryDisclosureState | Error> = [new CanaryApiError("invalid_response", 502), AWAITING_SHARE];
+    vi.spyOn(CanaryApi.prototype, "getDisclosure").mockImplementation(async () => {
+      const next = reads.length > 1 ? reads.shift()! : reads[0];
+      if (next instanceof Error) throw next;
+      return next;
+    });
     render(<Dashboard />);
-    const invalid = await chooseHeldSummary();
-    await act(async () => { invalid.resolve("not-json"); });
-    await screen.findByText("That file is not a closed signed canary summary.");
+    await screen.findByText(UNREADABLE_SHARING);
     expect(screen.queryByRole("dialog", { name: "Share result summary?" })).toBeNull();
 
-    const valid = await chooseHeldSummary();
-    await act(async () => { valid.resolve(SUMMARY); });
+    fireEvent.click(await screen.findByRole("button", { name: "Review sharing" }, { timeout: 4_000 }));
     const dialog = await screen.findByRole("dialog", { name: "Share result summary?" });
-    expect(within(dialog).getByText("Crossed").nextSibling?.textContent).toBe("1");
+    expect(within(dialog).getByText("Findings").nextSibling?.textContent).toBe("0");
     expect(within(dialog).getByText("25 B")).toBeTruthy();
+    expect(document.querySelector("input[type=file]")).toBeNull();
     expect(projectSelect().value).toBe(alpha);
   });
 });

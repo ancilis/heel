@@ -5,6 +5,7 @@ import { describe, expect, test, vi } from "vitest";
 import {
   canCreateProject,
   canListProjects,
+  confirmedRunRef,
   resolveAccount,
   selectionFromParams,
   selectionQuery,
@@ -19,6 +20,7 @@ const viewerWs = "ws_00000000000000b2";
 const billingWs = "ws_00000000000000c3";
 const projectA = `prj_${"a".repeat(32)}`;
 const projectB = `prj_${"b".repeat(32)}`;
+const run = `crun_${"c".repeat(32)}`;
 
 
 function project(workspaceRef: string, projectRef: string, name: string): HeelCloudProject {
@@ -119,11 +121,40 @@ describe("account selection in the URL", () => {
     expect(selectionFromParams(null)).toEqual({});
   });
 
-  test("serializes nothing but the two refs", () => {
+  test("serializes nothing but the three refs", () => {
     expect(selectionQuery({ workspaceRef: ownerWs, projectRef: projectA })).toBe(`?workspace=${ownerWs}&project=${projectA}`);
+    expect(selectionQuery({ workspaceRef: ownerWs, projectRef: projectA, runRef: run })).toBe(`?workspace=${ownerWs}&project=${projectA}&run=${run}`);
     expect(selectionQuery({ workspaceRef: ownerWs })).toBe(`?workspace=${ownerWs}`);
     expect(selectionQuery({})).toBe("");
     expect(selectionQuery({ workspaceRef: "not-a-ref", projectRef: projectA })).toBe("");
+  });
+
+  test("a run ref is read only as an exact opaque ref together with a well-formed workspace and project", () => {
+    expect(selectionFromParams(new URLSearchParams({ workspace: ownerWs, project: projectA, run })))
+      .toEqual({ workspaceRef: ownerWs, projectRef: projectA, runRef: run });
+    expect(selectionFromParams(new URLSearchParams({ workspace: ownerWs, run }))).toEqual({ workspaceRef: ownerWs });
+    expect(selectionFromParams(new URLSearchParams({ run }))).toEqual({});
+    expect(selectionFromParams(new URLSearchParams({ workspace: ownerWs, project: "prj_short", run }))).toEqual({ workspaceRef: ownerWs });
+    for (const bad of [`crun_${"C".repeat(32)}`, `crun_${"c".repeat(31)}`, `${run}x`, "crun_../x", `run_${"c".repeat(32)}`]) {
+      expect(selectionFromParams(new URLSearchParams({ workspace: ownerWs, project: projectA, run: bad })))
+        .toEqual({ workspaceRef: ownerWs, projectRef: projectA });
+    }
+  });
+
+  test("a run ref is never serialized without its workspace and project, nor when malformed", () => {
+    expect(selectionQuery({ workspaceRef: ownerWs, runRef: run })).toBe(`?workspace=${ownerWs}`);
+    expect(selectionQuery({ runRef: run })).toBe("");
+    expect(selectionQuery({ workspaceRef: ownerWs, projectRef: projectA, runRef: "crun_bad" })).toBe(`?workspace=${ownerWs}&project=${projectA}`);
+  });
+
+  test("a requested run ref counts only for the exact workspace and project the server confirmed", () => {
+    const requested = { workspaceRef: ownerWs, projectRef: projectB, runRef: run };
+    expect(confirmedRunRef(requested, ownerWs, projectB)).toBe(run);
+    // The server fell back to another project or workspace: the run ref is not carried over to it.
+    expect(confirmedRunRef(requested, ownerWs, projectA)).toBeNull();
+    expect(confirmedRunRef(requested, viewerWs, projectB)).toBeNull();
+    expect(confirmedRunRef({ workspaceRef: ownerWs, projectRef: projectB }, ownerWs, projectB)).toBeNull();
+    expect(confirmedRunRef({ ...requested, runRef: "crun_bad" }, ownerWs, projectB)).toBeNull();
   });
 });
 

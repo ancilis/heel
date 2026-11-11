@@ -34,7 +34,7 @@ export function ActivationCard({ snapshot, completedSteps, environmentOrigin, sc
         : snapshot.canaryAccess !== "ready"
           ? "finish local setup on the runner machine"
           : snapshot.rehearsal === "complete"
-            ? "review the detailed result on the runner machine"
+            ? "review the result below and choose whether to share its redacted summary"
             : snapshot.rehearsal === "running"
               ? "follow the approved rehearsal or stop it"
               : "review the exact rehearsal";
