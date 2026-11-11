@@ -109,9 +109,10 @@ it("rejects a runner revoke result outside the typed contract and names the refu
 });
 
 // The final 1.3.0rc3 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca
-// ("Customer install command"), pinned to the reviewed final rc3 wheel (source 4b68c2f, 2769936 bytes). That runbook
-// is not in this tree, so the line is pinned here. The /agent MCP quickstart deliberately stays on its rc2 install,
-// consistent with this tree's bundled rc2 downloads; only the paired-runner surfaces move to rc3.
+// ("Customer install command"), pinned to the reviewed final rc3 wheel (source 4b68c2f, 2769936 bytes), pinned here
+// rather than read from the runbook. The /agent MCP quickstart deliberately stays on its published rc2 public install;
+// its only rc3 mentions are the same-origin 1.3.0rc3 candidate downloads from main. Only the paired-runner surfaces
+// install the public rc3 release.
 const RC3_WHEEL_SHA256 = "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca";
 const RC3_RUNBOOK_INSTALL = "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "
   + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256=${RC3_WHEEL_SHA256}'`
@@ -126,7 +127,8 @@ it("the dashboard pairing card and /runner show the exact final rc3 runbook inst
   assert.ok(runner.includes(RC3_RUNBOOK_INSTALL));
   assert.doesNotMatch(runner, /heel-rc2\/|releases\/(tag|download)\/v1\.3\.0rc2/);
   const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
-  assert.doesNotMatch(agent, /rc3/);
+  assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc3|heel-rc3/);
+  assert.match(agent, /releases\/download\/v1\.3\.0rc2\/heel_sim-1\.3\.0rc2-py3-none-any\.whl#sha256=/);
 });
 
 it("discovers only a closed pending approval summary", async () => {
