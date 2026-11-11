@@ -177,7 +177,7 @@
   "app": {
     "directory": "apps/heel-cloud",
     "lockfile": "apps/heel-cloud/package-lock.json",
-    "lockfile_sha256": "eca12033cb2778a03fd2482e6d263fba47bd247cd651be76067a4745ff5f6da9",
+    "lockfile_sha256": "ef8b25eda1f393fa9dad3c55c1b162e9ea50ea6f5162d515addbe781ba0283cc",
     "install": [
       "npm",
       "ci",

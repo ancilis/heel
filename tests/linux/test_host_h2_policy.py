@@ -114,7 +114,7 @@ RECEIPT_SCHEMA = "heel.h2a.receipt.v1"
 # static test and P0 compare the staged bytes with these.
 H2_SOURCE_SHA256 = "2511dae4352bbf2006fb638164375da1d80a097a4bb6117dc7ea96328b5b4af6"
 H2_HELPER_SHA256 = "c261a67fee245d58bbf59adcd8203f959209c6210f1c16b452315044a5a53866"
-HARNESS_SHA256 = "b8887b867647a81ae0fc09e392b4ad410907f1df1453ef43282fcb1a1c3aeea1"
+HARNESS_SHA256 = "846bc9d401ae3b09759704ca9763f03d71ea2c961b18b0ed17bce3536176207d"
 H2_PUBLIC = ("build_input", "cleanup", "install", "readback_matches", "render_table", "unresolved_helpers")
 # The only non-function H2 names this module reads (public constants); it never reads or assigns a
 # private H2 name. H2-1's own guard (tests/test_host_h2_policy.py) admits no other tracked module that

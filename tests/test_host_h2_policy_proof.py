@@ -58,18 +58,18 @@ UNCHANGED_SHA256 = {
     "deploy/host/authority.py": "4c9a1fc6078060c1fcea0a858be601c34a558517a25a7134ec8042134e6967a5",
     "deploy/host/profile.py": "e697da2bf90a5e5e3bdf80aac2c18c9a8ab53f9018a35f977de1c857915dab83",
     "deploy/host/cycle.py": "a991548afa98a3423e360eff634ae7251c2f31b2dffe1778c727616bf6ca0e64",
-    # RUNNER-RC3 integration: accepted aa6e8314 (GAP-4) mirrors the Worker GET canary-approval-requests
-    # rule in the harness (was 779d2129...). Test-support bytes only; H2 closure moves; UNRUN.
-    "tests/support/edge_tls_harness.py": "b8887b867647a81ae0fc09e392b4ad410907f1df1453ef43282fcb1a1c3aeea1",
+    # RC4 integration: accepted H2A 1e249fa5 mirrors the Worker disclosure-poll route family (2 KiB cap)
+    # in the harness (was b8887b86..., RUNNER-RC3 GAP-4). Test-support bytes only; H2 closure moves; UNRUN.
+    "tests/support/edge_tls_harness.py": "846bc9d401ae3b09759704ca9763f03d71ea2c961b18b0ed17bce3536176207d",
     "scripts/host_lease_key_shape.py": "83edee96607a1fad33d5bb7f00a230650dffb5d36f2fe4f13eb34c3ae3e3a61c",
     "scripts/host_authority_proof.py": "af27f68e033cce033a9b48a77dc26a73dc6176829b575476ae904b43b69cb76c",
     "scripts/host_lease_feasibility.py": "62e8bbd346e7b196bdb2946924b93fa59b0b09bfb914997bebd65d76b21eeb51",
     # H2-LINK-DIAGNOSTICS-R1: H0's default-disabled capture observer (was a1b32cc4...). A shared-helper
     # change: H0/H1F regressions and a fresh H0 qualification are required; it is not H2-only.
     "scripts/host_ingress_proof.py": "76958e1896110155aea9802996f00408c097a2a238b8c73ede138eafbccd4aa4",
-    # RC3 pin refresh: only app.lockfile_sha256 changes (was f1fb8f3b..., H0-APP-LOCK); the npm root version
-    # is now 1.3.0-rc.3, so it names the tracked lockfile eca12033.... H2 closure moves; UNRUN.
-    "deploy/host/ingress/runtime-lock.json": "333c70348fd254b36cdb007901a3f7b8e008d9213c033970e1a25d1ddbc1b8f3",
+    # RC4 pin refresh: only app.lockfile_sha256 changes (was 333c7034..., RC3); the npm root version
+    # is now 1.3.0-rc.4, so it names the tracked lockfile ef8b25ed.... H2 closure moves; UNRUN.
+    "deploy/host/ingress/runtime-lock.json": "e011c0cfee75125a449f551685e7e33b8c97e404420dd6100d0ec7afb19641e6",
 }
 RECORDED_PICK = {"targets": ("8.8.8.8", "8.8.4.4"), "unapproved_target": "1.1.1.1", "wrong_source": "9.9.9.9",
                  "dual_stack_ipv6": "2001:4860:4860::8888"}
