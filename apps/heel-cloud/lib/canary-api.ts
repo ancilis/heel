@@ -11,6 +11,8 @@ const PROJECT_REF = /^prj_[0-9a-f]{32}$/;
 const RUN_REF = /^crun_[0-9a-f]{32}$/;
 const ENVIRONMENT_REF = /^env_[0-9a-f]{32}$/;
 const PAIRING_REF = /^pending_[0-9a-f]{32}$/;
+// The Worker's runner-route segment grammar; a runner id outside it is never sent.
+const RUNNER_REF = /^[A-Za-z0-9_-]{1,128}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9._:-]{1,256}$/;
 const BASE64_SIGNATURE = /^(?:[A-Za-z0-9+/]{4}){21}[A-Za-z0-9+/]{2}==$/;
@@ -94,6 +96,10 @@ export interface RunnerContextBindingRecord {
 export interface RunnerContextRunner {
   runnerId: string; runnerKeyId: string; displayName: string; fingerprint: string;
   runnerVersion: string; adapterVersions: readonly string[]; status: "active";
+}
+/** A pending runner pairing as the control plane shows it to the approving owner or admin. */
+export interface RunnerPairingView {
+  pairingId: string; runnerId: string; pairingPhrase: string; fingerprint: string; status: "pending"; expiresAt: number;
 }
 export interface RunnerContextBindingDashboard {
   runners: readonly RunnerContextRunner[]; bindings: readonly RunnerContextBindingRecord[];
@@ -179,6 +185,7 @@ const PUBLIC_MESSAGES = Object.freeze({
   quota_exceeded: "This workspace has reached its current allowance.",
   invalid_runner_pairing: "That runner pairing request is invalid or expired.",
   runner_pairing_not_found: "That runner pairing request is no longer available.",
+  invalid_runner_revocation: "That runner is already revoked or no longer available in this workspace.",
 } as const);
 
 type CanaryErrorCode = keyof typeof PUBLIC_MESSAGES;
@@ -911,14 +918,15 @@ export class CanaryApi {
     return deepFreeze({ invitationToken: value.invitation_token as string, expiresAt: value.expires_at });
   }
 
-  async inspectRunnerPairing(workspaceRef: string, pairingRef: string): Promise<Readonly<JsonRecord>> {
+  async inspectRunnerPairing(workspaceRef: string, pairingRef: string): Promise<Readonly<RunnerPairingView>> {
     if (!WORKSPACE_REF.test(workspaceRef) || !PAIRING_REF.test(pairingRef)) invalidRequest();
     const value = await this.#json(`${CONTROL_PLANE_PREFIX}/v1/workspaces/${workspaceRef}/runner-pairings/${pairingRef}`, "GET", undefined, 200);
     if (!exact(value, ["schema_version", "pairing_id", "runner_id", "pairing_phrase", "fingerprint", "status", "expires_at"])
       || value.schema_version !== "heel.runner-pairing-view.v1" || value.pairing_id !== pairingRef
       || !identifier(value.runner_id) || !closedString(value.pairing_phrase, 128) || !digest(value.fingerprint)
       || value.status !== "pending" || typeof value.expires_at !== "number" || !Number.isFinite(value.expires_at)) invalidResponse();
-    return deepFreeze(value);
+    return deepFreeze({ pairingId: pairingRef, runnerId: value.runner_id as string, pairingPhrase: value.pairing_phrase as string,
+      fingerprint: value.fingerprint as string, status: "pending", expiresAt: value.expires_at as number });
   }
 
   async approveRunnerPairing(workspaceRef: string, pairingRef: string, phrase: string, fingerprint: string): Promise<void> {
@@ -927,6 +935,15 @@ export class CanaryApi {
       schema_version: "heel.runner-pairing-approve.v1", pairing_phrase: phrase, fingerprint,
     }, 200);
     if (!exact(value, ["schema_version", "status"]) || value.schema_version !== "heel.runner-pairing-approved.v1" || value.status !== "approved") invalidResponse();
+  }
+
+  /** Revokes one paired runner in the workspace (recent owner/admin); the server revokes its keys and requests a stop of its active runs. */
+  async revokeRunner(workspaceRef: string, runnerId: string): Promise<void> {
+    if (!WORKSPACE_REF.test(workspaceRef) || !RUNNER_REF.test(runnerId)) invalidRequest();
+    const value = await this.#json(`${CONTROL_PLANE_PREFIX}/v1/workspaces/${workspaceRef}/runners/${runnerId}/revoke`, "POST", {
+      schema_version: "heel.runner-revoke.v1", reason_code: "human_revocation",
+    }, 200);
+    if (!exact(value, ["schema_version", "revoked"]) || value.schema_version !== "heel.runner-revoke-result.v1" || value.revoked !== true) invalidResponse();
   }
 
   async #json(path: string, method: "GET" | "POST", body: unknown, expectedStatus: number, extraHeaders: Record<string, string> = {}, signal?: AbortSignal): Promise<JsonRecord> {
