@@ -4230,7 +4230,7 @@ def test_a_permit_that_expires_while_its_upload_is_staged_is_never_resent(tmp_pa
         return [
             (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
             (503, {}, {"error": "edge"}),
-        ]
+        ] + [(429, {}, {"code": "runner_resync_rate_limited", "retry_after_ms": 20_000})] * 5
 
     h = _handoff_coordinator(tmp_path, tail)
     start = len(h.transport.requests)
@@ -4239,11 +4239,14 @@ def test_a_permit_that_expires_while_its_upload_is_staged_is_never_resent(tmp_pa
     for _ in range(4):
         h.clock[0] += 60_000
         h.coordinator.advance_disclosures()
-    assert len(h.transport.requests) - start == 2
+    # Expired: the projection is never re-sent.  Only the metadata-only recovery start goes out, once
+    # per 60 s (within the server's 3/min rule); rate limited here, so the upload stays parked.
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"] + ["start"] * 4
     _staged_upload(h)
-    with pytest.raises(ValueError, match="expired"):
-        h.build(h.client.runtime, nonce_byte=b"z")
-    assert len(h.transport.requests) - start == 2  # zero bytes on restart either
+    h.clock[0] += 60_000
+    h.build(h.client.runtime, nonce_byte=b"z")  # rc4/rc5 candidate: ValueError("...expired...")
+    assert _paths(h.transport, start) == ["disclosure-poll", "result-projection"] + ["start"] * 5
+    _staged_upload(h)
 
 
 def test_a_staged_upload_at_or_after_retention_is_never_resent_and_leaves_the_listing(tmp_path):
@@ -4529,3 +4532,85 @@ def test_retention_prunes_a_recovered_result_chain_with_its_tombstone_and_keeps_
     assert client.runtime.load_terminal_state(run_id) is None
     assert client.runtime.load_superseded_calls() == ()
     assert coordinator.advance_disclosures() == 0
+
+
+# --- expired human permit while an upload is staged (Fable REPORT §4): metadata-only recovery,
+# never the expired projection bytes; startup comes online instead of a ValueError dead end.
+
+def test_staged_upload_with_an_expired_permit_is_recovered_without_sending_bytes_then_polls(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        permit = _handoff_permit(authority, coordinator, grant, findings, expires_at_ms=32_000)
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (503, {}, {"error": "edge"}),
+            _rc_challenge(grant["run_id"], cursor["next_sequence"] + 1, cursor["generation"]),
+            _rc_completed(grant["run_id"], cursor["next_sequence"] + 1, cursor["generation"] + 1),
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"2")},
+             _handoff_state(grant, "awaiting_disclosure_approval")),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    start = len(h.transport.requests)
+    h.coordinator.advance_disclosures()
+    staged = _staged_upload(h)
+    for _ in range(2):                               # no recovery attempt inside the 60 s pacing
+        h.clock[0] += 29_999
+        assert h.coordinator.advance_disclosures() == 0
+    h.clock[0] += 2                                  # 60 s later; the permit expired at 32 s
+    assert h.coordinator.advance_disclosures() == 1
+    assert _rc_names(h.transport, start) == ["disclosure-poll", "result-projection", "start", "complete"]
+    assert all(b"findings_projection" not in body for _p, _h, body in h.transport.requests[start + 2:])
+    assert h.client.runtime.load_pending_calls() == ()
+    [tombstone] = h.client.runtime.load_superseded_calls()
+    assert (tombstone.request_operation, tombstone.reason, tombstone.sequence) == (
+        "upload-findings", "chain_authority_lost", staged.sequence,
+    )
+    terminal = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    assert terminal.state == "available"
+    assert (terminal.result_chain["next_sequence"], terminal.result_chain["generation"]) == (
+        staged.sequence, staged.generation + 1,
+    )
+    # The next due step polls afresh on the new nonce: the human must decide again.
+    h.clock[0] += 30_000
+    assert h.coordinator.advance_disclosures() == 1
+    path, headers, _body = h.transport.requests[-1]
+    assert path.endswith("/disclosure-poll") and headers["X-Heel-Runner-Nonce"] == _nonce(b"r")
+    assert headers["X-Heel-Runner-Sequence"] == str(staged.sequence)
+    assert _rc_names(h.transport, start).count("result-projection") == 1
+    assert h.client.runtime.load_terminal_state(h.grant["run_id"]).state == "available"
+
+
+def test_restart_with_a_staged_upload_and_expired_permit_comes_online_and_keeps_the_upload_parked_when_consumed(tmp_path):
+    def tail(grant, findings, authority, coordinator, holder):
+        cursor = _rc_cursor(coordinator, grant)
+        permit = _handoff_permit(authority, coordinator, grant, findings, expires_at_ms=32_000)
+        return [
+            (200, {"X-Heel-Runner-Next-Nonce": _nonce(b"p")}, copy.deepcopy(permit)),
+            (503, {}, {"error": "edge"}),
+            # Restart: the server proves the staged sequence consumed (+1) and holds no receipt.
+            _rc_challenge(grant["run_id"], cursor["next_sequence"] + 2, cursor["generation"]),
+            (204, {"X-Heel-Runner-Next-Nonce": _nonce(b"m")}, None),
+        ]
+
+    h = _handoff_coordinator(tmp_path, tail)
+    h.coordinator.advance_disclosures()
+    staged = _staged_upload(h)
+    terminal = h.client.runtime.load_terminal_state(h.grant["run_id"])
+    h.clock[0] += 60_000
+    start = len(h.transport.requests)
+    coordinator, client = h.build(h.client.runtime, nonce_byte=b"z")   # rc5 candidate: ValueError
+    assert _rc_names(h.transport, start) == ["start"]                 # never completed, no bytes
+    assert _staged_upload(h) == staged
+    assert client.runtime.load_terminal_state(h.grant["run_id"]) == terminal
+    assert client.runtime.load_superseded_calls() == ()
+    assert client.runtime.load_resync_attempt("result", h.grant["run_id"]) is None
+    # Online: the claim chain is usable while the consumed upload stays parked for support.
+    assert coordinator.claim() is None
+    assert _rc_names(h.transport, start) == ["start", "claim"]
+    for _ in range(3):
+        h.clock[0] += 60_000
+        assert coordinator.advance_disclosures() == 0
+    assert _rc_names(h.transport, start) == ["start", "claim"]
+    assert _staged_upload(h) == staged
+    assert client.runtime.load_terminal_state(h.grant["run_id"]) == terminal

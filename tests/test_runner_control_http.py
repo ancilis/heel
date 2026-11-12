@@ -549,7 +549,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "recover_staged_upload", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -4922,6 +4922,132 @@ def test_consumed_upload_without_receipt_keeps_the_staged_upload_and_fails_close
             assert runtime.load_terminal_state(live.run_id).state == "available"
             assert runtime.load_superseded_calls() == ()
             assert _rc_server(live)["cursor"] == server["cursor"] == (staged.sequence + 1, 0)
+        finally:
+            live.close()
+
+
+# --- expired human permit while an upload is staged (Fable REPORT §4; metadata-only recovery) ---
+
+def _rc_expire_permit(monkeypatch, permit):
+    """Offline past the permit TTL on every clock.  The server's disclosure service binds its clock at
+    definition and is built per request, so its own instant is shifted at the class (Fable F1)."""
+    from heel.saas.canary_disclosure import CanaryDisclosureService
+
+    seconds = (permit["expires_at_ms"] - permit["issued_at_ms"]) // 1000 + 1
+    real = time.time
+    _rc_shift_clock(monkeypatch, seconds)
+    monkeypatch.setattr(
+        CanaryDisclosureService, "_now_ms", lambda self: max(0, int((real() + seconds) * 1000)),
+    )
+    now = int(time.time() * 1000)
+    assert not permit["issued_at_ms"] <= now < permit["expires_at_ms"]
+
+
+def _rc_projections(live):
+    return live.cp.store.conn.execute(
+        "SELECT COUNT(*) FROM canary_findings_projections WHERE run_id=?", (live.run_id,),
+    ).fetchone()[0]
+
+
+def test_expired_permit_never_consumed_upload_is_retired_by_metadata_only_resync_then_fresh_consent(tmp_path, monkeypatch):
+    """Edge 502 (never forwarded), then offline past the one-use permit's TTL.  The public
+    ``recover_staged_upload`` retires the upload on the server's own cursor proof under the current
+    key and terminal lease, sends no projection bytes, and the next poll reopens the human choice;
+    only a fresh explicit permit then completes the handoff."""
+    from heel.runner.control_client import RunnerResultChainRecovered, RunnerUploadDeferred
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.edge_502_uploads = 1
+            with pytest.raises(RunnerUploadDeferred):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            assert staged.request_operation == "upload-findings" and _rc_server(live)["requests"] == 1
+            _rc_expire_permit(monkeypatch, permit)
+            sent = len(transport.sent)
+            error = _rc_raised(
+                lambda: client.recover_staged_upload(run_id=live.run_id, findings_projection=findings),
+            )
+            assert isinstance(error, RunnerResultChainRecovered), repr(error)
+            assert (error.operation, error.reason) == ("upload-findings", "chain_authority_lost")
+            assert _rc_resync_sends(transport, sent) == ["start", "complete"]
+            assert [path for path, _h, _b in transport.sent[sent:] if "/resync/" not in path] == []
+            assert all(b"findings_projection" not in body for _p, _h, body in transport.sent[sent:])
+            assert _rc_staged(runtime, live.run_id) == []
+            [tombstone] = runtime.load_superseded_calls()
+            assert (tombstone.request_operation, tombstone.reason) == ("upload-findings", "chain_authority_lost")
+            assert tombstone.body_sha256 == hashlib.sha256(staged.body).hexdigest()
+            assert tombstone.challenge_next_sequence == tombstone.completed_next_sequence == staged.sequence
+            state = runtime.load_terminal_state(live.run_id)
+            assert state.state == "available" and state.revision == 2
+            assert (state.result_chain["next_sequence"], state.result_chain["generation"]) == (
+                staged.sequence, staged.generation + 1,
+            )
+            server = _rc_server(live)
+            assert server["cursor"] == (staged.sequence, staged.generation + 1) and server["requests"] == 1
+            assert _rc_projections(live) == 0
+            # Nothing staged remains, so a second recovery is refused locally and sends nothing.
+            sent = len(transport.sent)
+            with pytest.raises(ValueError):
+                client.recover_staged_upload(run_id=live.run_id, findings_projection=findings)
+            assert len(transport.sent) == sent
+            # Next due step: the expired permit is gone; the human choice is open again.
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["status"] == "awaiting_disclosure_approval" and "permit_id" not in answer
+            # Only fresh explicit consent (a new permit) completes the handoff, re-verified as always.
+            fresh = _live_permit(live, findings)
+            assert fresh["permit_id"] != permit["permit_id"]
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["permit_id"] == fresh["permit_id"]
+            receipt = client.upload_findings(run_id=live.run_id, permit=answer, findings_projection=findings)
+            assert receipt["status"] == "synchronized"
+            assert runtime.load_terminal_state(live.run_id).state == "consumed"
+            assert _rc_projections(live) == 1
+        finally:
+            live.close()
+
+
+def test_expired_permit_consumed_upload_without_receipt_stays_fail_closed_under_metadata_only_resync(tmp_path, monkeypatch):
+    """The CP consumed the upload (answer lost), its receipt is gone and the permit expired.  The public
+    recovery proves +1 and never completes: staged upload kept, no tombstone, no local ``consumed``,
+    server generation untouched; a still-valid permit is never retired through this path."""
+    from heel.runner.control_client import RunnerChainRecoveryRequired
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            # While the permit is still valid the exact replay path owns the staged upload.
+            sent = len(transport.sent)
+            with pytest.raises(ValueError):
+                client.recover_staged_upload(run_id=live.run_id, findings_projection=findings)
+            assert len(transport.sent) == sent and _rc_staged(runtime, live.run_id) == [staged]
+            _rc_expire_receipts(live)
+            server = _rc_server(live)
+            assert server["cursor"] == (staged.sequence + 1, staged.generation)
+            _rc_expire_permit(monkeypatch, permit)
+            sent = len(transport.sent)
+            error = _rc_raised(
+                lambda: client.recover_staged_upload(run_id=live.run_id, findings_projection=findings),
+            )
+            assert isinstance(error, RunnerChainRecoveryRequired), repr(error)
+            assert (error.operation, error.reason) == ("upload-findings", "sequence_consumed")
+            assert _rc_resync_sends(transport, sent) == ["start"]
+            assert [path for path, _h, _b in transport.sent[sent:] if "/resync/" not in path] == []
+            assert _rc_staged(runtime, live.run_id) == [staged]
+            assert runtime.load_superseded_calls() == ()
+            assert runtime.load_terminal_state(live.run_id).state == "available"
+            assert runtime.load_resync_attempt("result", live.run_id) is None
+            assert _rc_server(live)["cursor"] == server["cursor"]
+            assert _rc_projections(live) == 1
         finally:
             live.close()
 

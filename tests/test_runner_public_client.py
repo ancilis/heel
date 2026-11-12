@@ -1563,7 +1563,7 @@ def test_named_run_control_requires_an_authenticated_active_claim_before_transpo
     public = {name for name, method in vars(RunnerControlClient).items() if callable(method) and not name.startswith("_")}
     assert public == {"claim", "heartbeat", "progress", "result", "stop_ack",
                       "start_resync", "complete_resync", "install_rotation_claim",
-                          "upload_findings", "poll_disclosure", "list_contexts", "claim_context",
+                          "upload_findings", "recover_staged_upload", "poll_disclosure", "list_contexts", "claim_context",
                           "submit_context_approval_projection", "replay_pending_call",
                           "replay_all_pending", "stage_recovered_result"}
     assert all(parameter.kind is not inspect.Parameter.VAR_KEYWORD for method in (
