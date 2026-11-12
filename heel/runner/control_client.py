@@ -2022,6 +2022,85 @@ class RunnerControlClient:
             run_id=run_id, permit=permit, findings_projection=findings_projection,
         )
 
+    def recover_staged_upload(self, *, run_id, findings_projection):
+        """Retire one staged findings upload whose human permit has closed, sending metadata only.
+
+        The staged bytes are never re-sent: an expired permit is not re-presented.  Under the
+        current key and the run's terminal-disclosure lease, the result-chain resync retires the
+        upload only on the server's proof that it was never consumed and raises
+        ``RunnerResultChainRecovered`` (the next poll asks the human again).  Consumed without a
+        receipt, ambiguous or rate limited: ``RunnerChainRecoveryRequired``/``Deferred`` with the
+        staged upload kept.  An open permit window, or no exact staged upload, is refused locally.
+        """
+        if type(run_id) is not str or not run_id:
+            raise ValueError("invalid runner findings upload")
+        try:
+            findings = validate_canary_findings(findings_projection)
+            self._verify_projection_signature(findings)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner findings upload") from None
+        if findings["workspace_id"] != self.workspace_id or findings["run_id"] != run_id:
+            raise ValueError("invalid runner findings upload")
+        pending = tuple(
+            item for item in self.runtime.load_pending_calls()
+            if item.chain_operation == "result" and item.run_id == run_id
+        )
+        if len(pending) != 1 or pending[0].request_operation != "upload-findings":
+            raise ValueError("terminal runner result is required before disclosure")
+        staged = pending[0]
+        now_ms = self._timestamp()
+        try:
+            request = json.loads(staged.body.decode("utf-8"))
+            if (
+                not isinstance(request, dict) or canonical_bytes(request) != staged.body
+                or set(request) != {"schema_version", "run_id", "permit", "findings_projection"}
+                or request["schema_version"] != "heel.runner-findings-upload.v1"
+                or request["run_id"] != run_id or request["findings_projection"] != findings
+            ):
+                raise ValueError
+            permit = validate_disclosure_permit(request["permit"])
+        except (TypeError, ValueError, UnicodeDecodeError):
+            raise ValueError("invalid runner findings upload") from None
+        if (
+            permit["workspace_id"] != self.workspace_id or permit["run_id"] != run_id
+            or permit["project_id"] != findings["project_id"]
+            or permit["grant_id"] != findings["grant_id"]
+        ):
+            raise ValueError("invalid runner findings upload")
+        if permit["issued_at_ms"] <= now_ms < permit["expires_at_ms"]:
+            # The byte-identical replay owns a staged upload whose permit is still valid.
+            raise ValueError("disclosure permit is still valid")
+        try:
+            disclosure_lease = self.runtime.lease_terminal_disclosure(
+                run_id, expected_project_id=findings["project_id"],
+                expected_grant_id=findings["grant_id"],
+                expected_approval_projection_digest=findings["approval_projection_digest"],
+                now_ms=now_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        with self._result_recovery_lock:
+            reason = self._recover_result_chain_locked(staged, disclosure_lease)
+        raise RunnerResultChainRecovered("upload-findings", reason)
+
+    def _release_replay_barrier_with_parked_uploads(self, call_ids) -> None:
+        """Open the claim path when every remaining staged call is a parked findings upload.
+
+        Startup parks a staged upload that recovery kept (consumed without receipt, deferred); it
+        stays durable and reported, exactly like an upload stopped in-process, while the claim and
+        run chains continue.  Any other staged call keeps the barrier closed.
+        """
+        parked = frozenset(call_ids)
+        pending = self.runtime.load_pending_calls(limit=74)
+        if not pending or len(pending) == 74 or any(
+            item.call_id not in parked or item.request_operation != "upload-findings"
+            or item.chain_operation != "result"
+            for item in pending
+        ):
+            raise ValueError("runner control pending replay is required")
+        with self._state_lock:
+            self._pending_replay_required = False
+
     def _verify_projection_signature(self, projection: dict[str, Any]) -> None:
         public_key = getattr(self.signer, "public_key", None)
         if (not isinstance(public_key, bytes) or len(public_key) != 32
