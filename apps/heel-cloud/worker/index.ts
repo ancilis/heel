@@ -116,6 +116,13 @@ const CANARY_DISCLOSURE_ROUTE = new RegExp(
 const CANARY_FINDINGS_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/findings$`,
 );
+// Scenario library: a session-only workspace listing, private custom revisions, and run-frozen
+// selection bindings. All three ride the human canary family: cookie only, exact same-origin POST.
+const SCENARIO_LIBRARY_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/scenario-library$`);
+const SCENARIO_LIBRARY_CUSTOM_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/scenario-library/custom$`);
+const CANARY_SCENARIO_BINDINGS_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/scenario-bindings$`,
+);
 const ENVIRONMENTS_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/environments$`,
 );
@@ -182,6 +189,9 @@ function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
   if (CANARY_DISCLOSURE_PERMIT_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_DISCLOSURE_LOCAL_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_DISCLOSURE_ROUTE.test(upstreamPath)) return method === "GET";
+  if (SCENARIO_LIBRARY_ROUTE.test(upstreamPath)) return method === "GET";
+  if (SCENARIO_LIBRARY_CUSTOM_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CANARY_SCENARIO_BINDINGS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
   return CANARY_FINDINGS_ROUTE.test(upstreamPath) && method === "GET";
 }
 

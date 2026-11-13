@@ -21,9 +21,9 @@ const clientRoot = join(distRoot, "client");
 const runtimeRoot = join(clientRoot, "heel-runtime");
 const downloadsRoot = join(clientRoot, "downloads");
 const serverRoot = join(distRoot, "server");
-const wheelName = "heel_browser-1.3.0rc4-py3-none-any.whl";
-const agentWheelName = "heel_sim-1.3.0rc4-py3-none-any.whl";
-const agentSourceName = "heel_sim-1.3.0rc4.tar.gz";
+const wheelName = "heel_browser-1.3.0rc5-py3-none-any.whl";
+const agentWheelName = "heel_sim-1.3.0rc5-py3-none-any.whl";
+const agentSourceName = "heel_sim-1.3.0rc5.tar.gz";
 const agentManifestName = "heel-open-core-manifest.json";
 const edgeAuthSecret = "E".repeat(43);
 const expectedDownloadNames = [agentManifestName, agentWheelName, agentSourceName];
@@ -1135,7 +1135,7 @@ test("TAR scanner rejects noncanonical and nonempty unused header metadata", asy
 
 
 test("TAR scanner rejects corrupt checksums, padding, termination, and private members", () => {
-  const valid = syntheticTar([{ name: "heel_sim-1.3.0rc4/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
+  const valid = syntheticTar([{ name: "heel_sim-1.3.0rc5/heel/model.py", payload: Buffer.from("VALUE = 1\n") }]);
   const raw = gunzipSync(valid);
 
   const badChecksum = Buffer.from(raw);
@@ -1156,13 +1156,13 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
   assert.throws(() => tarMembers(canonicalGzip(trailingPayload), "trailing-data source"), /trailing|termination/i);
 
   const privateSource = syntheticTar([
-    { name: "heel_sim-1.3.0rc4/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
-    { name: "heel_sim-1.3.0rc4/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
+    { name: "heel_sim-1.3.0rc5/docs/saas/PRODUCT.md", payload: Buffer.from("private\n") },
+    { name: "heel_sim-1.3.0rc5/heel/model.py", payload: Buffer.from("VALUE = 1\n") },
   ]);
   assert.throws(
     () => classifyReleaseMembers(tarMembers(privateSource), {
       label: "mutated source",
-      rootPrefix: "heel_sim-1.3.0rc4/",
+      rootPrefix: "heel_sim-1.3.0rc5/",
     }),
     /commercial boundary/,
   );
@@ -1171,7 +1171,7 @@ test("TAR scanner rejects corrupt checksums, padding, termination, and private m
 
 test("TAR decompression budget includes bounded headers and padding", () => {
   const records = Array.from({ length: 6 }, (_, index) => ({
-    name: `heel_sim-1.3.0rc4/heel/payload_${index}.py`,
+    name: `heel_sim-1.3.0rc5/heel/payload_${index}.py`,
     payload: Buffer.alloc(maxReleaseMemberBytes),
   }));
   assert.equal(tarMembers(syntheticTar(records), "limit source").length, records.length);
@@ -1265,7 +1265,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const manifest = JSON.parse(decodeUtf8(manifestPayload, `downloads/${agentManifestName}`));
   assert.deepEqual(Object.keys(manifest).sort(), ["artifacts", "schema_version", "version"]);
   assert.equal(manifest.schema_version, "heel.open-core-artifacts.v1");
-  assert.equal(manifest.version, "1.3.0rc4");
+  assert.equal(manifest.version, "1.3.0rc5");
   assert.deepEqual(manifest.artifacts.map(({ name }) => name), [agentWheelName, agentSourceName]);
   await validateReleaseDownloads(downloadsRoot);
 
@@ -1286,7 +1286,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
   const sourceRecords = tarMembers(artifacts.get(agentSourceName), "Heel Agent source archive");
   classifyReleaseMembers(sourceRecords, {
     label: "Heel Agent source archive",
-    rootPrefix: "heel_sim-1.3.0rc4/",
+    rootPrefix: "heel_sim-1.3.0rc5/",
   });
 });
 
@@ -1294,7 +1294,7 @@ test("ships exactly the classified, digest-pinned Heel Agent downloads", async (
 test("release member classification rejects private paths and hostile archive shapes", () => {
   const safeWheel = { name: "heel/model.py", payload: Buffer.from("VALUE = 1\n"), type: "0" };
   const safeSource = {
-    name: "heel_sim-1.3.0rc4/heel/model.py",
+    name: "heel_sim-1.3.0rc5/heel/model.py",
     payload: Buffer.from("VALUE = 1\n"),
     type: "0",
   };
@@ -1307,8 +1307,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "source private documentation",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc4/docs/saas/PRODUCT.md" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc4/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc5/docs/saas/PRODUCT.md" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc5/" },
       message: /commercial boundary/,
     },
     {
@@ -1331,8 +1331,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "device",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc4/heel/device.py", type: "3" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc4/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc5/heel/device.py", type: "3" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc5/" },
       message: /not a regular file/,
     },
     {
@@ -1361,8 +1361,8 @@ test("release member classification rejects private paths and hostile archive sh
     },
     {
       label: "unexpected extension",
-      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc4/private.pem" }],
-      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc4/" },
+      records: [safeSource, { ...safeSource, name: "heel_sim-1.3.0rc5/private.pem" }],
+      options: { label: "mutated source", rootPrefix: "heel_sim-1.3.0rc5/" },
       message: /unexpected extension/,
     },
   ];
@@ -1591,8 +1591,8 @@ test("serves the Agent acquisition page only from the canonical route", async ()
   assert.equal(agent.status, 200, "/agent must serve the customer acquisition page");
   const agentBody = await agent.text();
   assert.match(agentBody, /<h1>Investigate product abuse from your AI client\.<\/h1>/);
-  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc4-py3-none-any\.whl"/);
-  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc4\.tar\.gz"/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc5-py3-none-any\.whl"/);
+  assert.match(agentBody, /href="\/downloads\/heel_sim-1\.3\.0rc5\.tar\.gz"/);
   assert.match(agentBody, /href="\/downloads\/heel-open-core-manifest\.json"/);
   const agentManifest = JSON.parse(
     await readFile(join(downloadsRoot, agentManifestName), "utf8"),

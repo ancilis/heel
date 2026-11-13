@@ -33,13 +33,52 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc4]: unpublished candidate
+## [1.3.0rc5]: unpublished candidate
 
-Runner preview candidate for the H2 result handoff. It is not a GitHub release, not on PyPI and not
-publicly deployed. Customer copy is unchanged: the paired-runner surfaces keep the published
-v1.3.0rc3 install and the other surfaces keep the published, hash-pinned 1.3.0rc2 install, until
-this candidate's own release passes an anonymous public verification. The same-origin `/downloads/`
-files are labeled as this not-yet-published candidate.
+Runner preview candidate for the customer scenario library and result-chain recovery. It is not a
+GitHub release, not on PyPI and not publicly deployed. Every customer install surface keeps the
+published, hash-pinned 1.3.0rc4 install until this candidate's own release passes an anonymous
+public verification. The same-origin `/downloads/` files are labeled as this not-yet-published
+candidate.
+
+- Version identity 1.3.0rc5 (npm 1.3.0-rc.5) across the package, release contract, review engine,
+  MCP server info, `server.json` and browser engine; 1.3.0rc4 stays an accepted saved-review and
+  findings-sync engine version. Wheel, source archive, manifest, browser wheel/manifest, browser
+  sample and review golden are regenerated with the unchanged builders and open-core
+  classification. The published 1.3.0rc4 bytes and version sources are kept byte for byte as the
+  historical fixture `tests/fixtures/runner_preview_rc4/`.
+- Workspace scenario library (Heel Cloud source, not deployed): a listing with applicability fixed
+  to unknown and capability/setup labels, workspace-private custom scenarios as immutable validated
+  revisions (runner-supported only with an explicit closed check binding and the exact coverage
+  acknowledgement), and run bindings frozen before approval against the stored signed plan's action
+  tuples and digests, with a bounded display snapshot. A custom scenario is a customer declaration:
+  Heel validates its shape, not its truth.
+- Browser-local static assessment: the browser engine closure gains `browser_assess`, `contracts`
+  and `semantic`, which compare declared definitions with a locally reviewed OpenAPI document and
+  the customer's answers, keep unknown inputs unknown, and make no network call. A static result is
+  not live evidence; only an approved read-only `GET`/`HEAD` run by the local runner produces
+  observed results, which stay on the customer's machine until a human explicitly shares the
+  redacted findings.
+- Result-chain recovery (runner): a staged poll or findings upload refused with
+  `invalid_runner_auth` is recovered through the existing result-chain resync and retired only on
+  the server's cursor proof; a staged upload whose human permit expired is recovered metadata-only
+  on startup and on the serve step instead of stopping `serve`, and a consumed upload without a
+  receipt stays parked and fails closed. Nothing is re-signed inside recovery.
+- Findings semantics are unchanged from 1.3.0rc4: error envelopes are `inconclusive`, an ordinary
+  plan-differential key-path finding is medium confidence, and this is not a comprehensive abuse or
+  authorization assessment.
+
+## [1.3.0rc4]: 2026-11-11
+
+Runner preview prerelease for the H2 result handoff, published as a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4> from source commit
+`68b8d50e49d095d33fd4fb51327370b92086dfd3` after its anonymous public verification passed. It is
+not a stable release, it is not published to PyPI and the hosted control plane is not deployed.
+Every customer install surface now uses the one hash-pinned 1.3.0rc4 install from that release;
+1.3.0rc1, 1.3.0rc2 and 1.3.0rc3 stay published and are named only as history. At publication
+the same-origin `/downloads/` files were the bundled 1.3.0rc4 artifacts. The packaged `release/open-core/README.md`
+inside the source archive was frozen at candidate build time and still describes 1.3.0rc4 as not
+yet published; this entry and the release page are the publication record.
 
 - Version identity 1.3.0rc4 (npm 1.3.0-rc.4) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc3 stays an accepted saved-review and

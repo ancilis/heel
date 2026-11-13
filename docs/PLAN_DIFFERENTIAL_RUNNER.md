@@ -32,22 +32,28 @@ widen or re-sign a scope.
 
 Run these in order. Replace the values in capitals.
 
-The wheel below is the unreleased 1.3.0rc4 runner preview candidate, which is checked in
-under `apps/heel-cloud/public/downloads/` with its source archive and manifest. It is not yet
-published as a GitHub release or to PyPI, so no public download URL, registry command or
-release-asset digest is given here. (The earlier 1.3.0rc3, 1.3.0rc2 and 1.3.0rc1 previews are public
-GitHub prereleases; the [README](../README.md) gives the hash-pinned rc2 install and
-[the export demo](EXPORT_DEMO.md) the rc1 `error_envelope` and `hardened` errata.) Run the
-command in a directory that holds that local wheel. This journey is the standalone CLI. It
-does not use Heel Cloud pairing, which is still an incomplete public journey (see
-[capabilities](CAPABILITIES.md)).
+Install the 1.3.0rc4 runner preview, a public GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>, with the same one command the
+[README](../README.md) gives. It is not a stable release and is not published to PyPI. You need
+Python 3.11 or newer as `python3` with its standard `venv` module, on Apple silicon macOS or
+Linux x86_64/aarch64; Intel macOS is unsupported by this preview. No source checkout or manual download is needed: in an empty private
+directory the command creates `./heel-rc4`, installs the hash-pinned public wheel with its
+`runner` extra, and prints `heel 1.3.0rc4`. pip refuses the wheel unless its SHA-256 matches;
+the `cryptography` dependency comes from the package index and is not hash-pinned by this
+command. Activating the environment puts `heel` on `PATH` for the steps below. This journey is
+the standalone CLI. It does not use Heel Cloud pairing, which is still an incomplete public
+journey (see [capabilities](CAPABILITIES.md)).
 
 ```sh
-python3 -m venv --copies .venv
-. .venv/bin/activate
-python -m pip install './heel_sim-1.3.0rc4-py3-none-any.whl[runner]'
-export HEEL_HOME="$PWD/.heel"
+python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version
+. ./heel-rc4/bin/activate
+export HEEL_HOME="$(pwd -P)/.heel"
 ```
+
+`HEEL_HOME` must be an absolute physical path in which no component is a symbolic link;
+`pwd -P` prints that physical path and plain `$PWD` may not. On macOS, `/tmp` and `/var` are
+symbolic links to `/private/tmp` and `/private/var`. Use the same `HEEL_HOME`, in the same
+shell, for every command below.
 
 1. Create the signed scope. The allowlist entry is the bare host.
 
@@ -418,7 +424,7 @@ pair with a new invitation).
   before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
   installed it is unknown; this path is tested, not assumed unused. The current checked-in
-  artifact is the unreleased 1.3.0rc4 runner preview candidate. It reports `1.3.0rc4` and,
+  artifact is the unreleased 1.3.0rc5 runner preview candidate. It reports `1.3.0rc5` and,
   like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no
@@ -772,3 +778,11 @@ Chosen for this phase:
   `inconclusive` and sends nothing.
 - Credentials registered before this command existed have handles that were never
   displayed. Use a fresh `HEEL_HOME`.
+
+## Reporting a problem
+
+If a step fails, open an issue at <https://github.com/ancilis/heel/issues/new> with only:
+the output of `heel --version`, your operating system and version, the step that failed,
+the run ID if there is one, and a short summary with credential handles, hostnames and
+response content removed. Never paste credentials, tokens, keys, cookies or raw responses
+or evidence: issues are public.

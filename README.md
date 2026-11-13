@@ -25,61 +25,60 @@ See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export d
 
 ## Five-minute local launch review
 
-This local review is optional. Heel 1.3.0rc2 is a public preview prerelease at
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>. It is not a stable release, its GitHub
+This local review is optional. Heel 1.3.0rc4 is a public preview prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>. It is not a stable release, its GitHub
 release record is not immutable, and it is not a deployed Heel Cloud URL or evidence of customer
 acceptance. `heel-sim` is not yet published to PyPI. No source checkout, manual download, or app
 deployment is needed. You need Python 3.11 or newer as `python3` with its standard `venv` module, on
 Apple silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview: its pinned
 `cryptography` dependency ships no Intel macOS wheel, and a source build needs an additional (Rust)
 toolchain and is untested. In an empty private directory, this one copy-paste command creates a
-virtual environment in `./heel-rc2`, installs the hash-pinned public wheel with its `runner` extra,
+virtual environment in `./heel-rc4`, installs the hash-pinned public wheel with its `runner` extra,
 and prints the installed version:
 
 ```bash
-python3 -m venv heel-rc2 && ./heel-rc2/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc2/heel_sim-1.3.0rc2-py3-none-any.whl#sha256=f8698204e1d38aa80b8ca31dedd743c3d42e28d02c5153bddb4f02b44ecdf01c' && ./heel-rc2/bin/heel --version
+python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version
 ```
 
-It prints `heel 1.3.0rc2`; the CLI is then `./heel-rc2/bin/heel`. Review a sanitized OpenAPI
+It prints `heel 1.3.0rc4`; the CLI is then `./heel-rc4/bin/heel`. Review a sanitized OpenAPI
 document you own:
 
 ```bash
 export HEEL_HOME="$(pwd -P)/.heel-local"
-./heel-rc2/bin/heel review openapi ./sanitized-openapi.json
+./heel-rc4/bin/heel review openapi ./sanitized-openapi.json
 ```
 
 pip installs the wheel only if it matches that SHA-256. `--isolated` makes pip ignore environment
 variables and user configuration. The `runner` extra downloads the pinned `cryptography` dependency
 from the Python package index under pip's normal verification; that dependency is not hash-pinned by
-this command, and the review itself does not need it. An independent anonymous run of this exact
-command passed on Apple silicon macOS with Python 3.13.5; other platforms and Python versions have not
-been clean-room tested. `HEEL_HOME` must be a physical path in which no component is a symbolic link.
+this command, and the review itself does not need it. No independent clean-room run of this exact
+1.3.0rc4 command is recorded yet on any platform or Python version. `HEEL_HOME` must be a physical path in which no component is a symbolic link.
 On macOS, `/tmp` and `/var` are symbolic links, so use `pwd -P` rather than `$PWD`.
 
-1.3.0rc2 corrects two errata of the earlier 1.3.0rc1 prerelease, which remains published and
+1.3.0rc2 corrected two errata of the earlier 1.3.0rc1 prerelease, which remains published and
 unchanged at <https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>. The rc1 synthetic reference
 reports the HTTP 200 `error_envelope` case and the `hardened` case, an HTTP 403 error envelope, as
 invariant_held with regression_passed=true. An error envelope is inconclusive at any status, so read
-each rc1 result as inconclusive, not a pass; 1.3.0rc2 reports each case inconclusive with
-regression_passed=false. See the [export demo](docs/EXPORT_DEMO.md).
+each rc1 result as inconclusive, not a pass; 1.3.0rc2, 1.3.0rc3 and 1.3.0rc4 report each case
+inconclusive with regression_passed=false. See the [export demo](docs/EXPORT_DEMO.md).
 
 A Heel Cloud deployment built from this repository also serves its own bundled Agent files on its
-origin, such as `/downloads/heel_sim-1.3.0rc4-py3-none-any.whl`. Those files are that build's
-artifacts, not a separate verified public release: in this repository they are the 1.3.0rc4
+origin, such as `/downloads/heel_sim-1.3.0rc5-py3-none-any.whl`. Those files are that build's
+artifacts, not a separate verified public release: in this repository they are the 1.3.0rc5
 candidate, which is not yet published as a public release. The public command above is the
 recommended install. If you did download that file from a deployment's `/agent` page, install it
 from the folder where you saved it:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl
+.venv/bin/python -m pip install ./heel_sim-1.3.0rc5-py3-none-any.whl
 ```
 
 The default report is validated Markdown. Add `--json` for the canonical `heel.review.v1`
 envelope used by automation and MCP:
 
 ```bash
-./heel-rc2/bin/heel review openapi ./sanitized-openapi.json --json
+./heel-rc4/bin/heel review openapi ./sanitized-openapi.json --json
 ```
 
 This path needs no account or signing key, makes no analyzer network calls, uploads and syncs
@@ -137,8 +136,8 @@ the outstanding interactive browser or deployment acceptance gates.
 Run the broader synthetic proof from the installed Agent:
 
 ```bash
-./heel-rc2/bin/heel doctor
-./heel-rc2/bin/heel eval
+./heel-rc4/bin/heel doctor
+./heel-rc4/bin/heel eval
 ```
 
 ```text

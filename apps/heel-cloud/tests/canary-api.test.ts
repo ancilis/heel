@@ -108,27 +108,26 @@ it("rejects a runner revoke result outside the typed contract and names the refu
   await expect(refused.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_runner_revocation", status: 400 });
 });
 
-// The final 1.3.0rc3 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC3.md at 11bcaca
-// ("Customer install command"), pinned to the reviewed final rc3 wheel (source 4b68c2f, 2769936 bytes), pinned here
-// rather than read from the runbook. The /agent MCP quickstart deliberately stays on its published rc2 public install;
-// its only rc3 mentions are the same-origin 1.3.0rc3 candidate downloads from main. Only the paired-runner surfaces
-// install the public rc3 release.
-const RC3_WHEEL_SHA256 = "0b75aef7c22a18b78fdafcdffce995a90b1ba3da5b09db166f24e89c49419bca";
-const RC3_RUNBOOK_INSTALL = "python3 -m venv heel-rc3 && ./heel-rc3/bin/python -m pip --isolated install "
-  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc3/heel_sim-1.3.0rc3-py3-none-any.whl#sha256=${RC3_WHEEL_SHA256}'`
-  + " && ./heel-rc3/bin/heel --version";
+// The 1.3.0rc4 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC4.md ("Customer install
+// command"), pinned here rather than read from the runbook. It may be deployed only after the release owner's anonymous
+// verify-public for v1.3.0rc4 passes. Every self-serve install surface shows this one command.
+const RC4_WHEEL_SHA256 = "27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af";
+const RC4_RUNBOOK_INSTALL = "python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install "
+  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=${RC4_WHEEL_SHA256}'`
+  + " && ./heel-rc4/bin/heel --version";
 
-it("the dashboard pairing card and /runner show the exact final rc3 runbook install line", async () => {
-  const { RUNNER_RC3_INSTALL, RUNNER_RC3_CLI, RUNNER_RC3_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
-  assert.equal(RUNNER_RC3_INSTALL, RC3_RUNBOOK_INSTALL);
-  assert.equal(RUNNER_RC3_CLI, "./heel-rc3/bin/heel");
-  assert.equal(RUNNER_RC3_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc3");
+it("the dashboard pairing card, /runner and /agent show the exact rc4 runbook install line", async () => {
+  const { RUNNER_RC4_INSTALL, RUNNER_RC4_CLI, RUNNER_RC4_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
+  assert.equal(RUNNER_RC4_INSTALL, RC4_RUNBOOK_INSTALL);
+  assert.equal(RUNNER_RC4_CLI, "./heel-rc4/bin/heel");
+  assert.equal(RUNNER_RC4_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc4");
   const runner = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
-  assert.ok(runner.includes(RC3_RUNBOOK_INSTALL));
-  assert.doesNotMatch(runner, /heel-rc2\/|releases\/(tag|download)\/v1\.3\.0rc2/);
+  assert.ok(runner.includes(RC4_RUNBOOK_INSTALL));
+  assert.doesNotMatch(runner, /heel-rc[123]\/|releases\/(tag|download)\/v1\.3\.0rc[23]/);
   const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
-  assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc3|heel-rc3/);
-  assert.match(agent, /releases\/download\/v1\.3\.0rc2\/heel_sim-1\.3\.0rc2-py3-none-any\.whl#sha256=/);
+  assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc[123]|heel-rc[123]\b/);
+  assert.ok(agent.includes(`const PUBLIC_WHEEL_SHA256 = "${RC4_WHEEL_SHA256}";`));
+  assert.match(agent, /releases\/download\/v1\.3\.0rc4\/heel_sim-1\.3\.0rc4-py3-none-any\.whl#sha256=\$\{PUBLIC_WHEEL_SHA256\}/);
 });
 
 it("discovers only a closed pending approval summary", async () => {
@@ -853,5 +852,129 @@ describe("disclosure state and synchronized findings reads", () => {
     const derived = { ...findings(), derived_findings: [] };
     await expect(new CanaryApi({ transport: async () => jsonResponse(derived) }).getFindings(workspace, project, run))
       .rejects.toMatchObject({ code: "invalid_response" });
+  });
+});
+
+
+describe("scenario library and run-frozen bindings", () => {
+  const coverage = {
+    anonymous_authenticated_read: "Executed check: anonymous_authenticated_read (GET/HEAD, roles anonymous and authenticated). The custom objective and its criterion are not executed; they are analysis-only.",
+    plan_entitlement_read: "Executed check: plan_entitlement_read (GET/HEAD, roles lower_plan and higher_plan). The custom objective and its criterion are not executed; they are analysis-only.",
+  };
+  const definition = {
+    id: "sc.internal.admin_read", category: "unintended_endpoints", objective: "Admin stays private", kind: "endpoint",
+    success_criterion: { prop: "method", equals: "GET" }, severity_model: { likelihood: 0.5, impact: 0.7 },
+    recommended_control: "require a session", containment_limits: { canary_only: true, no_live_targets: true, sample_cap: 1 },
+  };
+  const libraryRow = (overrides: Record<string, unknown> = {}) => ({
+    id: "sc.endpoint.hidden", source: "library", revision: null, definition_digest: digest,
+    definition: { id: "sc.endpoint.hidden", objective: "Hidden endpoint", category: "unintended_endpoints", kind: "endpoint", recommended_control: "auth", pack: "core_saas" },
+    mechanism_id: "route-access", applicability: "unknown", applicability_rule: "always", evidence_state: "inferred",
+    execution_support: "runner_supported", catalog_scenario_id: "anonymous_authenticated_read", binding_version: 1,
+    coverage_statement: "Executed check: anonymous_authenticated_read (GET/HEAD, roles anonymous and authenticated).",
+    prerequisites: ["methods: GET, HEAD"], ...overrides,
+  });
+  const listing = (rows: unknown[] = [libraryRow()]) => ({
+    schema_version: "heel.scenario-library.v1", library_digest: "f".repeat(64), engine_version: "1.3.0rc4", binding_version: 1,
+    custom_coverage_statements: coverage, scenarios: rows,
+  });
+  const frozen = {
+    catalog_scenario_id: "anonymous_authenticated_read", method: "GET", route_template: "/api/canary",
+    library_scenario_id: "sc.endpoint.hidden", source: "library", revision: null, definition_digest: digest,
+    library_digest: "f".repeat(64), binding_version: 1, approval_id: "ap_canary", projection_digest: "b".repeat(64),
+    manifest_digest: "c".repeat(64), display: { objective: "Hidden endpoint", mechanism_id: "route-access", pack: "core_saas", coverage_statement: "Executed check: x" },
+    bound_at_ms: 5,
+  };
+  const view = (overrides: Record<string, unknown> = {}) => ({
+    schema_version: "heel.run-scenario-bindings-view.v1", run_id: run, approval_id: "ap_canary",
+    projection_digest: "b".repeat(64), manifest_digest: "c".repeat(64), accepting_bindings: true,
+    actions: [{ catalog_scenario_id: "anonymous_authenticated_read", method: "GET", route_template: "/api/canary" }],
+    bindings: [], library_digest: "f".repeat(64), ...overrides,
+  });
+
+  it("lists the library strictly on the workspace route and refuses mislabelled rows", async () => {
+    const calls: string[] = [];
+    const api = new CanaryApi({ transport: async (path, init) => { calls.push(`${init.method}:${path}`); return jsonResponse(listing()); } });
+    const library = await api.listScenarioLibrary(workspace);
+    expect(calls).toEqual([`GET:/api/control-plane/v1/workspaces/${workspace}/scenario-library`]);
+    expect(library.scenarios[0]).toMatchObject({ id: "sc.endpoint.hidden", applicability: "unknown", executionSupport: "runner_supported", objective: "Hidden endpoint" });
+    expect(Object.isFrozen(library.scenarios[0])).toBe(true);
+    for (const bad of [
+      libraryRow({ applicability: "applies" }),
+      libraryRow({ execution_support: "runner_supported", catalog_scenario_id: null }),
+      libraryRow({ execution_support: "static_only" }),
+      libraryRow({ source: "custom", revision: null }),
+      libraryRow({ evidence_state: "customer_declared" }),
+      libraryRow({ definition: { id: "sc.other", objective: "x", category: "c", kind: "k", recommended_control: "r" } }),
+      { ...libraryRow(), outcome: "blocked" },
+    ]) {
+      const strict = new CanaryApi({ transport: async () => jsonResponse(listing([bad])) });
+      await expect(strict.listScenarioLibrary(workspace)).rejects.toMatchObject({ code: "invalid_response" });
+    }
+  });
+
+  it("creates a custom revision with fractional severities and exposes only validator details", async () => {
+    let body = "";
+    let path = "";
+    const api = new CanaryApi({ transport: async (target, init) => {
+      path = String(target); body = String(init.body);
+      expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+      expect(init.credentials).toBe("same-origin");
+      return jsonResponse({ ...libraryRow({ id: definition.id, source: "custom", revision: 1, evidence_state: "customer_declared", definition, mechanism_id: definition.id,
+        coverage_statement: coverage.anonymous_authenticated_read }), warnings: ["applies_when: omitted; defaults to always"] }, 201);
+    } });
+    const created = await api.createCustomScenario(workspace, { definition, supersedesRevision: null,
+      executionBinding: { catalogScenarioId: "anonymous_authenticated_read", coverageAck: coverage.anonymous_authenticated_read } });
+    expect(path).toBe(`/api/control-plane/v1/workspaces/${workspace}/scenario-library/custom`);
+    expect(JSON.parse(body)).toEqual({ schema_version: "heel.custom-scenario.v1", definition, supersedes_revision: null,
+      execution_binding: { catalog_scenario_id: "anonymous_authenticated_read", binding_version: 1, coverage_ack: coverage.anonymous_authenticated_read } });
+    expect(created.revision).toBe(1);
+    expect(created.warnings).toEqual(["applies_when: omitted; defaults to always"]);
+    const rejecting = new CanaryApi({ transport: async () => jsonResponse({ schema_version: "heel.scenario-library-error.v1", code: "invalid_scenario",
+      errors: ["containment_limits: include a bounded sample cap"], warnings: [] }, 400) });
+    const failure = await rejecting.createCustomScenario(workspace, { definition, supersedesRevision: null, executionBinding: null }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CanaryApiError);
+    expect((failure as CanaryApiError).code).toBe("invalid_scenario");
+    expect((failure as CanaryApiError).details).toEqual(["containment_limits: include a bounded sample cap"]);
+    const conflict = new CanaryApi({ transport: async () => jsonResponse({ schema_version: "heel.scenario-library-error.v1", code: "revision_conflict" }, 409) });
+    await expect(conflict.createCustomScenario(workspace, { definition, supersedesRevision: 1, executionBinding: null })).rejects.toMatchObject({ code: "revision_conflict", details: [] });
+    const unsent = vi.fn();
+    const local = new CanaryApi({ transport: unsent });
+    await expect(local.createCustomScenario(workspace, { definition: { ...definition, objective: "x".repeat(5000) }, supersedesRevision: null, executionBinding: null })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(local.createCustomScenario(workspace, { definition: { ...definition, id: "Bad Id" }, supersedesRevision: null, executionBinding: null })).rejects.toMatchObject({ code: "invalid_request" });
+    expect(unsent).not.toHaveBeenCalled();
+  });
+
+  it("reads and freezes run bindings on the exact run route with the plan tuple payload", async () => {
+    const calls: Array<[string, string, string]> = [];
+    const api = new CanaryApi({ transport: async (path, init) => {
+      calls.push([String(init.method), String(path), String(init.body ?? "")]);
+      return init.method === "GET" ? jsonResponse(view()) : jsonResponse(view({ bindings: [frozen] }), 201);
+    } });
+    const before = await api.getRunScenarioBindings(workspace, project, run);
+    expect(before.actions).toEqual([{ catalogScenarioId: "anonymous_authenticated_read", method: "GET", routeTemplate: "/api/canary" }]);
+    const after = await api.freezeRunScenarioBindings(workspace, project, run, "b".repeat(64), [{
+      catalogScenarioId: "anonymous_authenticated_read", method: "GET", routeTemplate: "/api/canary",
+      libraryScenarioId: "sc.endpoint.hidden", source: "library", definitionDigest: digest }]);
+    expect(after.bindings[0]).toMatchObject({ libraryScenarioId: "sc.endpoint.hidden", projectionDigest: "b".repeat(64), manifestDigest: "c".repeat(64) });
+    const path = `/api/control-plane/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/scenario-bindings`;
+    expect(calls.map(([method, target]) => `${method}:${target}`)).toEqual([`GET:${path}`, `POST:${path}`]);
+    expect(JSON.parse(calls[1][2])).toEqual({ schema_version: "heel.run-scenario-bindings.v1", projection_digest: "b".repeat(64), items: [{
+      binding_version: 1, catalog_scenario_id: "anonymous_authenticated_read", definition_digest: digest,
+      library_scenario_id: "sc.endpoint.hidden", method: "GET", route_template: "/api/canary", source: "library" }] });
+    for (const bad of [
+      view({ run_id: `crun_${"9".repeat(32)}` }),
+      view({ accepting_bindings: false }),
+      view({ bindings: [{ ...frozen, projection_digest: "9".repeat(64) }] }),
+      view({ bindings: [{ ...frozen, display: { ...frozen.display, extra: 1 } }] }),
+    ]) {
+      const strict = new CanaryApi({ transport: async () => jsonResponse(bad) });
+      await expect(strict.getRunScenarioBindings(workspace, project, run)).rejects.toMatchObject({ code: "invalid_response" });
+    }
+    const frozenOut = new CanaryApi({ transport: async () => jsonResponse({ schema_version: "heel.scenario-library-error.v1", code: "run_bindings_frozen" }, 409) });
+    await expect(frozenOut.freezeRunScenarioBindings(workspace, project, run, "b".repeat(64), [{
+      catalogScenarioId: "anonymous_authenticated_read", method: "GET", routeTemplate: "/api/canary",
+      libraryScenarioId: "sc.endpoint.hidden", source: "library", definitionDigest: digest }])).rejects.toMatchObject({ code: "run_bindings_frozen", status: 409 });
+    await expect(api.freezeRunScenarioBindings(workspace, project, run, "b".repeat(64), [])).rejects.toMatchObject({ code: "invalid_request" });
   });
 });

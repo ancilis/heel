@@ -162,8 +162,8 @@ test("ships server-renderable evidence, local interaction semantics, and accessi
   assert.doesNotMatch(page, /href="\/mcp"/);
   await assertMissing("app/mcp/");
   assert.match(agentPage, /heel-sim/);
-  assert.match(agentPage, /\.\/heel-rc2\/bin\/python -m pip install \./);
-  assert.match(agentPage, /\/absolute\/path\/to\/heel-rc2\/bin\/heel-mcp/);
+  assert.match(agentPage, /\.\/heel-rc4\/bin\/python -m pip install \./);
+  assert.match(agentPage, /\/absolute\/path\/to\/heel-rc4\/bin\/heel-mcp/);
   assert.match(agentPage, /mcpServers/);
   assert.match(agentPage, /HEEL_HOME/);
   assert.match(agentPage, /HEEL_CLOUD_ORIGIN/);

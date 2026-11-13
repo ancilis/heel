@@ -24,12 +24,11 @@ The implemented launch is **Heel free early access**:
   result on first use.
 - Pinned same-origin browser runtime and dedicated Python Web Worker.
 - Optional local browser save, delete, clear, JSON export, and Markdown export.
-- Checked-in Heel 1.3.0rc4 runner preview candidate wheel/source/manifest under
-  `apps/heel-cloud/public/downloads/`, and local MCP setup. The candidate is unreleased: it is
-  not published as a GitHub release or to PyPI, and it is not publicly deployed. Its runner code
-  equals the published 1.3.0rc2 prerelease's (a version-only re-version so the H3 runner seam can
-  later be integrated without overwriting the frozen rc2 bytes); customer copy keeps the public
-  hash-pinned 1.3.0rc2 install. It treats a
+- Checked-in Heel 1.3.0rc5 runner preview candidate wheel/source/manifest under
+  `apps/heel-cloud/public/downloads/`, and local MCP setup. The 1.3.0rc5 candidate is unreleased:
+  it is not published as a GitHub release or to PyPI, and the website is not publicly deployed.
+  1.3.0rc4 is published as a GitHub prerelease (2026-11-11) and customer copy uses its public
+  hash-pinned install. Both treat a
   recognized error envelope as inconclusive at every HTTP status, so the synthetic reference
   `error_envelope` (HTTP 200) and `hardened` (HTTP 403) cases are inconclusive and only the
   non-error `public` and `redacted` cases pass; no inconclusive plan-differential pair stores a
@@ -150,8 +149,13 @@ docker compose --env-file deploy/.env.production \
 - The full self-serve product is not launch-ready. Paired runner execution, the cloud route
   inventory bridge, and approval wiring are incomplete, and final launch acceptance has not
   been given. Owner actions alone do not close these gaps.
-- The 1.3.0rc4 candidate files are not yet published; the public one-command install remains the
-  hash-pinned 1.3.0rc2 GitHub prerelease.
+- 1.3.0rc4 is published as a GitHub prerelease (2026-11-11,
+  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>), and the public one-command install
+  is its hash-pinned wheel. Its anonymous verify-public proves packaging only; no independent
+  clean-room customer run, pairing, serve, HTTPS target traffic or hosted findings result is
+  recorded for it.
+- The 1.3.0rc5 candidate files are not yet published; the public one-command install remains the
+  hash-pinned 1.3.0rc4 GitHub prerelease.
 
 ## Exact next action
 

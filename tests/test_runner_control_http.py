@@ -549,7 +549,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "recover_staged_upload", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():
@@ -4607,3 +4607,526 @@ def test_poll_disclosure_is_a_named_closed_operation_that_never_sends_without_lo
     assert control.runtime.load_pending_calls() == ()
     # The generic call surface stays closed; the poll is a named operation only.
     assert not hasattr(control, "request")
+
+
+# --- rc5 result-chain recovery: real HTTP + real control plane + real runtime/client (REPORT §4.1, §6) ---
+
+def _rc_shift_clock(monkeypatch, seconds):
+    """Real elapsed time for every in-process clock that reads ``time.time`` (server runner auth,
+    the runner client clock): the server's own nonce lifetime and 30 s proof window then apply."""
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + seconds)
+
+
+class _RcTransport(_LiveRunnerTransport):
+    """Real loopback HTTP; it can also answer one findings upload with an edge 502 (never forwarded)."""
+
+    def __init__(self, live):
+        super().__init__(live)
+        self.edge_502_uploads = 0
+        self.last_status = self.last_error_code = None   # what the daemon's status branch reads
+
+    def post(self, path, *, headers=None, body=b""):
+        if self.edge_502_uploads and path.endswith("/result-projection"):
+            self.edge_502_uploads -= 1
+            self.sent.append((path, dict(headers or {}), body))
+            return 502, {}, None
+        return super().post(path, headers=headers, body=body)
+
+
+def _rc_terminal(live, root):
+    """A runner whose real terminal result the unchanged control plane accepted: disclosure
+    ``available``, server result-chain nonce on its ordinary 60 s lifetime."""
+    times = _live_timeline()
+    _accepted_ack(live, times=times)
+    terminal = _live_projection(live, times, sequence=2, phase="terminal", acknowledged=None)
+    transport = _RcTransport(live)
+    runtime, signer, control = _live_runner(live, root, transport, terminal, times=times)
+    control.result(run_id=live.run_id, operational_projection=terminal)
+    assert transport.answers[-1][0] == 200 and _runtime_retired(runtime, live.run_id)
+    authority = live.cp.grant_authority
+    client = RunnerControlClient(
+        origin="http://127.0.0.1", workspace_id=live.workspace, runner_id="runner", signer=signer,
+        clock=lambda: int(time.time() * 1000), transport=transport,
+        nonce_source=lambda chain: (_ for _ in ()).throw(AssertionError("run chains are Cloud-issued")),
+        trusted_disclosure_keys={authority.key_id: authority.public_key}, runtime=runtime,
+    )
+    return runtime, client, transport, _representative_findings(live, terminal)
+
+
+def _rc_server(live):
+    conn, chain = live.cp.store.conn, f"result:{live.run_id}"
+    cursor = tuple(conn.execute(
+        "SELECT next_sequence,generation FROM canary_runner_chain_cursors WHERE chain_name=?", (chain,),
+    ).fetchone())
+    nonce = conn.execute(
+        "SELECT next_sequence,expires_at FROM canary_runner_nonce_chains WHERE chain_name=?", (chain,),
+    ).fetchone()
+    requests = conn.execute(
+        "SELECT COUNT(*) FROM canary_disclosure_requests WHERE run_id=?", (live.run_id,),
+    ).fetchone()[0]
+    challenges = [tuple(row) for row in conn.execute(
+        "SELECT status,challenge_generation FROM canary_runner_resync_challenges WHERE chain_name=? "
+        "ORDER BY created_at", (chain,),
+    )]
+    return {"cursor": cursor, "nonce": tuple(nonce), "requests": requests, "challenges": challenges}
+
+
+def _rc_staged(runtime, run_id):
+    return [item for item in runtime.load_pending_calls() if item.run_id == run_id]
+
+
+def _rc_resync_sends(transport, since=0):
+    return [path.rsplit("/", 1)[-1] for path, _h, _b in transport.sent[since:] if "/resync/" in path]
+
+
+def _rc_expire_receipts(live):
+    """The server's own bounded reaper runs at an instant past the 30-day exact-receipt horizon."""
+    chain = f"result:{live.run_id}"
+    conn = live.cp.store.conn
+    assert conn.execute("SELECT COUNT(*) FROM canary_runner_request_ledger WHERE chain_name=?", (chain,)).fetchone()[0] == 1
+    live.cp.runner_auth.purge_runner_request_receipts(time.time() + 2_592_000.0 + 1)
+    assert conn.execute("SELECT COUNT(*) FROM canary_runner_request_ledger WHERE chain_name=?", (chain,)).fetchone()[0] == 0
+
+
+def _rc_raised(call):
+    try:
+        call()
+    except Exception as error:  # noqa: BLE001 - the exact class is asserted by name (red on rc4)
+        return error
+    raise AssertionError("the call did not raise")
+
+
+def test_disclosure_poll_refused_after_result_nonce_ttl_is_recovered_by_result_chain_resync(tmp_path, monkeypatch):
+    """The customer state on the real path: a terminal result accepted by the unchanged server (60 s nonce),
+    a poll staged on that cursor that never reached the Cloud, then more than 60 s.  The exact replay is
+    refused (stale proof, expired nonce); the result-chain resync proves the sequence unconsumed, the
+    poll is retired into a tombstone, and the next poll on the new nonce is accepted."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            transport.refuse_sends = 1
+            with pytest.raises(ConnectionError):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            before = runtime.load_terminal_state(live.run_id).result_chain
+            server = _rc_server(live)
+            assert (staged.request_operation, staged.sequence, staged.generation) == (
+                "poll-disclosure", before["next_sequence"], before["generation"],
+            ) and server["cursor"] == (staged.sequence, 0) and server["requests"] == 0
+
+            _rc_shift_clock(monkeypatch, runner_auth.NONCE_TTL + 1)
+            sent, answered = len(transport.sent), len(transport.answers)
+            error = _rc_raised(lambda: client.poll_disclosure(run_id=live.run_id, findings_projection=findings))
+            assert type(error).__name__ == "RunnerResultChainRecovered", repr(error)
+            assert (error.operation, error.reason) == ("poll-disclosure", "chain_authority_lost")
+            # Exact replay first (refused 401), then exactly one start and one completion.
+            assert transport.sent[sent][2] == staged.body and transport.answers[answered][0] == 401
+            assert _rc_resync_sends(transport, sent) == ["start", "complete"]
+            assert _rc_staged(runtime, live.run_id) == []
+            [tombstone] = runtime.load_superseded_calls()
+            assert (tombstone.call_id, tombstone.request_operation, tombstone.reason, tombstone.run_id) == (
+                staged.call_id, "poll-disclosure", "chain_authority_lost", live.run_id,
+            )
+            assert tombstone.challenge_next_sequence == tombstone.completed_next_sequence == staged.sequence
+            assert (tombstone.generation, tombstone.superseded_by_generation) == (0, 1)
+            after = runtime.load_terminal_state(live.run_id)
+            assert after.state == "available" and after.revision == 2
+            assert (after.result_chain["next_sequence"], after.result_chain["generation"]) == (staged.sequence, 1)
+            assert after.result_chain["next_nonce_b64"] != before["next_nonce_b64"]
+            server = _rc_server(live)
+            assert server["cursor"] == (staged.sequence, 1) and server["requests"] == 0
+            assert server["challenges"] == [("completed", 0)]
+
+            # The next due step polls afresh on the recovered nonce and is accepted.
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["status"] == "local_result_ready"
+            assert _rc_server(live)["requests"] == 1 and _rc_staged(runtime, live.run_id) == []
+            assert runtime.load_terminal_state(live.run_id).result_chain["next_sequence"] == staged.sequence + 1
+        finally:
+            live.close()
+
+
+def test_lost_poll_reply_is_answered_from_the_server_receipt_without_resync(tmp_path, monkeypatch):
+    """The CP committed the poll and its answer was lost: the byte-identical replay, with a proof far
+    older than 30 s, is answered from the exact receipt; no resync is sent and nothing is retired."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            assert _rc_server(live)["cursor"] == (staged.sequence + 1, 0)
+            _rc_shift_clock(monkeypatch, runner_auth.NONCE_TTL + 1)
+            sent = len(transport.sent)
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["status"] == "local_result_ready"
+            assert transport.sent[sent][2] == staged.body and _rc_resync_sends(transport, sent) == []
+            assert _rc_staged(runtime, live.run_id) == [] and runtime.load_superseded_calls() == ()
+            assert runtime.load_terminal_state(live.run_id).result_chain["next_sequence"] == staged.sequence + 1
+        finally:
+            live.close()
+
+
+def test_consumed_poll_sequence_is_retired_and_repolled_as_idempotent(tmp_path, monkeypatch):
+    """The CP consumed the poll but its receipt is gone (30-day horizon): both resync cursors equal the
+    staged sequence + 1, the poll is retired as ``sequence_consumed`` and polled again (an idempotent read)."""
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            _rc_expire_receipts(live)
+            _rc_shift_clock(monkeypatch, runner_auth.NONCE_TTL + 1)
+            error = _rc_raised(lambda: client.poll_disclosure(run_id=live.run_id, findings_projection=findings))
+            assert type(error).__name__ == "RunnerResultChainRecovered", repr(error)
+            assert error.reason == "sequence_consumed"
+            [tombstone] = runtime.load_superseded_calls()
+            assert tombstone.reason == "sequence_consumed"
+            assert tombstone.challenge_next_sequence == tombstone.completed_next_sequence == staged.sequence + 1
+            cursor = runtime.load_terminal_state(live.run_id).result_chain
+            assert (cursor["next_sequence"], cursor["generation"]) == (staged.sequence + 1, 1)
+            assert _rc_server(live)["cursor"] == (staged.sequence + 1, 1)
+            assert client.poll_disclosure(run_id=live.run_id, findings_projection=findings)["status"] == "local_result_ready"
+            assert _rc_server(live)["requests"] == 1
+        finally:
+            live.close()
+
+
+@pytest.mark.parametrize("drift", ["sequence_ahead_by_two", "generation_advanced"])
+def test_ambiguous_result_cursor_keeps_the_staged_poll_and_fails_closed(tmp_path, monkeypatch, drift):
+    """Any other cursor relation proves nothing: the resync is never completed (server generation
+    untouched), the staged poll is kept byte-identical, and the outcome is ``result_cursor_ambiguous``."""
+    from heel.runner.control_client import RunnerChainRecoveryRequired
+    from heel.runner.daemon import _serve_failure
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            transport.refuse_sends = 1
+            with pytest.raises(ConnectionError):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            column = "next_sequence=next_sequence+2" if drift == "sequence_ahead_by_two" else "generation=generation+1"
+            live.cp.store.conn.execute(
+                f"UPDATE canary_runner_chain_cursors SET {column} WHERE chain_name=?", (f"result:{live.run_id}",),
+            )
+            live.cp.store.conn.commit()
+            server = _rc_server(live)
+            terminal = runtime.load_terminal_state(live.run_id)
+            _rc_shift_clock(monkeypatch, runner_auth.NONCE_TTL + 1)
+            sent = len(transport.sent)
+            with pytest.raises(RunnerChainRecoveryRequired) as raised:
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert (raised.value.operation, raised.value.reason) == ("poll-disclosure", "result_cursor_ambiguous")
+            assert _serve_failure(raised.value) == ("failed", "recovery_required")
+            assert _rc_resync_sends(transport, sent) == ["start"]
+            assert _rc_staged(runtime, live.run_id) == [staged]
+            assert runtime.load_terminal_state(live.run_id) == terminal
+            assert runtime.load_superseded_calls() == () and runtime.load_resync_attempt("result", live.run_id) is None
+            after = _rc_server(live)
+            assert after["cursor"] == server["cursor"] and after["challenges"][-1][0] == "pending"
+        finally:
+            live.close()
+
+
+def test_deferred_upload_that_never_reached_the_cp_is_recovered_by_result_chain_resync(tmp_path, monkeypatch):
+    """An edge 502 answered the findings upload (never forwarded).  The 60 s byte-identical re-send is
+    refused (30 s proof window); the resync proves it unconsumed and retires it.  The next step polls,
+    receives the human's still-valid permit, re-verifies it and uploads: synchronized."""
+    from heel.runner.control_client import RunnerUploadDeferred
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.edge_502_uploads = 1
+            with pytest.raises(RunnerUploadDeferred):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            assert staged.request_operation == "upload-findings"
+            _rc_shift_clock(monkeypatch, 61)
+            sent, answered = len(transport.sent), len(transport.answers)
+            error = _rc_raised(
+                lambda: client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings),
+            )
+            assert type(error).__name__ == "RunnerResultChainRecovered", repr(error)
+            assert (error.operation, error.reason) == ("upload-findings", "chain_authority_lost")
+            assert transport.sent[sent][2] == staged.body and transport.answers[answered][0] == 401
+            assert _rc_resync_sends(transport, sent) == ["start", "complete"]
+            [tombstone] = runtime.load_superseded_calls()
+            assert tombstone.request_operation == "upload-findings" and tombstone.body_sha256 == hashlib.sha256(staged.body).hexdigest()
+            assert runtime.load_terminal_state(live.run_id).state == "available"
+            assert live.cp.store.conn.execute(
+                "SELECT COUNT(*) FROM canary_findings_projections WHERE run_id=?", (live.run_id,),
+            ).fetchone()[0] == 0
+            # Next due step: poll -> the human's permit, re-verified by upload_findings before any byte.
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["permit_id"] == permit["permit_id"]
+            receipt = client.upload_findings(run_id=live.run_id, permit=answer, findings_projection=findings)
+            assert receipt["status"] == "synchronized"
+            assert runtime.load_terminal_state(live.run_id).state == "consumed"
+        finally:
+            live.close()
+
+
+def test_deferred_upload_consumed_by_the_cp_is_answered_from_its_receipt(tmp_path, monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            _rc_shift_clock(monkeypatch, 61)
+            sent = len(transport.sent)
+            receipt = client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            assert receipt["status"] == "synchronized" and _rc_resync_sends(transport, sent) == []
+            assert runtime.load_terminal_state(live.run_id).state == "consumed"
+            assert runtime.load_superseded_calls() == ()
+        finally:
+            live.close()
+
+
+def test_consumed_upload_without_receipt_keeps_the_staged_upload_and_fails_closed(tmp_path, monkeypatch):
+    """Consumed (+1) but no receipt: never completed, never retired, never marked consumed locally."""
+    from heel.runner.control_client import RunnerChainRecoveryRequired
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            _rc_expire_receipts(live)
+            server = _rc_server(live)
+            _rc_shift_clock(monkeypatch, 61)
+            sent = len(transport.sent)
+            with pytest.raises(RunnerChainRecoveryRequired) as raised:
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            assert (raised.value.operation, raised.value.reason) == ("upload-findings", "sequence_consumed")
+            assert _rc_resync_sends(transport, sent) == ["start"]
+            assert _rc_staged(runtime, live.run_id) == [staged]
+            assert runtime.load_terminal_state(live.run_id).state == "available"
+            assert runtime.load_superseded_calls() == ()
+            assert _rc_server(live)["cursor"] == server["cursor"] == (staged.sequence + 1, 0)
+        finally:
+            live.close()
+
+
+# --- expired human permit while an upload is staged (Fable REPORT §4; metadata-only recovery) ---
+
+def _rc_expire_permit(monkeypatch, permit):
+    """Offline past the permit TTL on every clock.  The server's disclosure service binds its clock at
+    definition and is built per request, so its own instant is shifted at the class (Fable F1)."""
+    from heel.saas.canary_disclosure import CanaryDisclosureService
+
+    seconds = (permit["expires_at_ms"] - permit["issued_at_ms"]) // 1000 + 1
+    real = time.time
+    _rc_shift_clock(monkeypatch, seconds)
+    monkeypatch.setattr(
+        CanaryDisclosureService, "_now_ms", lambda self: max(0, int((real() + seconds) * 1000)),
+    )
+    now = int(time.time() * 1000)
+    assert not permit["issued_at_ms"] <= now < permit["expires_at_ms"]
+
+
+def _rc_projections(live):
+    return live.cp.store.conn.execute(
+        "SELECT COUNT(*) FROM canary_findings_projections WHERE run_id=?", (live.run_id,),
+    ).fetchone()[0]
+
+
+def test_expired_permit_never_consumed_upload_is_retired_by_metadata_only_resync_then_fresh_consent(tmp_path, monkeypatch):
+    """Edge 502 (never forwarded), then offline past the one-use permit's TTL.  The public
+    ``recover_staged_upload`` retires the upload on the server's own cursor proof under the current
+    key and terminal lease, sends no projection bytes, and the next poll reopens the human choice;
+    only a fresh explicit permit then completes the handoff."""
+    from heel.runner.control_client import RunnerResultChainRecovered, RunnerUploadDeferred
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.edge_502_uploads = 1
+            with pytest.raises(RunnerUploadDeferred):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            assert staged.request_operation == "upload-findings" and _rc_server(live)["requests"] == 1
+            _rc_expire_permit(monkeypatch, permit)
+            sent = len(transport.sent)
+            error = _rc_raised(
+                lambda: client.recover_staged_upload(run_id=live.run_id, findings_projection=findings),
+            )
+            assert isinstance(error, RunnerResultChainRecovered), repr(error)
+            assert (error.operation, error.reason) == ("upload-findings", "chain_authority_lost")
+            assert _rc_resync_sends(transport, sent) == ["start", "complete"]
+            assert [path for path, _h, _b in transport.sent[sent:] if "/resync/" not in path] == []
+            assert all(b"findings_projection" not in body for _p, _h, body in transport.sent[sent:])
+            assert _rc_staged(runtime, live.run_id) == []
+            [tombstone] = runtime.load_superseded_calls()
+            assert (tombstone.request_operation, tombstone.reason) == ("upload-findings", "chain_authority_lost")
+            assert tombstone.body_sha256 == hashlib.sha256(staged.body).hexdigest()
+            assert tombstone.challenge_next_sequence == tombstone.completed_next_sequence == staged.sequence
+            state = runtime.load_terminal_state(live.run_id)
+            assert state.state == "available" and state.revision == 2
+            assert (state.result_chain["next_sequence"], state.result_chain["generation"]) == (
+                staged.sequence, staged.generation + 1,
+            )
+            server = _rc_server(live)
+            assert server["cursor"] == (staged.sequence, staged.generation + 1) and server["requests"] == 1
+            assert _rc_projections(live) == 0
+            # Nothing staged remains, so a second recovery is refused locally and sends nothing.
+            sent = len(transport.sent)
+            with pytest.raises(ValueError):
+                client.recover_staged_upload(run_id=live.run_id, findings_projection=findings)
+            assert len(transport.sent) == sent
+            # Next due step: the expired permit is gone; the human choice is open again.
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["status"] == "awaiting_disclosure_approval" and "permit_id" not in answer
+            # Only fresh explicit consent (a new permit) completes the handoff, re-verified as always.
+            fresh = _live_permit(live, findings)
+            assert fresh["permit_id"] != permit["permit_id"]
+            answer = client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert answer["permit_id"] == fresh["permit_id"]
+            receipt = client.upload_findings(run_id=live.run_id, permit=answer, findings_projection=findings)
+            assert receipt["status"] == "synchronized"
+            assert runtime.load_terminal_state(live.run_id).state == "consumed"
+            assert _rc_projections(live) == 1
+        finally:
+            live.close()
+
+
+def test_expired_permit_consumed_upload_without_receipt_stays_fail_closed_under_metadata_only_resync(tmp_path, monkeypatch):
+    """The CP consumed the upload (answer lost), its receipt is gone and the permit expired.  The public
+    recovery proves +1 and never completes: staged upload kept, no tombstone, no local ``consumed``,
+    server generation untouched; a still-valid permit is never retired through this path."""
+    from heel.runner.control_client import RunnerChainRecoveryRequired
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            permit = _live_permit(live, findings)
+            transport.lose_answers = 1
+            with pytest.raises(ConnectionError):
+                client.upload_findings(run_id=live.run_id, permit=permit, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            # While the permit is still valid the exact replay path owns the staged upload.
+            sent = len(transport.sent)
+            with pytest.raises(ValueError):
+                client.recover_staged_upload(run_id=live.run_id, findings_projection=findings)
+            assert len(transport.sent) == sent and _rc_staged(runtime, live.run_id) == [staged]
+            _rc_expire_receipts(live)
+            server = _rc_server(live)
+            assert server["cursor"] == (staged.sequence + 1, staged.generation)
+            _rc_expire_permit(monkeypatch, permit)
+            sent = len(transport.sent)
+            error = _rc_raised(
+                lambda: client.recover_staged_upload(run_id=live.run_id, findings_projection=findings),
+            )
+            assert isinstance(error, RunnerChainRecoveryRequired), repr(error)
+            assert (error.operation, error.reason) == ("upload-findings", "sequence_consumed")
+            assert _rc_resync_sends(transport, sent) == ["start"]
+            assert [path for path, _h, _b in transport.sent[sent:] if "/resync/" not in path] == []
+            assert _rc_staged(runtime, live.run_id) == [staged]
+            assert runtime.load_superseded_calls() == ()
+            assert runtime.load_terminal_state(live.run_id).state == "available"
+            assert runtime.load_resync_attempt("result", live.run_id) is None
+            assert _rc_server(live)["cursor"] == server["cursor"]
+            assert _rc_projections(live) == 1
+        finally:
+            live.close()
+
+
+def test_revoked_key_or_rate_limited_resync_retires_nothing_and_keeps_state(tmp_path, monkeypatch):
+    """A refused fresh start (revoked key) and the server's 3/min resync rule (429) both keep the staged
+    poll, the sealed cursor and the server cursor unchanged; 429 maps to the bounded deferral."""
+    from heel.runner.control_client import RunnerAuthenticationRejected, RunnerChainRecoveryDeferred
+    from heel.runner.daemon import _serve_failure
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            transport.refuse_sends = 1
+            with pytest.raises(ConnectionError):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            terminal = runtime.load_terminal_state(live.run_id)
+            server = _rc_server(live)
+            _rc_shift_clock(monkeypatch, runner_auth.NONCE_TTL + 1)
+
+            # 429: three fresh starts by this runner in the last minute (other chains of the run).
+            for operation in ("heartbeat", "progress", "stop-ack"):
+                body = canonical_bytes({
+                    "schema_version": "heel.runner-resync-start.v2",
+                    "chain": {"operation": operation, "run_id": live.run_id},
+                    "client_nonce_b64": base64.b64encode(os.urandom(32)).decode(),
+                })
+                path, headers, _ = client._signed_resync_request("start", body)
+                assert live.send(path, body, headers)[0] == 200
+            with pytest.raises(RunnerChainRecoveryDeferred) as deferred:
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert _serve_failure(deferred.value) == ("offline", "recovery_rate_limited")
+            assert _rc_staged(runtime, live.run_id) == [staged]
+            assert runtime.load_terminal_state(live.run_id) == terminal
+            assert runtime.load_resync_attempt("result", live.run_id) is None
+            assert _rc_server(live)["cursor"] == server["cursor"]
+
+            # Revoked key: the exact replay and the fresh start are both refused; nothing changes.
+            live.cp.store.conn.execute(
+                "UPDATE canary_runner_keys SET status='revoked',revoked_at=? WHERE key_id=?", (time.time(), live.key_id),
+            )
+            live.cp.store.conn.commit()
+            with pytest.raises(RunnerAuthenticationRejected):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            assert _rc_staged(runtime, live.run_id) == [staged]
+            assert runtime.load_terminal_state(live.run_id) == terminal
+            assert runtime.load_superseded_calls() == ()
+            assert runtime.load_resync_attempt("result", live.run_id) is None
+            assert _rc_server(live)["cursor"] == server["cursor"]
+        finally:
+            live.close()
+
+
+def test_status_live_check_reports_a_staged_poll_disclosure_without_sending_it(tmp_path):
+    """``heel runner status`` recognises a staged disclosure call: it reports the operation truthfully
+    (replayed and, if needed, recovered only by serve) and sends nothing, instead of ``response_rejected``."""
+    from heel.runner.daemon import RunnerDaemon
+
+    with tempfile.TemporaryDirectory() as directory:
+        live = _LiveHttpRun(directory)
+        try:
+            runtime, client, transport, findings = _rc_terminal(live, tmp_path / "runner")
+            transport.refuse_sends = 1
+            with pytest.raises(ConnectionError):
+                client.poll_disclosure(run_id=live.run_id, findings_projection=findings)
+            [staged] = _rc_staged(runtime, live.run_id)
+            sent = len(transport.sent)
+            daemon = RunnerDaemon.__new__(RunnerDaemon)
+            daemon._transport = lambda origin: transport
+            daemon._clock_ms = lambda: int(time.time() * 1000)
+            record = {"origin": "http://127.0.0.1"}
+            identity = runtime.identity
+            outcome = daemon._live_check(record, identity, client.signer, runtime)
+            assert outcome == {
+                "state": "disclosure_pending", "reason": "serve_replay_required",
+                "operation": "poll-disclosure",
+            }
+            assert len(transport.sent) == sent and _rc_staged(runtime, live.run_id) == [staged]
+        finally:
+            live.close()

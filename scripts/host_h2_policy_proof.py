@@ -76,7 +76,7 @@ STAGE_FILES = (
 # Exactly ``git ls-files heel`` at the candidate (a static test and candidate_provenance compare it).
 HEEL_TREE_FILES = (
     "heel/__init__.py", "heel/agents.py", "heel/agents_human.py", "heel/backtest.py", "heel/bench.py",
-    "heel/blind.py", "heel/blind_eval.py", "heel/browser_review.py", "heel/business_rules.py",
+    "heel/blind.py", "heel/blind_eval.py", "heel/browser_assess.py", "heel/browser_review.py", "heel/business_rules.py",
     "heel/canary_contracts.py", "heel/chaining.py", "heel/classify.py", "heel/cli.py", "heel/cloud_auth.py",
     "heel/cloud_client.py", "heel/containment.py", "heel/contracts.py", "heel/control.py",
     "heel/control_simulator.py", "heel/crypto.py", "heel/economics.py", "heel/entitlements.py",
@@ -99,7 +99,7 @@ HEEL_TREE_FILES = (
     "heel/saas/http_api.py", "heel/saas/iana_root_tlds.py", "heel/saas/jobs.py", "heel/saas/ledger.py",
     "heel/saas/managed_authority_contracts.py",
     "heel/saas/migrate.py", "heel/saas/network_guard.py", "heel/saas/ops.py", "heel/saas/projects.py",
-    "heel/saas/reconcile.py", "heel/saas/runner_auth.py", "heel/saas/runner_contexts.py", "heel/saas/server.py",
+    "heel/saas/reconcile.py", "heel/saas/runner_auth.py", "heel/saas/runner_contexts.py", "heel/saas/scenario_library.py", "heel/saas/server.py",
     "heel/saas/site.py", "heel/saas/tenancy.py", "heel/saas/verification.py", "heel/scenario_validate.py",
     "heel/scenarios.py", "heel/scenarios_lib/community.json", "heel/scenarios_lib/research_owasp.json",
     "heel/scope.py", "heel/semantic.py", "heel/static_review.py", "heel/store.py", "heel/sync_queue.py",

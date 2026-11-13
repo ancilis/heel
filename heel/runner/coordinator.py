@@ -20,7 +20,13 @@ from heel.canary_contracts import (
     validate_operational_run,
 )
 from heel.crypto import verify_envelope
-from heel.runner.control_client import RunnerControlClient, RunnerUploadDeferred
+from heel.runner.control_client import (
+    RunnerChainRecoveryDeferred,
+    RunnerChainRecoveryRequired,
+    RunnerControlClient,
+    RunnerResultChainRecovered,
+    RunnerUploadDeferred,
+)
 from heel.runner.execution import (
     ExecutionBundle,
     ExecutionGate,
@@ -66,9 +72,15 @@ class RunnerMaintenanceResult:
 
 
 # Result handoff (H2 §3.3): poll every idle step (the service paces steps at >= 2 s) for ten
-# minutes after a run's terminal time, then at most once per minute until retention expiry.
+# minutes after a run's terminal time, then every 30 s until retention expiry.  The slow cadence
+# stays below the server's 60 s result-chain nonce lifetime with margin (rc5): it is measured
+# from the previous send, the server lifetime from the previous consumption.
 DISCLOSURE_FAST_POLL_WINDOW_MS = 10 * 60 * 1000
-DISCLOSURE_SLOW_POLL_INTERVAL_MS = 60 * 1000
+DISCLOSURE_SLOW_POLL_INTERVAL_MS = 30 * 1000
+# A findings upload left staged by a 502/503/504 is re-sent byte-identically no sooner than this:
+# never inside the server's 30 s proof window (a race on one nonce), and a never-consumed upload
+# is then recovered by the result-chain resync rather than by beating the timestamp window.
+DISCLOSURE_UPLOAD_RETRY_INTERVAL_MS = 60 * 1000
 # Network polls one serve step may send; local index pages are walked to the end.
 DISCLOSURE_POLLS_PER_STEP = 16
 _DISCLOSURE_STOP_STATES = frozenset({"local_only", "synchronized"})
@@ -158,9 +170,17 @@ class RunnerCoordinator:
 
     def _replay_pending_calls(self) -> None:
         """Drain durable calls before exposing a coordinator to polling or execution."""
+        parked: set[str] = set()
         while True:
-            pending = self.control.runtime.load_pending_calls(limit=74)
+            pending = tuple(
+                item for item in self.control.runtime.load_pending_calls(limit=74)
+                if item.call_id not in parked
+            )
             if not pending:
+                if parked:
+                    # Only kept findings uploads remain: reported and durable, never re-sent.
+                    self.control._release_replay_barrier_with_parked_uploads(parked)
+                    break
                 # The client owns the startup-barrier bit; let its zero-pending
                 # path clear that bit without generating a transport request.
                 self.control.replay_all_pending(
@@ -170,20 +190,47 @@ class RunnerCoordinator:
             for item in pending:
                 if item.request_operation == "poll-disclosure":
                     # Replay the sealed metadata-only poll byte-identically; its answer is a read
-                    # the next serve step repeats, so it is never acted on here.
-                    self.poll_disclosure(
-                        item.run_id, findings_projection=self._local_findings(item.run_id),
-                    )
+                    # the next serve step repeats, so it is never acted on here.  A poll whose
+                    # result-chain authority was lost is retired only under the server's resync
+                    # proof; the next due step then polls afresh.
+                    try:
+                        self.poll_disclosure(
+                            item.run_id, findings_projection=self._local_findings(item.run_id),
+                        )
+                    except RunnerResultChainRecovered:
+                        pass
                     continue
                 if item.request_operation == "upload-findings":
                     # Findings recovery remains lease/permit bound.  Re-enter
                     # the coordinator rather than allowing the client to infer
                     # disclosure authority from an available runtime row alone.
                     request = self._staged_upload_request(item)
-                    self.upload_findings(
-                        item.run_id, permit=request["permit"],
-                        findings_projection=request["findings_projection"],
-                    )
+                    if not self._staged_permit_open(request):
+                        # An expired permit is never re-presented: metadata-only recovery, then
+                        # the next due step polls for fresh consent.  Kept uploads stay parked
+                        # (consumed without receipt: stopped for this process) and serve continues.
+                        try:
+                            self._recover_staged_upload(item.run_id, request)
+                        except RunnerResultChainRecovered:
+                            pass
+                        except RunnerChainRecoveryDeferred:
+                            parked.add(item.call_id)
+                            with self._disclosure_lock:
+                                self._disclosure_last_poll_ms[item.run_id] = self._now_ms()
+                        except RunnerChainRecoveryRequired:
+                            parked.add(item.call_id)
+                            with self._disclosure_lock:
+                                self._disclosure_stopped.add(item.run_id)
+                        continue
+                    try:
+                        self.upload_findings(
+                            item.run_id, permit=request["permit"],
+                            findings_projection=request["findings_projection"],
+                        )
+                    except RunnerResultChainRecovered:
+                        # Retired as never consumed: the next due step polls and re-verifies the
+                        # human's current permit; the retired permit is never reused here.
+                        pass
                     continue
                 self.control.replay_pending_call(
                     item, now_ms=self._now_ms(),
@@ -975,8 +1022,28 @@ class RunnerCoordinator:
         except (RunnerStoreError, KeyError, TypeError, ValueError) as exc:
             raise ValueError("local findings projection is unavailable") from exc
 
+    def _staged_permit_open(self, request: dict[str, Any]) -> bool:
+        """The exact window ``upload_findings`` applies before any byte leaves."""
+        try:
+            permit = validate_disclosure_permit(request["permit"])
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner findings upload") from None
+        return permit["issued_at_ms"] <= self._now_ms() < permit["expires_at_ms"]
+
+    def _recover_staged_upload(self, run_id: str, request: dict[str, Any]) -> None:
+        """Bind the staged findings to the local terminal anchor, then recover metadata-only."""
+        findings = self._bound_findings(
+            run_id, request["findings_projection"], "invalid runner findings upload",
+        )
+        self.control.recover_staged_upload(run_id=run_id, findings_projection=findings)
+
     def poll_disclosure(self, run_id: str, *, findings_projection: object) -> dict[str, Any]:
         """Send only digest/bytes/counts of the local findings on the terminal result chain."""
+        findings = self._bound_findings(run_id, findings_projection, "invalid runner disclosure poll")
+        return self.control.poll_disclosure(run_id=run_id, findings_projection=findings)
+
+    def _bound_findings(self, run_id: str, findings_projection: object, refusal: str) -> dict[str, Any]:
+        """Local findings bound to this runner and the run's store-verified terminal anchor."""
         if type(run_id) is not str or not run_id:
             raise ValueError("active runner claim is required")
         try:
@@ -997,8 +1064,8 @@ class RunnerCoordinator:
             or findings["grant_id"] != anchor["grant_id"]
             or findings["approval_projection_digest"] != anchor["approval_projection_digest"]
         ):
-            raise ValueError("invalid runner disclosure poll")
-        return self.control.poll_disclosure(run_id=run_id, findings_projection=findings)
+            raise ValueError(refusal)
+        return findings
 
     def _disclosure_due(self, state: Any, now: int, *, upload_staged: bool = False) -> bool:
         if state.run_id in self._disclosure_stopped or now >= state.retention_expires_at_ms:
@@ -1007,7 +1074,8 @@ class RunnerCoordinator:
         if not upload_staged and now < state.terminal_at_ms + DISCLOSURE_FAST_POLL_WINDOW_MS:
             return True
         last = self._disclosure_last_poll_ms.get(state.run_id)
-        return last is None or now - last >= DISCLOSURE_SLOW_POLL_INTERVAL_MS
+        interval = DISCLOSURE_UPLOAD_RETRY_INTERVAL_MS if upload_staged else DISCLOSURE_SLOW_POLL_INTERVAL_MS
+        return last is None or now - last >= interval
 
     def _advance_one_disclosure(self, run_id: str) -> None:
         findings = self._local_findings(run_id)
@@ -1069,13 +1137,28 @@ class RunnerCoordinator:
             try:
                 if run_id in staged_uploads:
                     request = self._staged_upload_request(staged_uploads[run_id])
-                    self.upload_findings(
-                        run_id, permit=request["permit"],
-                        findings_projection=request["findings_projection"],
-                    )
+                    if not self._staged_permit_open(request):
+                        # Metadata-only recovery on the same 60 s cadence; no expired bytes.
+                        try:
+                            self._recover_staged_upload(run_id, request)
+                        except RunnerChainRecoveryDeferred:
+                            continue
+                        except RunnerChainRecoveryRequired:
+                            with self._disclosure_lock:
+                                self._disclosure_stopped.add(run_id)
+                            continue
+                    else:
+                        self.upload_findings(
+                            run_id, permit=request["permit"],
+                            findings_projection=request["findings_projection"],
+                        )
                 else:
                     self._advance_one_disclosure(run_id)
             except RunnerUploadDeferred:
+                continue
+            except RunnerResultChainRecovered:
+                # Retired under the server's resync proof; this step's send time paces the next
+                # fresh poll, which re-verifies any permit before an upload.
                 continue
             except ValueError:
                 if run_id in staged_uploads or any(

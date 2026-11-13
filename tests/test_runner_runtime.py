@@ -3270,7 +3270,12 @@ def test_runtime_open_guards_plan_live_first_and_stay_bounded_with_ten_thousand_
                 detail.startswith("SEARCH r USING") and "(run_hash=?)" in detail for detail in details
             ), (statement, details)
         else:
-            assert details == ["SCAN chain_recovery"], details
+            # Bounded live table (capacity-checked) plus one primary-key probe of a retained
+            # terminal disclosure per row; never a scan of terminal_disclosures or retired_claims.
+            assert details == [
+                "SCAN chain_recovery", "CORRELATED SCALAR SUBQUERY 1",
+                "SEARCH t USING COVERING INDEX sqlite_autoindex_terminal_disclosures_1 (run_hash=?)",
+            ], details
     # §6.4 of the serializer design: grammar cost on a ceiling-sized archive plaintext.
     ceiling = {"active": {"sealed_blob_b64": "A" * 524_288}, "pending": [{"sealed_blob_b64": "A" * 524_288}]}
     started = time.perf_counter()
@@ -4366,3 +4371,172 @@ def test_disclosure_poll_commit_advances_only_the_sealed_result_cursor(tmp_path)
     page = runtime.load_available_disclosures(now_ms=14)
     assert [item.run_id for item in page.items] == [run_id] and page.has_more is False
     assert runtime.load_available_disclosures(now_ms=available.retention_expires_at_ms).items == ()
+
+
+# --------------------------------------------------------------------- rc5 result-chain recovery
+
+def _signed_resync(signer, identity, phase, body, timestamp_ms):
+    path = f"/v1/workspaces/{identity.workspace_id}/runners/{identity.runner_id}/resync/{phase}"
+    proof = {
+        "schema_version": f"heel.runner-resync-{phase}-proof.v2", "workspace_id": identity.workspace_id,
+        "runner_id": identity.runner_id, "key_id": identity.key_id, "method": "POST", "path": path,
+        "body_sha256": hashlib.sha256(body).hexdigest(), "timestamp_ms": timestamp_ms,
+    }
+    headers = {
+        "Content-Type": "application/json", "X-Heel-Runner-Id": identity.runner_id,
+        "X-Heel-Runner-Key-Id": identity.key_id, "X-Heel-Runner-Timestamp-Ms": str(timestamp_ms),
+        "X-Heel-Runner-Signature": _b64(signer.sign(
+            f"heel.runner-resync-{phase}-pop.v2".encode() + b"\0" + canonical_bytes(proof)
+        )),
+    }
+    return path, headers
+
+
+def _completed_result_attempt(runtime, signer, identity, run_id, *, next_sequence, generation):
+    chain = {"operation": "result", "run_id": run_id}
+    client_nonce = _b64(b"\x05" * 32)
+    body = canonical_bytes({
+        "schema_version": "heel.runner-resync-start.v2", "chain": chain, "client_nonce_b64": client_nonce,
+    })
+    path, headers = _signed_resync(signer, identity, "start", body, 14)
+    attempt = runtime.begin_resync_attempt(
+        operation="result", run_id=run_id, path=path, headers=headers, body=body,
+        client_nonce_b64=client_nonce, timestamp_ms=14, now_ms=14,
+    )
+    attempt = runtime.record_resync_challenge(
+        attempt, challenge_id="rrs_" + "b" * 32, server_challenge_b64=_b64(b"\x06" * 32),
+        next_sequence=next_sequence, generation=generation, expires_at_ms=10 ** 12, now_ms=14,
+    )
+    body = canonical_bytes({
+        "schema_version": "heel.runner-resync-complete.v2", "challenge_id": "rrs_" + "b" * 32,
+        "chain": chain, "client_nonce_b64": client_nonce, "server_challenge_b64": _b64(b"\x06" * 32),
+        "generation": generation,
+    })
+    path, headers = _signed_resync(signer, identity, "complete", body, 15)
+    return runtime.record_resync_completion(attempt, path=path, headers=headers, body=body, timestamp_ms=15, now_ms=15)
+
+
+def _staged_result_call(runtime, signer, identity, run_id, available, operation):
+    body = canonical_bytes({"schema_version": "heel.runner-disclosure-poll.v1" if operation == "poll-disclosure"
+                            else "heel.runner-findings-upload.v1"})
+    lease, path, headers = _signed_disclosure(runtime, signer, identity, run_id, available, body, operation=operation)
+    staged = runtime.stage_disclosure_call(
+        lease, path=path, headers=headers, body=body, now_ms=13, request_operation=operation,
+    )
+    return lease, staged
+
+
+def test_runtime_supersedes_poll_disclosure_only_under_result_chain_resync(tmp_path):
+    runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+    lease, staged = _staged_result_call(runtime, signer, identity, run_id, available, "poll-disclosure")
+    cursor = available.result_chain
+    root = runtime.terminal_root_state_digest(available)
+    attempt = _completed_result_attempt(
+        runtime, signer, identity, run_id, next_sequence=cursor["next_sequence"], generation=cursor["generation"],
+    )
+    assert (attempt.operation, attempt.run_id, attempt.base_generation) == ("result", run_id, cursor["generation"])
+    assert runtime.load_resync_attempt("result", run_id) == attempt
+    assert runtime.load_resync_attempt("claim") is None            # chains never share an attempt row
+    new_nonce = _b64(b"\x08" * 32)
+
+    # Wrong lease, a wrong generation and an ambiguous cursor all change nothing.
+    with pytest.raises(runtime_module.RunnerRuntimeConflict):
+        runtime.commit_result_chain_supersession(
+            attempt, staged, object(), next_nonce_b64=new_nonce,
+            next_sequence=cursor["next_sequence"], generation=cursor["generation"] + 1, now_ms=16,
+        )
+    for sequence, generation in (
+        (cursor["next_sequence"], cursor["generation"] + 2),
+        (cursor["next_sequence"] + 2, cursor["generation"] + 1),
+    ):
+        with pytest.raises(runtime_module.RuntimeResultCursorRefused) as refused:
+            runtime.commit_result_chain_supersession(
+                attempt, staged, lease, next_nonce_b64=new_nonce,
+                next_sequence=sequence, generation=generation, now_ms=16,
+            )
+        assert refused.value.reason == "result_cursor_ambiguous"
+    assert runtime.load_pending_calls() == (staged,)
+    assert runtime.load_terminal_state(run_id) == available
+    assert runtime.load_superseded_calls() == ()
+
+    reason = runtime.commit_result_chain_supersession(
+        attempt, staged, lease, next_nonce_b64=new_nonce,
+        next_sequence=cursor["next_sequence"], generation=cursor["generation"] + 1, now_ms=16,
+    )
+    assert reason == "chain_authority_lost"
+    after = runtime.load_terminal_state(run_id)
+    assert after.state == "available" and after.revision == available.revision
+    assert after.prior_state_digest == available.prior_state_digest
+    assert runtime.terminal_root_state_digest(after) == root          # root binding unchanged
+    assert dict(after.result_chain) == {
+        "operation": "result", "run_id": run_id, "next_nonce_b64": new_nonce,
+        "next_sequence": cursor["next_sequence"], "generation": cursor["generation"] + 1,
+    }
+    assert runtime.load_pending_calls() == () and runtime.load_resync_attempt("result", run_id) is None
+    [tombstone] = runtime.load_superseded_calls()
+    assert (tombstone.call_id, tombstone.chain_operation, tombstone.run_id, tombstone.reason) == (
+        staged.call_id, "result", run_id, "chain_authority_lost",
+    )
+    run_hash = hashlib.sha256(run_id.encode()).hexdigest()
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        assert conn.execute("SELECT kind,chain FROM chain_recovery").fetchall() == [("superseded_call", run_hash)]
+    # The load guard accepts a retained disclosure's recovery rows; a reopened runtime reads them.
+    reopened = RunnerRuntimeState(runtime.path, identity, signer)
+    assert reopened.load_superseded_calls() == (tombstone,)
+    # A replayed supersession cannot apply twice.
+    with pytest.raises(runtime_module.RunnerRuntimeConflict):
+        reopened.commit_result_chain_supersession(
+            attempt, staged, lease, next_nonce_b64=new_nonce,
+            next_sequence=cursor["next_sequence"], generation=cursor["generation"] + 1, now_ms=17,
+        )
+
+
+def test_runtime_never_retires_a_consumed_upload_and_refuses_unavailable_or_active_chains(tmp_path):
+    runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+    lease, staged = _staged_result_call(runtime, signer, identity, run_id, available, "upload-findings")
+    cursor = available.result_chain
+    attempt = _completed_result_attempt(
+        runtime, signer, identity, run_id, next_sequence=cursor["next_sequence"] + 1, generation=cursor["generation"],
+    )
+    with pytest.raises(runtime_module.RuntimeResultCursorRefused) as refused:
+        runtime.commit_result_chain_supersession(
+            attempt, staged, lease, next_nonce_b64=_b64(b"\x08" * 32),
+            next_sequence=cursor["next_sequence"] + 1, generation=cursor["generation"] + 1, now_ms=16,
+        )
+    assert refused.value.reason == "sequence_consumed"
+    assert runtime.load_pending_calls() == (staged,) and runtime.load_terminal_state(run_id) == available
+    assert runtime.load_superseded_calls() == ()
+
+    # A run that still holds an active row (terminal not yet available) admits no result resync.
+    active_runtime, active_signer, active_identity, grant = _runtime_with_active_run(tmp_path / "active")
+    active_runtime.register_local_terminal(
+        run_id=grant["run_id"], project_id=grant["project_id"], grant_id=grant["grant_id"],
+        approval_projection_digest=grant["approval"]["projection_digest"], terminal_projection_digest="b" * 64,
+        terminal_record_digest="c" * 64, terminal_at_ms=10, retention_expires_at_ms=20,
+    )
+    body = canonical_bytes({
+        "schema_version": "heel.runner-resync-start.v2",
+        "chain": {"operation": "result", "run_id": grant["run_id"]}, "client_nonce_b64": _b64(b"\x05" * 32),
+    })
+    path, headers = _signed_resync(active_signer, active_identity, "start", body, 14)
+    with pytest.raises(runtime_module.RunnerRuntimeConflict, match="chain is unavailable"):
+        active_runtime.begin_resync_attempt(
+            operation="result", run_id=grant["run_id"], path=path, headers=headers, body=body,
+            client_nonce_b64=_b64(b"\x05" * 32), timestamp_ms=14, now_ms=14,
+        )
+    # Other chains are still refused by the attempt store.
+    with pytest.raises(runtime_module.RunnerRuntimeStateError):
+        runtime.load_resync_attempt("heartbeat", run_id)
+
+
+def test_a_result_chain_recovery_row_without_its_retained_disclosure_fails_the_load_guard(tmp_path):
+    runtime, signer, identity, run_id, available = _runtime_with_available_disclosure(tmp_path)
+    runtime.close()
+    with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
+        conn.execute(
+            "INSERT INTO chain_recovery(record_id,kind,chain,generation,sealed_blob,created_at_ms) "
+            "VALUES(?,?,?,?,?,?)", ("a" * 64, "superseded_call", "9" * 64, 1, b"\0" * 29, 1),
+        )
+        conn.commit()
+    with pytest.raises(RunnerRuntimeCorrupt, match="chain recovery index"):
+        RunnerRuntimeState(runtime.path, identity, signer)

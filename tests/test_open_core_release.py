@@ -30,7 +30,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "release/open-core-v1.json"
 BUILDER = ROOT / "scripts/build_open_core_release.py"
-VERSION = "1.3.0rc4"
+VERSION = "1.3.0rc5"
 WHEEL = f"heel_sim-{VERSION}-py3-none-any.whl"
 SDIST = f"heel_sim-{VERSION}.tar.gz"
 ARTIFACT_MANIFEST = "heel-open-core-manifest.json"
@@ -136,6 +136,7 @@ EXPECTED_CONTRACT = {
         "heel/bench.py",
         "heel/blind.py",
         "heel/blind_eval.py",
+        "heel/browser_assess.py",
         "heel/browser_review.py",
         "heel/business_rules.py",
         "heel/canary_contracts.py",

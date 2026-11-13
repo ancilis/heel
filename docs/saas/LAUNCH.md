@@ -21,14 +21,17 @@ include a Stripe or PostgreSQL integration.
 - Anonymous browser-local OpenAPI review with a committed sample on first visit.
 - Same-origin, pinned Pyodide runtime and Heel wheel; no analyzer network calls.
 - Explicit local browser save/export without retaining the source document.
-- Checked-in Heel 1.3.0rc4 runner preview candidate wheel, source archive, and manifest under
-  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The 1.3.0rc4 candidate
-  is not yet published; its runner code equals the 1.3.0rc2 component, which is published as the
-  public GitHub prerelease
-  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>, with a one-command hash-pinned install
-  whose independent anonymous run passed on Apple silicon macOS with Python 3.13.5. It is not a
-  stable release, its release record is not immutable, it is not published to PyPI, and the website
-  that bundles these files is not publicly deployed. It corrects the public 1.3.0rc1 prerelease's `error_envelope` and `hardened`
+- Checked-in Heel 1.3.0rc5 runner preview candidate wheel, source archive, and manifest under
+  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The 1.3.0rc5 candidate
+  is not yet published. 1.3.0rc4 is published
+  as the public GitHub prerelease <https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>
+  (2026-11-11), and the current public one-command install is its hash-pinned wheel; the release
+  owner's anonymous verify-public passed, which proves packaging only. No independent clean-room
+  customer run of that command is recorded yet. The earlier prerelease
+  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2> stays published as history; its
+  one-command install's independent anonymous run passed on Apple silicon macOS with Python
+  3.13.5. 1.3.0rc4 is not a stable release, its release record is not immutable, it is not
+  published to PyPI, and the website that bundles these files is not publicly deployed. It corrects the public 1.3.0rc1 prerelease's `error_envelope` and `hardened`
   errata (an error envelope is inconclusive at every HTTP status), stores no inconclusive
   plan-differential pair as a finding, and never passes a regression whose denial status still
   carries the paid payload. Publishing the component is not a completed customer journey:

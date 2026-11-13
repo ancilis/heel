@@ -47,8 +47,8 @@ from heel.crypto import ed25519_key_id, verify_envelope
 from heel.runner.runtime import (
     ActiveGateUpdate, ActiveRunInstall, ChainResyncAttempt, InactiveClaimAttestationEvidence,
     PendingResultReplayVerifier, PendingSignedCall, RetiredClaimRecord, RunnerRuntimeConflict,
-    RunnerRuntimeCorrupt, RunnerRuntimeState, RuntimeClaimSequenceConsumed, TerminalResultStageEvidence,
-    _active_json_bytes,
+    RunnerRuntimeCorrupt, RunnerRuntimeState, RuntimeClaimSequenceConsumed, RuntimeResultCursorRefused,
+    TerminalResultStageEvidence, _active_json_bytes,
 )
 
 
@@ -127,8 +127,10 @@ class RunnerAuthenticationRejected(RunnerControlRecoveryError):
 class RunnerChainRecoveryRequired(RunnerControlRecoveryError):
     """A staged call that cannot be retired safely blocks the chain; it is kept unchanged.
 
-    ``reason`` is ``unsupported_operation`` (a kind outside this phase's recovery) or
-    ``claim_sequence_consumed`` (the server consumed the staged job claim's sequence).
+    ``reason`` is ``unsupported_operation`` (a kind outside this phase's recovery),
+    ``claim_sequence_consumed`` (the server consumed the staged job claim's sequence),
+    ``sequence_consumed`` (the server consumed a staged findings upload whose receipt it no longer
+    answers) or ``result_cursor_ambiguous`` (the result-chain resync cursors prove nothing).
     """
 
     code = "recovery_required"
@@ -189,6 +191,28 @@ class VerifiedInactiveClaimAttestation:
     attestation: Mapping[str, Any]
     evidence: InactiveClaimAttestationEvidence
     _client: object
+
+
+class RunnerResultChainRecovered(Exception):
+    """A staged terminal-disclosure call was retired under the server's result-chain resync proof.
+
+    Not an error and not a response: nothing was re-signed.  The sealed result cursor now holds the
+    server's new nonce and generation; the caller's next due step polls afresh (and re-verifies any
+    human permit).  ``reason`` is the tombstone reason; no request material is carried.
+    """
+
+    def __init__(self, operation: str, reason: str):
+        super().__init__("runner result chain recovered")
+        self.operation = operation
+        self.reason = reason
+
+
+class _ResultChainAuthorityLost(Exception):
+    """Internal: a staged terminal-disclosure call received ``401 invalid_runner_auth``."""
+
+    def __init__(self, pending: PendingSignedCall):
+        super().__init__("runner result chain authority lost")
+        self.pending = pending
 
 
 class _ClaimChainAuthorityLost(Exception):
@@ -397,6 +421,7 @@ class RunnerControlClient:
             )
         self._state_lock = threading.Lock()
         self._claim_lock = threading.Lock()
+        self._result_recovery_lock = threading.Lock()
         self._run_guards: dict[str, _RunGuard] = {}
         self._tracked_runs: set[str] = set()
         self._terminal_runs: set[str] = set()
@@ -780,6 +805,13 @@ class RunnerControlClient:
             if operation == "claim" and isinstance(runtime_pending, PendingSignedCall):
                 # Recovered by the caller; the job claim is retired only on the server's proof.
                 raise _ClaimChainAuthorityLost(runtime_pending)
+            if (
+                operation in {"poll-disclosure", "upload-findings"}
+                and isinstance(runtime_pending, PendingSignedCall)
+                and runtime_disclosure_lease is not None
+            ):
+                # Recovered by the caller under the same lease; retired only on the server's proof.
+                raise _ResultChainAuthorityLost(runtime_pending)
             # Run chains are outside this phase's recovery (T4a): the staged call is kept.
             raise RunnerChainRecoveryRequired(operation)
         if operation == "upload-findings" and status in {502, 503, 504}:
@@ -1786,7 +1818,7 @@ class RunnerControlClient:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("terminal runner result is required before disclosure") from exc
-        return self._post_closed(
+        return self._post_disclosure_recovering(
             call, "upload-findings", run_id,
             upload_binding=(permit_value, findings, len(projection_bytes), finding_count),
             runtime_pending=runtime_pending, runtime_disclosure_lease=disclosure_lease,
@@ -1823,7 +1855,7 @@ class RunnerControlClient:
             pending.path, dict(pending.headers), pending.body, pending.capability,
             self._chain("result", pending.run_id), pending.sequence, pending.generation,
         )
-        return self._post_closed(
+        return self._post_disclosure_recovering(
             call, "upload-findings", pending.run_id,
             upload_binding=(permit_value, findings, projection_bytes, finding_count),
             runtime_pending=pending, runtime_disclosure_lease=disclosure_lease,
@@ -1906,7 +1938,9 @@ class RunnerControlClient:
                 pending[0].path, dict(pending[0].headers), pending[0].body, pending[0].capability,
                 self._chain("result", run_id), pending[0].sequence, pending[0].generation,
             )
-            return self._post_closed(
+            # The byte-identical replay goes first: a poll the server committed is answered from
+            # its exact receipt, before any timestamp or nonce check.
+            return self._post_disclosure_recovering(
                 call, "poll-disclosure", run_id,
                 runtime_pending=pending[0], runtime_disclosure_lease=disclosure_lease,
             )
@@ -1944,7 +1978,7 @@ class RunnerControlClient:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("terminal runner result is required before disclosure") from exc
-        return self._post_closed(
+        return self._post_disclosure_recovering(
             call, "poll-disclosure", run_id,
             runtime_pending=runtime_pending, runtime_disclosure_lease=disclosure_lease,
         )
@@ -1987,6 +2021,85 @@ class RunnerControlClient:
         return self._upload_findings_closed(
             run_id=run_id, permit=permit, findings_projection=findings_projection,
         )
+
+    def recover_staged_upload(self, *, run_id, findings_projection):
+        """Retire one staged findings upload whose human permit has closed, sending metadata only.
+
+        The staged bytes are never re-sent: an expired permit is not re-presented.  Under the
+        current key and the run's terminal-disclosure lease, the result-chain resync retires the
+        upload only on the server's proof that it was never consumed and raises
+        ``RunnerResultChainRecovered`` (the next poll asks the human again).  Consumed without a
+        receipt, ambiguous or rate limited: ``RunnerChainRecoveryRequired``/``Deferred`` with the
+        staged upload kept.  An open permit window, or no exact staged upload, is refused locally.
+        """
+        if type(run_id) is not str or not run_id:
+            raise ValueError("invalid runner findings upload")
+        try:
+            findings = validate_canary_findings(findings_projection)
+            self._verify_projection_signature(findings)
+        except (TypeError, ValueError):
+            raise ValueError("invalid runner findings upload") from None
+        if findings["workspace_id"] != self.workspace_id or findings["run_id"] != run_id:
+            raise ValueError("invalid runner findings upload")
+        pending = tuple(
+            item for item in self.runtime.load_pending_calls()
+            if item.chain_operation == "result" and item.run_id == run_id
+        )
+        if len(pending) != 1 or pending[0].request_operation != "upload-findings":
+            raise ValueError("terminal runner result is required before disclosure")
+        staged = pending[0]
+        now_ms = self._timestamp()
+        try:
+            request = json.loads(staged.body.decode("utf-8"))
+            if (
+                not isinstance(request, dict) or canonical_bytes(request) != staged.body
+                or set(request) != {"schema_version", "run_id", "permit", "findings_projection"}
+                or request["schema_version"] != "heel.runner-findings-upload.v1"
+                or request["run_id"] != run_id or request["findings_projection"] != findings
+            ):
+                raise ValueError
+            permit = validate_disclosure_permit(request["permit"])
+        except (TypeError, ValueError, UnicodeDecodeError):
+            raise ValueError("invalid runner findings upload") from None
+        if (
+            permit["workspace_id"] != self.workspace_id or permit["run_id"] != run_id
+            or permit["project_id"] != findings["project_id"]
+            or permit["grant_id"] != findings["grant_id"]
+        ):
+            raise ValueError("invalid runner findings upload")
+        if permit["issued_at_ms"] <= now_ms < permit["expires_at_ms"]:
+            # The byte-identical replay owns a staged upload whose permit is still valid.
+            raise ValueError("disclosure permit is still valid")
+        try:
+            disclosure_lease = self.runtime.lease_terminal_disclosure(
+                run_id, expected_project_id=findings["project_id"],
+                expected_grant_id=findings["grant_id"],
+                expected_approval_projection_digest=findings["approval_projection_digest"],
+                now_ms=now_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal runner result is required before disclosure") from exc
+        with self._result_recovery_lock:
+            reason = self._recover_result_chain_locked(staged, disclosure_lease)
+        raise RunnerResultChainRecovered("upload-findings", reason)
+
+    def _release_replay_barrier_with_parked_uploads(self, call_ids) -> None:
+        """Open the claim path when every remaining staged call is a parked findings upload.
+
+        Startup parks a staged upload that recovery kept (consumed without receipt, deferred); it
+        stays durable and reported, exactly like an upload stopped in-process, while the claim and
+        run chains continue.  Any other staged call keeps the barrier closed.
+        """
+        parked = frozenset(call_ids)
+        pending = self.runtime.load_pending_calls(limit=74)
+        if not pending or len(pending) == 74 or any(
+            item.call_id not in parked or item.request_operation != "upload-findings"
+            or item.chain_operation != "result"
+            for item in pending
+        ):
+            raise ValueError("runner control pending replay is required")
+        with self._state_lock:
+            self._pending_replay_required = False
 
     def _verify_projection_signature(self, projection: dict[str, Any]) -> None:
         public_key = getattr(self.signer, "public_key", None)
@@ -2126,7 +2239,91 @@ class RunnerControlClient:
         fresh) is adopted and completed as the one fresh start, so it is never left orphaned.
         """
         self._assert_supersedable(failed)
-        attempt: ChainResyncAttempt | None = self.runtime.load_resync_attempt("claim")
+        self._recover_chain_locked(failed, chain={"operation": "claim", "run_id": None})
+
+    def _post_disclosure_recovering(
+        self, call: _Call, operation: str, run_id: str, *, runtime_pending: PendingSignedCall,
+        runtime_disclosure_lease: object, upload_binding=None,
+    ):
+        """Post one sealed disclosure call; lost result-chain authority is recovered, never resent.
+
+        On ``401 invalid_runner_auth`` the one staged call is retired only on the server's verified
+        result-chain resync (``RunnerResultChainRecovered``); a refusal keeps it and raises.
+        """
+        try:
+            return self._post_closed(
+                call, operation, run_id, upload_binding=upload_binding,
+                runtime_pending=runtime_pending, runtime_disclosure_lease=runtime_disclosure_lease,
+            )
+        except _ResultChainAuthorityLost as lost:
+            with self._result_recovery_lock:
+                reason = self._recover_result_chain_locked(lost.pending, runtime_disclosure_lease)
+            with self._state_lock:
+                self._append_call_diagnostic_locked(operation, 401, call)
+            raise RunnerResultChainRecovered(operation, reason) from None
+
+    def _recover_result_chain_locked(self, failed: PendingSignedCall, lease: object) -> str:
+        """Recover the sealed result cursor of a retained terminal disclosure for ``failed``.
+
+        The same bounded protocol as the claim chain (exact retransmission before any fresh start,
+        at most one fresh start, 429 deferred with state kept).  Before a completion is signed, the
+        server challenge must prove the staged call retirable: never consumed (challenge cursor ==
+        staged sequence == local cursor, same generation) or, for a poll only, consumed (+1).  Any
+        other relation leaves the server generation untouched and keeps the staged call.
+        """
+        if (
+            failed.request_operation not in {"poll-disclosure", "upload-findings"}
+            or failed.chain_operation != "result" or failed.run_id is None
+            or failed.capability != "runner_result"
+            or failed.headers.get("X-Heel-Runner-Id") != self.runner_id
+            or failed.headers.get("X-Heel-Runner-Key-Id") != self.signer.key_id
+        ):
+            raise RunnerChainRecoveryRequired(failed.request_operation)
+        try:
+            cursor = self.runtime._disclosure_result_cursor_for_recovery(lease)
+        except (TypeError, ValueError) as exc:
+            raise RunnerChainRecoveryRequired(failed.request_operation, "result_cursor_ambiguous") from exc
+        if (
+            cursor["run_id"] != failed.run_id
+            or (cursor["next_sequence"], cursor["generation"], cursor["next_nonce_b64"])
+            != (failed.sequence, failed.generation, failed.headers.get("X-Heel-Runner-Nonce"))
+        ):
+            raise RunnerChainRecoveryRequired(failed.request_operation, "result_cursor_ambiguous")
+
+        def gate(attempt: ChainResyncAttempt) -> None:
+            sequence = attempt.challenge_next_sequence
+            if attempt.challenge_generation != failed.generation or attempt.base_generation != failed.generation:
+                raise RunnerChainRecoveryRequired(failed.request_operation, "result_cursor_ambiguous")
+            if sequence == failed.sequence:
+                return
+            if sequence == failed.sequence + 1:
+                if failed.request_operation == "poll-disclosure":
+                    return
+                # An upload is not idempotent in authority terms: its receipt must be the server's.
+                raise RunnerChainRecoveryRequired("upload-findings", "sequence_consumed")
+            raise RunnerChainRecoveryRequired(failed.request_operation, "result_cursor_ambiguous")
+
+        def commit(attempt: ChainResyncAttempt, data: dict[str, Any]) -> str:
+            try:
+                return self.runtime.commit_result_chain_supersession(
+                    attempt, failed, lease, next_nonce_b64=data["next_nonce_b64"],
+                    next_sequence=data["next_sequence"], generation=data["generation"],
+                    now_ms=self._timestamp(),
+                )
+            except RuntimeResultCursorRefused as refused:
+                # The completed attempt stays retransmittable; the staged call is kept.
+                raise RunnerChainRecoveryRequired(failed.request_operation, refused.reason) from None
+
+        return self._recover_chain_locked(
+            failed, chain={"operation": "result", "run_id": failed.run_id}, gate=gate, commit=commit,
+        )
+
+    def _recover_chain_locked(
+        self, failed: PendingSignedCall, *, chain: dict[str, Any], gate=None, commit=None,
+    ):
+        """The shared resync loop; ``gate`` vets a challenge before signing, ``commit`` installs."""
+        operation, run_id = chain["operation"], chain["run_id"]
+        attempt: ChainResyncAttempt | None = self.runtime.load_resync_attempt(operation, run_id)
         fresh_started = probed = False
         original: ChainResyncAttempt | None = None
         while True:
@@ -2137,11 +2334,11 @@ class RunnerControlClient:
                 client_nonce = self._random_b64()
                 body = canonical_bytes({
                     "schema_version": "heel.runner-resync-start.v2",
-                    "chain": {"operation": "claim", "run_id": None}, "client_nonce_b64": client_nonce,
+                    "chain": dict(chain), "client_nonce_b64": client_nonce,
                 })
                 path, headers, timestamp_ms = self._signed_resync_request("start", body)
                 attempt = self.runtime.begin_resync_attempt(
-                    operation="claim", path=path, headers=headers, body=body,
+                    operation=operation, run_id=run_id, path=path, headers=headers, body=body,
                     client_nonce_b64=client_nonce, timestamp_ms=timestamp_ms, now_ms=timestamp_ms,
                 )
             if attempt.challenge_id is None:
@@ -2157,18 +2354,26 @@ class RunnerControlClient:
                 if status == 429 and isinstance(payload, dict) and payload.get("code") == "runner_resync_rate_limited":
                     self.runtime.discard_resync_attempt(attempt)
                     raise RunnerChainRecoveryDeferred(self._retry_after_ms(payload))
-                data = self._recovery_challenge(response)
+                data = self._recovery_challenge(response, chain)
                 attempt = self.runtime.record_resync_challenge(
                     attempt, challenge_id=data["challenge_id"], server_challenge_b64=data["server_challenge_b64"],
                     next_sequence=data["next_sequence"], generation=data["generation"],
                     expires_at_ms=data["expires_at_ms"], now_ms=self._timestamp(),
                 )
             freshly_signed = attempt.complete_body is None
+            if freshly_signed and gate is not None:
+                try:
+                    gate(attempt)
+                except RunnerChainRecoveryRequired:
+                    # Never completed: the server generation is untouched, so a committed receipt
+                    # for the staged call stays answerable.  The unanswered challenge just expires.
+                    self.runtime.discard_resync_attempt(attempt)
+                    raise
             if freshly_signed:
                 body = canonical_bytes({
                     "schema_version": "heel.runner-resync-complete.v2",
                     "challenge_id": attempt.challenge_id,
-                    "chain": {"operation": "claim", "run_id": None},
+                    "chain": dict(chain),
                     "client_nonce_b64": attempt.client_nonce_b64,
                     "server_challenge_b64": attempt.server_challenge_b64,
                     "generation": attempt.challenge_generation,
@@ -2223,7 +2428,7 @@ class RunnerControlClient:
                     # No pending challenge matched this start (the server checks that first).
                     self.runtime.discard_resync_attempt(attempt)
                     raise RunnerChainRecoveryDeferred(self._retry_after_ms(payload))
-                data = self._recovery_challenge(response)
+                data = self._recovery_challenge(response, chain)
                 if data["challenge_id"] != attempt.challenge_id:
                     # This challenge is no longer pending, and the server answered this exact start
                     # with a NEW challenge (its proof was still fresh). It is bound to this start,
@@ -2252,7 +2457,7 @@ class RunnerControlClient:
                      "expires_at_ms", "generation"},
                 )
                 if (
-                    data["chain"] != {"operation": "claim", "run_id": None}
+                    data["chain"] != chain
                     or not self._b64_32(data["next_nonce_b64"])
                     or not self._positive_int(data["next_sequence"])
                     or not self._positive_int(data["expires_at_ms"])
@@ -2263,6 +2468,8 @@ class RunnerControlClient:
                     raise ValueError
             except ValueError:
                 raise ValueError("invalid runner resync completion") from None
+            if commit is not None:
+                return commit(attempt, data)
             with self._state_lock:
                 before = self._chains.get("claim")
             try:
@@ -2281,18 +2488,25 @@ class RunnerControlClient:
                 self._chains["claim"] = (cursor.next_nonce_b64, cursor.next_sequence, cursor.generation)
             return
 
-    def _recovery_challenge(self, response: object) -> dict[str, Any]:
-        """A valid claim-chain challenge answer, or ``ValueError``; nothing is recorded here."""
+    def _recovery_challenge(
+        self, response: object, chain: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A valid challenge answer for ``chain`` (claim by default), or ``ValueError``; nothing recorded."""
+        chain = {"operation": "claim", "run_id": None} if chain is None else chain
         try:
             data = self._response_data(
                 response, "heel.runner-resync-challenge.v2",
                 {"schema_version", "challenge_id", "chain", "server_challenge_b64",
                  "next_sequence", "expires_at_ms", "generation"},
             )
-            cursor = self.runtime.load_chain("claim", None)
+            if chain["operation"] == "claim":
+                claim_cursor = self.runtime.load_chain("claim", None)
+                generation = None if claim_cursor is None else claim_cursor.generation
+            else:
+                generation = self.runtime.load_recovery_generation("result", chain["run_id"])
             challenge_id = data["challenge_id"]
             if (
-                data["chain"] != {"operation": "claim", "run_id": None}
+                data["chain"] != chain
                 or not self._b64_32(data["server_challenge_b64"])
                 or type(challenge_id) is not str or len(challenge_id) != 36
                 or not challenge_id.startswith("rrs_")
@@ -2300,7 +2514,7 @@ class RunnerControlClient:
                 or not self._positive_int(data["next_sequence"])
                 or not self._positive_int(data["expires_at_ms"])
                 or not self._generation(data["generation"])
-                or cursor is None or data["generation"] < cursor.generation
+                or generation is None or data["generation"] < generation
             ):
                 raise ValueError
         except ValueError:
