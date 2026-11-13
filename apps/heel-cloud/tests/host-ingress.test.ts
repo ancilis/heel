@@ -97,6 +97,10 @@ function routeCases(origin: string): RouteCase[] {
     { label: "canary run", method: "GET", path: `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}`, headers: session },
     { label: "canary approve", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/approve`, headers: { ...browser, "Idempotency-Key": `ca1-${"1".repeat(64)}`, "If-Heel-Control-Generation": "3" }, body: "{}", human: true },
     { label: "runner context bindings", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/runner-context-bindings`, headers: browser, body: "{}", human: true },
+    { label: "scenario library", method: "GET", path: `/v1/workspaces/${workspace}/scenario-library`, headers: session },
+    { label: "custom scenario", method: "POST", path: `/v1/workspaces/${workspace}/scenario-library/custom`, headers: browser, body: "{}", human: true },
+    { label: "run scenario bindings read", method: "GET", path: `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/scenario-bindings`, headers: session },
+    { label: "run scenario bindings freeze", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/scenario-bindings`, headers: browser, body: "{}", human: true },
     { label: "environments list", method: "GET", path: `/v1/workspaces/${workspace}/projects/${project}/environments`, headers: session },
     { label: "environment check", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/check`, headers: browser, body: "{}", human: true },
     { label: "environment proof recovery", method: "POST", path: `/v1/workspaces/${workspace}/projects/${project}/environments/${environment}/challenge`, headers: browser, body: "{}", human: true },
@@ -476,6 +480,59 @@ describe("canonical control-plane binding destination", () => {
       expect(upstream.headers.get("x-heel-internal-origin")).toBe("same-origin");
       expect(upstream.headers.get("x-heel-edge-auth")).toBe(edge);
       expect(upstream.headers.get("origin")).toBe(origin);
+    }
+    expectNoFallback();
+  });
+
+  it("admits the scenario library only as cookie-session reads and exact same-origin browser POSTs", async () => {
+    const origin = CONFIGURED_ORIGINS[0];
+    const fetcher = bindingSpy();
+    const browser = { ...session, Origin: origin, "Sec-Fetch-Site": "same-origin" };
+    const library = `/v1/workspaces/${workspace}/scenario-library`;
+    const bindings = `/v1/workspaces/${workspace}/projects/${project}/canary-runs/${run}/scenario-bindings`;
+    const notFound: RouteCase[] = [
+      { label: "library POST", method: "POST", path: library, headers: browser, body: "{}" },
+      { label: "custom GET", method: "GET", path: `${library}/custom`, headers: session },
+      ...[
+        `${library}/`, `${library}/custom/`, `${library}/custom/sc.internal.x`, `${library}s`,
+        `/v1/workspaces/ws_0123456789abcde/scenario-library`, `/v1/workspaces/${workspace}/projects/${project}/scenario-library`,
+        `${bindings}/`, `${bindings}/x`, `/v1/workspaces/${workspace}/projects/${project}/canary-runs/crun_${"c".repeat(31)}/scenario-bindings`,
+      ].map((path): RouteCase => ({ label: path, method: "POST", path, headers: browser, body: "{}" })),
+    ];
+    for (const route of notFound) {
+      const response = await worker.fetch(incoming(origin, route), workerEnv(origin, fetcher), context);
+      expect(response.status, route.label).toBe(404);
+    }
+    for (const [path, method] of [[library, "GET"], [`${library}/custom`, "POST"], [bindings, "GET"], [bindings, "POST"]] as const) {
+      const body = method === "POST" ? "{}" : undefined;
+      const refused: Array<[string, Record<string, string>]> = [
+        ["bearer key", { Origin: origin, "Sec-Fetch-Site": "same-origin", Authorization: "Bearer heel_sk_private" }],
+        ["bearer key beside the session", { ...browser, Authorization: "Bearer heel_sk_private" }],
+        ["no session", { Origin: origin, "Sec-Fetch-Site": "same-origin" }],
+      ];
+      if (method === "POST") {
+        refused.push(["no Origin", { ...session, "Sec-Fetch-Site": "same-origin" }],
+          ["cross-site", { ...browser, "Sec-Fetch-Site": "cross-site" }], ["foreign Origin", { ...browser, Origin: "https://attacker.invalid" }]);
+      }
+      for (const [label, headers] of refused) {
+        const response = await worker.fetch(incoming(origin, { label, method, path, headers, body }), workerEnv(origin, fetcher), context);
+        expect(response.status, `${method} ${path} ${label}`).toBe(400);
+      }
+    }
+    for (const path of [`${library}/custom`, bindings]) {
+      const oversized = "x".repeat(16 * 1024 + 1);
+      const response = await worker.fetch(incoming(origin, { label: path, method: "POST", path, headers: browser, body: oversized }), workerEnv(origin, fetcher), context);
+      expect(response.status, path).toBe(400);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+    for (const path of [`${library}/custom`, bindings]) {
+      const forged = { ...browser, "X-Heel-Internal-Origin": "forged", "X-Heel-Edge-Auth": "forged" };
+      const response = await worker.fetch(incoming(origin, { label: path, method: "POST", path, headers: forged, body: "{}" }), workerEnv(origin, fetcher), context);
+      expect(response.status, path).toBe(200);
+      const upstream = fetcher.mock.calls.at(-1)![0];
+      expect(upstream.headers.get("x-heel-internal-origin")).toBe("same-origin");
+      expect(upstream.headers.get("cookie")).toBe("heel_session=private");
+      expect(upstream.headers.get("authorization")).toBeNull();
     }
     expectNoFallback();
   });
