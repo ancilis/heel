@@ -112,6 +112,11 @@ it.
 6. **Authorize the target.** Under Add canary access, select the verified environment and the
    runner, then choose Authorize paired runner. The runner is fixed to the first environment it
    claims.
+
+   Before adding credentials, wait until `CLI runner status` shows a `binding_id` under `serve`,
+   which means the runner has claimed the authorized context. A credential add before then is
+   refused with `Heel runner credential could not be stored safely.` and stores nothing; run it
+   again once the `binding_id` appears.
 7. **Credentials.** Use isolated staging accounts only. Each command prompts
    `Canary credential:` with hidden input. Use `--backend secret-service` on Linux.
 
@@ -201,12 +206,16 @@ example.
 
 ## Recorded evidence and limits
 
-On 2026-11-13, one fresh preview account ran the steps above. It used a clean Linux container,
-the public [1.3.0rc5 release](https://github.com/ancilis/heel/releases/tag/v1.3.0rc5) and the
-browser, with the hosted build that includes
-[PR #94](https://github.com/ancilis/heel/pull/94). The target was a controlled synthetic staging
-app that Heel operates on the public network. This was not a customer target or customer
-acceptance.
+Two attempts are recorded on 2026-11-13. Each used a separate fresh preview account, a clean
+Linux container, the public
+[1.3.0rc5 release](https://github.com/ancilis/heel/releases/tag/v1.3.0rc5) and the browser. In
+both, the target was a controlled synthetic staging app that Heel operates on the public network.
+Neither is a customer target or customer acceptance, and neither promises how long your own
+setup will take.
+
+### First attempt: two checks
+
+It ran on the hosted build that includes [PR #94](https://github.com/ancilis/heel/pull/94).
 
 | Area | Recorded result |
 | --- | --- |
@@ -222,7 +231,7 @@ acceptance.
 Limits:
 
 - **Timing.** Time to the first finding was 1761.8 s (about 29.4 minutes), including the
-  17.4 s install. The 15-minute goal was **not** met.
+  17.4 s install. The 15-minute goal was **not** met in this attempt.
 - **Control-plane outage.** The timing includes a control-plane outage that recovered with its
   data intact. An automatic-restart recovery
   ([PR #95](https://github.com/ancilis/heel/pull/95)) has since been merged and deployed. In a
@@ -234,7 +243,26 @@ Limits:
   Stopping a run while it is in flight is not demonstrated.
 - **Scope of the evidence.** The two checks were exercised only as marker-backed checks over
   `GET` routes with the `bearer` profile.
-- **Preview.** No launch-readiness claim is made.
+
+### Second attempt: one timed check
+
+It ran on the corrected hosted service, in a new container.
+
+- **Check.** One check, `plan_entitlement_read`, with two `GET` requests and a binding frozen to
+  the library scenario `sc.flag.tiergate`.
+- **Timing.** The browser showed the observed entitlement finding 414.1 s (6 minutes 54 seconds)
+  after the start, install included. This is one recorded attempt with one check. It is not a
+  guaranteed time.
+- **Credential order.** Two credential adds made before the runner had claimed the context were
+  refused. The retries after the `binding_id` appeared succeeded.
+- **Regression.** The finding was saved as a regression. After the target was patched, the browser
+  showed the replay held (`blocked`): the higher-plan read answered 200 and the lower-plan read 403
+  with an empty body.
+- **Revocation.** The runner was then revoked from the dashboard. On the runner, `serve` then
+  exited with code 3, `runner_authentication_rejected`; a later `runner status` showed the
+  control plane as `rejected`, and no Heel process was left running.
+
+**Preview.** No launch-readiness claim is made.
 
 ## Feedback
 

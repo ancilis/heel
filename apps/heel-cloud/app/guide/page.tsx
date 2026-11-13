@@ -232,6 +232,13 @@ export default function Guide() {
               it claims. To move it to another one, pair a fresh runner. Authorization adds and reveals
               no credential.
             </p>
+            <p>
+              Before you add credentials, wait until <code>{CLI} runner status</code> shows a{" "}
+              <code>binding_id</code> under <code>serve</code>. That means the runner has claimed the
+              authorized context. A credential add before then is refused with{" "}
+              <code>Heel runner credential could not be stored safely.</code> and stores nothing; run it
+              again once the <code>binding_id</code> appears.
+            </p>
           </article>
 
           <article className="quickstart-card">
@@ -400,27 +407,45 @@ export default function Guide() {
             <p className="step-number">Evidence</p>
             <h2>What has been recorded, and its limits</h2>
             <p>
-              On November 13, 2026, one fresh preview account ran this workflow from a clean Linux
-              container with the public release and the browser. The target was a controlled synthetic
-              staging app that Heel operates on the public network. This is not a customer target or
-              customer acceptance. The workflow produced two observed findings, an authorization one
-              and an entitlement one. It also produced a redacted shared summary, two saved regressions
-              whose replays passed after the target was patched, a custom revision kept frozen on its
-              run after an edit and reload, and an inconclusive result for error envelopes. Requests
-              into another workspace were refused with 403 and into another project with 404. A run
-              kept local uploaded no summary bytes. The context and the runner were then revoked.
+              Two attempts are recorded on November 13, 2026. Each used a separate fresh preview
+              account, a clean Linux container, the public release and the browser. In both, the target
+              was a controlled synthetic staging app that Heel operates on the public network. Neither
+              is a customer target or customer acceptance, and neither promises how long your own
+              setup will take.
             </p>
             <p>
-              Time to the first finding was about 29.4 minutes, including install. That misses the
+              The first attempt exercised two checks. It produced two observed findings, an
+              authorization one and an entitlement one. It also produced a redacted shared summary, two
+              saved regressions whose replays passed after the target was patched, a custom revision
+              kept frozen on its run after an edit and reload, and an inconclusive result for error
+              envelopes. Requests into another workspace were refused with 403 and into another project
+              with 404. A run kept local uploaded no summary bytes. The context and the runner were then
+              revoked.
+            </p>
+            <p>
+              Its time to the first finding was about 29.4 minutes, including install. That missed the
               15-minute goal, and the time includes a control-plane outage that recovered with its data
               intact. An automatic-restart recovery for that outage has since been merged and deployed;
               in a controlled fault test it restarted with data preserved and was ready in about 12
-              seconds.
-              Separately, <code>serve</code> once stopped with <code>response_rejected</code> before a
-              run started: nothing was sent, and that run&apos;s quota was refunded. One restart of{" "}
-              <code>serve</code> recovered, and a fresh plan then ran. The cause is unknown. This is a
-              preview, and no launch-readiness claim is made.
+              seconds. Separately, <code>serve</code> once stopped with <code>response_rejected</code>{" "}
+              before a run started: nothing was sent, and that run&apos;s quota was refunded. One
+              restart of <code>serve</code> recovered, and a fresh plan then ran. The cause is unknown.
             </p>
+            <p>
+              The second attempt was timed on the corrected hosted service and a new container. It
+              exercised one check, <code>plan_entitlement_read</code>, with two <code>GET</code>{" "}
+              requests and a binding frozen to the library scenario <code>sc.flag.tiergate</code>. The
+              browser showed the observed entitlement finding 6 minutes 54 seconds (414.1 s) after the
+              start, install included. In that attempt, two credential adds made before the runner had
+              claimed the context were refused, and the retries after the <code>binding_id</code>{" "}
+              appeared succeeded. The finding was saved as a regression. After the target was patched,
+              the browser showed the replay held (<code>blocked</code>): the higher-plan read answered
+              200 and the lower-plan read 403 with an empty body. The runner was then revoked from the
+              dashboard. On the runner, <code>serve</code> then exited with code 3,{" "}
+              <code>runner_authentication_rejected</code>; a later <code>runner status</code> showed the
+              control plane as <code>rejected</code>, and no Heel process was left running.
+            </p>
+            <p>This is a preview, and no launch-readiness claim is made.</p>
           </article>
 
           <article className="quickstart-card">
