@@ -11,6 +11,7 @@ import time
 import pytest
 
 from heel.canary_contracts import canonical_bytes, canonical_digest
+from heel.review_contract import stable_json
 from heel.runner.catalog import CATALOG_IDS
 from heel.saas.catalog import CATALOG_VERSION
 from heel.saas.scenario_library import (
@@ -390,6 +391,43 @@ def test_later_edits_never_relabel_old_run(lib):
     assert status == 201 and body["bindings"][0]["revision"] == 2
     _, _, old = lib.request("GET", _bindings_path(lib, run_id), headers=lib.browser)
     assert old["bindings"] == frozen_rows
+
+
+def _freeze_wide_custom(fixture, scenario_id, objective):
+    definition = _definition(scenario_id, objective=objective)
+    assert len(stable_json(definition).encode("utf-8")) <= 4096
+    status, _, custom = _custom(fixture, definition, binding=_ack())
+    assert status == 201, custom
+    projection, run_id = _submit(fixture)
+    status, _, frozen = _freeze(fixture, run_id, projection["projection_digest"], [
+        _item(scenario_id, source="custom", digest=custom["definition_digest"])])
+    assert status == 201, frozen
+    conn = fixture.cp.store.conn
+    stored_display = conn.execute(
+        "SELECT CAST(display_json AS BLOB) FROM run_scenario_bindings WHERE run_id=?", (run_id,)).fetchone()[0]
+    assert len(stored_display) <= 2048
+    stored = conn.execute(
+        "SELECT revision, definition_digest, definition_json FROM workspace_custom_scenarios WHERE scenario_id=?",
+        (scenario_id,)).fetchone()
+    assert (stored[0], stored[1]) == (1, custom["definition_digest"])
+    assert json.loads(stored[2]) == definition
+    binding = frozen["bindings"][0]
+    assert (binding["revision"], binding["definition_digest"]) == (1, custom["definition_digest"])
+    shown = binding["display"]["objective"]
+    assert len(shown) <= 500 and len(json.dumps(shown, ensure_ascii=False).encode("utf-8")) - 2 <= 1024
+    assert shown.endswith("…") and objective.startswith(shown[:-1])
+    return shown
+
+
+def test_long_multibyte_custom_objective_binds_within_display_bound(lib):
+    shown = _freeze_wide_custom(lib, "sc.internal.wide", "\U0001F600" * 500)
+    assert set(shown[:-1]) == {"\U0001F600"} and len(shown[:-1].encode("utf-8")) == 1020
+
+
+def test_escape_heavy_custom_objective_binds_within_display_bound(lib):
+    # 500 raw bytes, but each control character is stored as a six-byte JSON escape.
+    shown = _freeze_wide_custom(lib, "sc.internal.escaped", "\x01" * 500)
+    assert shown[:-1] == "\x01" * 170
 
 
 def test_wrong_project_run_workspace_refused(lib):
