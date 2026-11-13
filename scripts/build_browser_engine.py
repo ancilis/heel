@@ -25,7 +25,9 @@ RECORD_PATH = f"{DIST_INFO}/RECORD"
 FIXED_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MODULE_PATHS = (
     "heel/__init__.py",
+    "heel/browser_assess.py",
     "heel/browser_review.py",
+    "heel/contracts.py",
     "heel/findings_sync.py",
     "heel/openapi_model.py",
     "heel/product_model.py",
@@ -33,6 +35,7 @@ MODULE_PATHS = (
     "heel/review_contract.py",
     "heel/review_rules.py",
     "heel/review_service.py",
+    "heel/semantic.py",
     "heel/static_review.py",
 )
 # This is a trusted-source capability policy for the reviewed browser closure,
@@ -51,7 +54,10 @@ REVIEWED_MODULE_ATTRIBUTES = {
 REVIEWED_FROM_IMPORTS = {
     (0, "__future__"): frozenset({"annotations"}),
     (0, "dataclasses"): frozenset({"dataclass", "field"}),
-    (0, "typing"): frozenset({"Any", "Mapping"}),
+    (0, "enum"): frozenset({"Enum"}),
+    (0, "typing"): frozenset({"Any", "Mapping", "Optional"}),
+    (1, "browser_review"): frozenset({"BrowserReviewError", "review_openapi_json"}),
+    (1, "contracts"): frozenset({"Affordance", "Category"}),
     (1, "openapi_model"): frozenset({
         "OpenAPIImportError",
         "QUESTION_PROMPTS",
@@ -70,6 +76,7 @@ REVIEWED_FROM_IMPORTS = {
         "parse_review_answers",
     }),
     (1, "review_contract"): frozenset({
+        "ENGINE_VERSION",
         "build_review_envelope",
         "stable_json",
         "stable_json_hash",
@@ -77,6 +84,7 @@ REVIEWED_FROM_IMPORTS = {
     }),
     (1, "review_rules"): frozenset({"is_broad_scope"}),
     (1, "review_service"): frozenset({"review_openapi"}),
+    (1, "semantic"): frozenset({"semantic_specificity"}),
     (1, "static_review"): frozenset({"review_product_models"}),
 }
 # Bare calls have no ambient authority: only these closure-derived builtins,
@@ -94,7 +102,9 @@ REVIEWED_BUILTIN_CALLS = frozenset({
     "isinstance",
     "len",
     "list",
+    "max",
     "ord",
+    "round",
     "set",
     "sorted",
     "str",
@@ -108,6 +118,18 @@ REVIEWED_BUILTIN_CALLS = frozenset({
 # call-result, conditional, and every other indirect call target are rejected.
 REVIEWED_DATA_METHOD_CALLS = {
     "__init__": frozenset(),
+    "browser_assess": frozenset({
+        "add",
+        "append",
+        "encode",
+        "get",
+        "hexdigest",
+        "items",
+        "join",
+        "lower",
+        "strip",
+        "values",
+    }),
     "browser_review": frozenset({
         "append",
         "encode",
@@ -116,6 +138,7 @@ REVIEWED_DATA_METHOD_CALLS = {
         "lower",
         "pop",
     }),
+    "contracts": frozenset(),
     "findings_sync": frozenset({
         "add",
         "append",
@@ -182,6 +205,15 @@ REVIEWED_DATA_METHOD_CALLS = {
     }),
     "review_rules": frozenset({"lower", "strip"}),
     "review_service": frozenset({"append", "get", "to_dict", "update"}),
+    "semantic": frozenset({
+        "get",
+        "items",
+        "join",
+        "lower",
+        "replace",
+        "split",
+        "strip",
+    }),
     "static_review": frozenset({
         "add",
         "append",
@@ -659,7 +691,7 @@ def _prove_import_closure() -> None:
         _module_name(path)
         for path in MODULE_PATHS
     }
-    pending = ["__init__", "browser_review", "findings_sync"]
+    pending = ["__init__", "browser_assess", "browser_review", "findings_sync"]
     observed: set[str] = set()
     observed_builtin_calls: set[str] = set()
     while pending:
