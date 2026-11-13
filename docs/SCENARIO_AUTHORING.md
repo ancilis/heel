@@ -184,3 +184,36 @@ Every authored scenario must state canary-only containment limits:
 
 The cap must be a small integer. Heel validation is offline and Heel execution remains
 bounded by signed scopes, run budgets, audit logging, and canary data handling.
+
+## Workspace Custom Scenarios
+
+Signed-in workspaces can save custom scenarios in Heel Cloud without touching the shared pack
+files. These rules hold:
+
+- **Workspace-private.** A custom scenario is visible only to members of its workspace. Another
+  workspace cannot list, read, bind or assess it. Heel never writes customer definitions into
+  `heel/scenarios_lib` or any package data.
+- **Validated and revisioned.** Every save runs the same `validate_scenario` checks described above
+  (investigation signals included) and must use the `sc.community.` or `sc.internal.` namespace; a
+  shared library identifier cannot be claimed. Each save creates a new immutable revision with its
+  own definition digest. A new revision must name the current revision it supersedes; earlier
+  revisions are never edited or deleted.
+- **Analysis-only unless explicitly bound.** A custom criterion is never executed. A revision is
+  runner-supported only when its author chooses one closed launch check
+  (`anonymous_authenticated_read` or `plan_entitlement_read`) and confirms the fixed statement
+  exactly: "Executed check: <check> (<methods>, roles <roles>). The custom objective and its
+  criterion are not executed; they are analysis-only." The scenario `kind` may suggest a check
+  but never binds one. Runner prerequisites remain the catalog check's methods, roles and statuses,
+  `heel runner import-openapi`, `heel runner credential add --role …`,
+  `heel runner map --scenario …`, and a `protected_canary` positive-control fixture.
+- **Bindings freeze at approval.** Before approving a signed rehearsal plan, an owner or admin may
+  bind library or custom revisions to the plan's literal actions. Bindings are accepted only while
+  the approval is awaiting and unexpired, are written once, and record the plan and manifest
+  digests plus the revision digest. Later library or custom edits never relabel an earlier run; a
+  rehearsal result says what it stands for only when the action and both plan digests match.
+- **Static assessment stays in the browser.** "Assess statically in this browser" evaluates only
+  the selected definitions against the customer's own OpenAPI document after any review answers.
+  A criterion that depends on a property absent from that model stays unknown (it is never turned
+  into a finding), declared and inferred provenance stay separate, and "no matching surface" is not
+  evidence of absence. Nothing is executed against the product and nothing is uploaded.
+
