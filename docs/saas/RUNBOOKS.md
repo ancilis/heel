@@ -140,6 +140,41 @@ WAL database.
 5. If readiness remains unhealthy, restore the latest verified backup to a new
    volume; preserve the failed volume for investigation.
 
+### Bounded automatic recovery after reaper lock exhaustion
+
+A transient disk sync stall can hold the SQLite writer lock long enough for the canary
+reaper to fail three consecutive cycles (`canary_reaper_cycle_skipped`, then
+`canary_reaper_died`). The node first fails closed. It sets draining, so `/v1/readyz`
+returns 503 and new requests return 503. WAL `synchronous=FULL` and the reaper thresholds are
+unchanged.
+
+- **Automatic recovery.** This applies only when the death is a genuine SQLite BUSY/LOCKED
+  result code. The process records one entry in `<database>.recovery.json`, which is written
+  atomically and fsynced beside the database. It logs `control_plane_recovery_exit` and then
+  takes the ordinary SIGTERM shutdown path, which drains accepted requests, joins workers,
+  checkpoints, closes, and releases the lock. It exits with code 75. The existing Compose
+  `restart: unless-stopped` policy then restarts the same image on the same volume. No backup is
+  restored and no rows change. `cloudflared` is not touched, so a fence stays fenced.
+- **Budget.** At most 3 automatic exits per hour. When the budget is exhausted, or the budget
+  file is malformed, symlinked, oversized or unwritable, or any `<database>.recovery.json.tmp`
+  staging path already exists (it is never truncated, adopted or removed), the process logs
+  `control_plane_recovery_budget_exhausted` with a `reason` and **stays draining**. It needs an
+  operator.
+- **Not covered.** Any other reaper failure, a host-authority death, or a worker that does not
+  join keeps the existing permanent draining or retained ownership. Note the pre-existing
+  Compose behavior: `unless-stopped` restarts *any* non-zero process exit, including startup
+  configuration, migration or secret failures. Diagnose those from the startup log; this
+  recovery adds no exit on those paths.
+- **Diagnose.** Run `hc logs --tail=200 control-plane`. Look for
+  `canary_reaper_cycle_skipped`, `canary_reaper_died`, and `control_plane_recovery_*`. Then
+  check `docker inspect -f '{{.RestartCount}}'` on the control-plane container.
+- **Hold for investigation.** Run `hc stop control-plane`. Docker never restarts a manually
+  stopped container, and a SIGTERM shutdown never writes a budget entry.
+- **Rollback.** Use the same schema on the same volume only, and redeploy the recorded previous
+  image. **Retain `<database>.recovery.json` and all evidence.** Older images ignore the file.
+  Never delete it, and never reset the counter to force another automatic cycle. Never restore an
+  older backup after customer writes.
+
 ## Secret rotation
 
 - **Edge-auth secret:** stop `cloudflared` (`hc stop cloudflared`); generate a new

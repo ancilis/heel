@@ -4,8 +4,12 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -611,6 +615,467 @@ class ProductionConfigurationTests(unittest.TestCase):
             "        run: npm run build"
         )
         self.assertIn(production_build, workflow)
+
+
+
+def _real_lock_error() -> sqlite3.OperationalError:
+    """A genuine SQLITE_BUSY from two connections, exactly as the reaper's BEGIN IMMEDIATE sees it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "busy.sqlite3")
+        holder = sqlite3.connect(path)
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("BEGIN IMMEDIATE")
+        waiter = sqlite3.connect(path)
+        waiter.execute("PRAGMA busy_timeout=0")
+        try:
+            waiter.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            return error
+        finally:
+            waiter.close()
+            holder.rollback()
+            holder.close()
+    raise AssertionError("expected SQLITE_BUSY")
+
+
+class _RecoveryReaperDouble:
+    """Production reaper seam: start, unexpected death callback, bounded stop/join result."""
+
+    instances: list = []
+    stop_result = True
+
+    def __init__(self, _path, *, on_unexpected_death, **_kwargs):
+        self.on_unexpected_death = on_unexpected_death
+        self.alive = False
+        self.thread = threading.Thread(target=lambda: None, daemon=False)
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def start(self):
+        self.alive = True
+
+    def die(self, error):
+        self.alive = False
+        self.on_unexpected_death(error)
+
+    def stop(self, *, timeout=5):
+        self.stopped = True
+        self.alive = False
+        return type(self).stop_result
+
+
+class ReaperLockRecoveryTests(unittest.TestCase):
+    valid_environment = ProductionConfigurationTests.valid_environment
+
+    def setUp(self):
+        _RecoveryReaperDouble.instances = []
+        _RecoveryReaperDouble.stop_result = True
+
+    def budget_path(self, root: Path) -> Path:
+        return root / "heel.sqlite3.recovery.json"
+
+    def write_budget(self, root: Path, exits_at) -> bytes:
+        raw = json.dumps({
+            "schema_version": "heel.control-plane-recovery-budget.v1", "exits_at": exits_at,
+        }, separators=(",", ":")).encode()
+        self.budget_path(root).write_bytes(raw)
+        return raw
+
+    def run_main(self, root: Path):
+        """Run the real ``main()`` on a worker thread with captured signal handlers."""
+        from heel.saas import server as server_module
+
+        handlers: dict = {}
+        built: dict = {}
+        outcome: dict = {}
+        original_build = server_module.build_server
+
+        def capture_build(config):
+            built["server"] = original_build(config)
+            return built["server"]
+
+        def run():
+            try:
+                outcome["code"] = server_module.main()
+            except BaseException as error:  # noqa: BLE001 - asserted by the caller
+                outcome["error"] = error
+
+        patches = [
+            mock.patch.dict("os.environ", self.valid_environment(root), clear=True),
+            mock.patch("heel.saas.server.CanaryReaper", _RecoveryReaperDouble),
+            mock.patch("heel.saas.server.build_server", capture_build),
+            mock.patch("heel.saas.server.signal.signal", lambda sig, handler: handlers.__setitem__(sig, handler)),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        for _ in range(500):
+            if "server" in built and handlers:
+                break
+            thread.join(0.01)
+        self.assertIn("server", built, outcome)
+        return built["server"], thread, outcome, handlers
+
+    def readyz(self, server) -> int:
+        connection = http.client.HTTPConnection(*server.server_address[:2], timeout=5)
+        connection.request("GET", "/v1/readyz")
+        status = connection.getresponse().status
+        connection.close()
+        return status
+
+    def test_only_sqlite_busy_or_locked_primary_codes_are_recovery_eligible(self):
+        from heel.saas.server import _is_reaper_lock_exhaustion
+
+        real = _real_lock_error()
+        self.assertEqual(real.sqlite_errorcode & 0xFF, sqlite3.SQLITE_BUSY)
+        self.assertTrue(_is_reaper_lock_exhaustion(real))
+        for code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, 261, 517, 262):
+            error = sqlite3.OperationalError("opaque")
+            error.sqlite_errorcode = code
+            self.assertTrue(_is_reaper_lock_exhaustion(error), code)
+        # Message text alone never qualifies; neither do other codes or other exception types.
+        message_only = sqlite3.OperationalError("database is locked")
+        no_table = sqlite3.OperationalError("no such table: canary_runs")
+        no_table.sqlite_errorcode = sqlite3.SQLITE_ERROR
+        bool_code = sqlite3.OperationalError("database is locked")
+        bool_code.sqlite_errorcode = True
+        integrity = sqlite3.DatabaseError("database is locked")
+        integrity.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        for error in (message_only, no_table, bool_code, integrity,
+                      RuntimeError("database is locked"), TimeoutError("busy")):
+            self.assertFalse(_is_reaper_lock_exhaustion(error), repr(error))
+
+    def test_lock_exhaustion_persists_budget_then_gracefully_exits_75_after_inflight_drain(self):
+        from heel.saas import http_api
+        from heel.saas.server import ProductionConfigurationError, _SingleProcessDatabaseLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            entered, release = threading.Event(), threading.Event()
+            original_readyz = http_api._Handler._readyz
+
+            def held_readyz(handler):
+                entered.set()
+                release.wait(5)
+                return original_readyz(handler)
+
+            with mock.patch.object(http_api._Handler, "_readyz", held_readyz):
+                server, thread, outcome, _ = self.run_main(root)
+                inflight: dict = {}
+                request = threading.Thread(target=lambda: inflight.__setitem__("status", self.readyz(server)))
+                request.start()
+                self.assertTrue(entered.wait(5))
+                with self.assertLogs("heel.saas.control_plane", "INFO") as logs:
+                    _RecoveryReaperDouble.instances[0].die(_real_lock_error())
+                # The counter is durable before any shutdown work starts.
+                budget = json.loads(self.budget_path(root).read_text())
+                self.assertEqual(budget["schema_version"], "heel.control-plane-recovery-budget.v1")
+                self.assertEqual(len(budget["exits_at"]), 1)
+                self.assertEqual(self.budget_path(root).stat().st_mode & 0o777, 0o600)
+                self.assertTrue(server.control_plane.draining)
+                self.assertFalse(server.reaper_ready)
+                # While the accepted request is active, nothing is closed and ownership is held.
+                thread.join(0.5)
+                self.assertTrue(thread.is_alive())
+                server.control_plane.store.conn.execute("SELECT 1")
+                with self.assertRaises(ProductionConfigurationError):
+                    _SingleProcessDatabaseLock.acquire(str(root / "heel.sqlite3"))
+                release.set()
+                request.join(5)
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(outcome, {"code": 75})
+            self.assertEqual(inflight["status"], 503)
+            self.assertTrue(_RecoveryReaperDouble.instances[0].stopped)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                server.control_plane.store.conn.execute("SELECT 1")
+            _SingleProcessDatabaseLock.acquire(str(root / "heel.sqlite3")).close()
+            events = [json.loads(line.split(":", 2)[2]) for line in logs.output]
+            recovery = [event for event in events if event.get("event") == "control_plane_recovery_exit"]
+            self.assertEqual(recovery, [{
+                "attempt": 1, "budget": 3, "event": "control_plane_recovery_exit", "window_seconds": 3600,
+            }])
+            self.assertNotIn(str(root), "\n".join(logs.output))
+
+    def test_exhausted_budget_keeps_fail_closed_draining_without_exit_or_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            now = 1_800_000_000
+            raw = self.write_budget(root, [now - 3599, now - 60, now - 1])
+            with mock.patch("heel.saas.server._recovery_now", return_value=now):
+                server, thread, outcome, handlers = self.run_main(root)
+                with self.assertLogs("heel.saas.control_plane", "INFO") as logs:
+                    _RecoveryReaperDouble.instances[0].die(_real_lock_error())
+                thread.join(0.5)
+                self.assertTrue(thread.is_alive())
+                self.assertEqual(self.readyz(server), 503)
+                self.assertEqual(self.budget_path(root).read_bytes(), raw)
+                self.assertIn('"event":"control_plane_recovery_budget_exhausted"', "\n".join(logs.output))
+                self.assertIn('"reason":"budget_exhausted"', "\n".join(logs.output))
+                handlers[next(iter(handlers))](15, None)
+                thread.join(10)
+            self.assertEqual(outcome, {"code": 0})
+            self.assertEqual(self.budget_path(root).read_bytes(), raw)
+
+    def test_budget_window_boundary_prunes_old_and_conservatively_counts_future_entries(self):
+        from heel.saas.server import _RecoveryBudget
+
+        now = 1_800_000_000
+        cases = [
+            ([now - 3600, now - 7200, now - 3601], True, 1),   # exactly one window old is expired
+            ([now - 3599, now - 10], True, 3),
+            ([now + 600, now - 10, now - 3599], False, 3),     # a future entry still counts
+            ([now + 10 ** 6, now + 1, now + 2], False, 3),
+        ]
+        for exits, allowed, count in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve(strict=True)
+                raw = self.write_budget(root, exits)
+                budget = _RecoveryBudget(str(root / "heel.sqlite3"))
+                result = budget.consume(now)
+                self.assertEqual((result.allowed, result.exits_in_window), (allowed, count), exits)
+                stored = self.budget_path(root).read_bytes()
+                if allowed:
+                    self.assertEqual(json.loads(stored)["exits_at"][-1], now)
+                    self.assertTrue(all(value > now - 3600 for value in json.loads(stored)["exits_at"]))
+                else:
+                    self.assertEqual(stored, raw)
+
+    def test_malformed_symlinked_oversized_or_unwritable_budget_fails_closed(self):
+        from heel.saas.server import _RecoveryBudget
+
+        now = 1_800_000_000
+        valid = {"schema_version": "heel.control-plane-recovery-budget.v1", "exits_at": []}
+        payloads = [
+            b"not json", b"[]", b"\xff\xfe", json.dumps({**valid, "extra": 1}).encode(),
+            json.dumps({**valid, "schema_version": "v0"}).encode(),
+            json.dumps({**valid, "exits_at": [True]}).encode(),
+            json.dumps({**valid, "exits_at": [-1]}).encode(),
+            json.dumps({**valid, "exits_at": [1.5]}).encode(),
+            json.dumps({**valid, "exits_at": [1, 2, 3, 4]}).encode(),
+            json.dumps({**valid, "exits_at": "1"}).encode(),
+            b" " * 4097,
+        ]
+        for payload in payloads:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve(strict=True)
+                self.budget_path(root).write_bytes(payload)
+                result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
+                self.assertEqual((result.allowed, result.reason), (False, "budget_unreadable"), payload[:40])
+                self.assertEqual(self.budget_path(root).read_bytes(), payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            target = root / "elsewhere.json"
+            target.write_text(json.dumps(valid))
+            self.budget_path(root).symlink_to(target)
+            self.assertFalse(_RecoveryBudget(str(root / "heel.sqlite3")).consume(now).allowed)
+            self.assertEqual(json.loads(target.read_text()), valid)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            self.budget_path(root).mkdir()
+            self.assertFalse(_RecoveryBudget(str(root / "heel.sqlite3")).consume(now).allowed)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            # The staging file cannot be created: the durable counter cannot be persisted.
+            Path(str(self.budget_path(root)) + ".tmp").mkdir()
+            result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
+            self.assertEqual((result.allowed, result.reason), (False, "budget_unwritable"))
+            self.assertFalse(self.budget_path(root).exists())
+
+    def test_preexisting_staging_path_is_never_truncated_adopted_or_removed(self):
+        from heel.saas.server import _RecoveryBudget
+
+        now = 1_800_000_000
+        victim_bytes = b"unrelated synthetic victim\n" * 4
+        for kind in ("hardlink", "regular", "symlink"):
+            for budget_present in (False, True):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp).resolve(strict=True)
+                    staging = Path(str(self.budget_path(root)) + ".tmp")
+                    victim = root / "victim.bin"
+                    victim.write_bytes(victim_bytes)
+                    raw = self.write_budget(root, [now - 10]) if budget_present else None
+                    if kind == "hardlink":
+                        os.link(victim, staging)
+                    elif kind == "regular":
+                        staging.write_bytes(b"leftover")
+                    else:
+                        staging.symlink_to(victim)
+                    before = os.lstat(staging)
+                    result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
+                    label = (kind, budget_present)
+                    self.assertEqual((result.allowed, result.reason), (False, "budget_unwritable"), label)
+                    self.assertEqual(victim.read_bytes(), victim_bytes, label)
+                    after = os.lstat(staging)
+                    self.assertEqual((after.st_ino, after.st_mode, after.st_size),
+                                     (before.st_ino, before.st_mode, before.st_size), label)
+                    if kind == "regular":
+                        self.assertEqual(staging.read_bytes(), b"leftover")
+                    if budget_present:
+                        self.assertEqual(self.budget_path(root).read_bytes(), raw, label)
+                    else:
+                        self.assertFalse(self.budget_path(root).exists(), label)
+        with tempfile.TemporaryDirectory() as tmp:
+            # A hardlinked budget file is existing counter corruption: refused, never rewritten.
+            root = Path(tmp).resolve(strict=True)
+            raw = self.write_budget(root, [])
+            os.link(self.budget_path(root), root / "victim.bin")
+            result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
+            self.assertEqual((result.allowed, result.reason), (False, "budget_unreadable"))
+            self.assertEqual((root / "victim.bin").read_bytes(), raw)
+
+    def test_exclusive_staging_keeps_three_durable_exits_then_exhausts(self):
+        from heel.saas.server import _RecoveryBudget
+
+        now = 1_800_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            staging = Path(str(self.budget_path(root)) + ".tmp")
+            for attempt in range(3):
+                result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now + attempt)
+                self.assertEqual((result.allowed, result.exits_in_window), (True, attempt + 1))
+                self.assertFalse(os.path.lexists(staging))
+                metadata = os.stat(self.budget_path(root))
+                self.assertEqual((metadata.st_mode & 0o777, metadata.st_nlink), (0o600, 1))
+            raw = self.budget_path(root).read_bytes()
+            self.assertEqual(json.loads(raw)["exits_at"], [now, now + 1, now + 2])
+            result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now + 3)
+            self.assertEqual((result.allowed, result.reason), (False, "budget_exhausted"))
+            self.assertEqual(self.budget_path(root).read_bytes(), raw)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX-only")
+    def test_fifo_budget_or_staging_path_is_refused_promptly_in_a_bounded_subprocess(self):
+        # A blocking open on a FIFO would hang; run in a child process so a regression is detected
+        # by the timeout and the child is killed, never leaving a stuck thread in this process.
+        probe = (
+            "import json, sys\n"
+            "from heel.saas.server import _RecoveryBudget\n"
+            "result = _RecoveryBudget(sys.argv[1]).consume(1800000000)\n"
+            "print(json.dumps([result.allowed, result.reason]))\n"
+        )
+        repository = str(Path(__file__).resolve().parents[1])
+        for fifo_at, expected in ((".recovery.json", "budget_unreadable"),
+                                  (".recovery.json.tmp", "budget_unwritable")):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve(strict=True)
+                fifo = Path(str(root / "heel.sqlite3") + fifo_at)
+                os.mkfifo(fifo, 0o600)
+                try:
+                    completed = subprocess.run(
+                        [sys.executable, "-c", probe, str(root / "heel.sqlite3")],
+                        cwd=repository, capture_output=True, text=True, timeout=5,
+                        env={**os.environ, "PYTHONPATH": repository},
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail(f"consume() blocked on a FIFO at {fifo_at}")
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout), [False, expected], fifo_at)
+                self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode), fifo_at)
+                if fifo_at.endswith(".tmp"):
+                    self.assertFalse(self.budget_path(root).exists())
+
+    def test_unwritable_budget_keeps_draining_and_does_not_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            Path(str(self.budget_path(root)) + ".tmp").mkdir()
+            server, thread, outcome, handlers = self.run_main(root)
+            _RecoveryReaperDouble.instances[0].die(_real_lock_error())
+            thread.join(0.5)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(self.readyz(server), 503)
+            self.assertFalse(self.budget_path(root).exists())
+            handlers[next(iter(handlers))](15, None)
+            thread.join(10)
+            self.assertEqual(outcome, {"code": 0})
+
+    def test_non_lock_reaper_death_keeps_existing_permanent_draining(self):
+        no_table = sqlite3.OperationalError("no such table: canary_runs")
+        no_table.sqlite_errorcode = sqlite3.SQLITE_ERROR
+        for error in (RuntimeError("runner context purge readiness lost serialization"), no_table,
+                      sqlite3.OperationalError("database is locked")):
+            with self.subTest(error=repr(error)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve(strict=True)
+                server, thread, outcome, handlers = self.run_main(root)
+                _RecoveryReaperDouble.instances[-1].die(error)
+                thread.join(0.5)
+                self.assertTrue(thread.is_alive())
+                self.assertTrue(server.control_plane.draining)
+                self.assertIs(server.reaper_failure, error)
+                self.assertEqual(self.readyz(server), 503)
+                self.assertFalse(self.budget_path(root).exists())
+                handlers[next(iter(handlers))](15, None)
+                thread.join(10)
+                self.assertEqual(outcome, {"code": 0})
+
+    def test_manual_sigterm_is_never_an_automatic_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            server, thread, outcome, handlers = self.run_main(root)
+            self.assertEqual(self.readyz(server), 200)
+            handlers[next(iter(handlers))](15, None)
+            thread.join(10)
+            self.assertEqual(outcome, {"code": 0})
+            self.assertFalse(self.budget_path(root).exists())
+            self.assertEqual(server.exit_code, 0)
+
+    def test_worker_that_does_not_join_retains_ownership_and_never_exits_75(self):
+        from heel.saas.canary_reaper import CanaryReaperError
+        from heel.saas.server import ProductionConfigurationError, _SingleProcessDatabaseLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            server, thread, outcome, _ = self.run_main(root)
+            _RecoveryReaperDouble.stop_result = False
+            _RecoveryReaperDouble.instances[0].die(_real_lock_error())
+            thread.join(10)
+            self.assertIsInstance(outcome.get("error"), CanaryReaperError)
+            self.assertNotIn("code", outcome)
+            server.control_plane.store.conn.execute("SELECT 1")
+            with self.assertRaises(ProductionConfigurationError):
+                _SingleProcessDatabaseLock.acquire(str(root / "heel.sqlite3"))
+
+    def test_recovery_restart_preserves_nonces_revocations_and_kill_switch(self):
+        from canary_test_support import seed_authority
+        from heel.saas.ops import KillSwitchTripped
+        from heel.saas.server import ProductionConfiguration, build_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            server, thread, outcome, _ = self.run_main(root)
+            cp = server.control_plane
+            user = cp.store.create_user("owner@example.com")
+            workspace = cp.store.create_workspace(cp.store.create_org("o"), "default", "free", CATALOG_VERSION)
+            cp.store.add_member(workspace, user, Role.OWNER)
+            revoked = cp.auth.create_session(user)
+            cp.auth.revoke_session(revoked.token)
+            project = cp.projects.create(workspace, "p", created_by=user).project_ref
+            seed_authority(cp.store.conn, workspace_id=workspace, project_ref=project)
+            cp.store.conn.execute(
+                "INSERT INTO canary_runner_nonce_chains VALUES(?,?,?,?,?,?)",
+                (workspace, "runr_canary", "claim", "a" * 64, 7, 4_000_000_000),
+            )
+            cp.store.conn.commit()
+            cp.ops.trip("global", actor=user, reason="incident")
+            tables = ("sessions", "kill_switches", "canary_runner_nonce_chains", "canary_runner_keys",
+                      "canary_runners", "canary_environments")
+            dump = lambda conn: {t: sorted(map(tuple, conn.execute(f"SELECT * FROM {t}").fetchall())) for t in tables}
+            before = dump(cp.store.conn)
+            _RecoveryReaperDouble.instances[0].die(_real_lock_error())
+            thread.join(10)
+            self.assertEqual(outcome, {"code": 75})
+            budget = self.budget_path(root).read_bytes()
+            restarted = build_server(ProductionConfiguration.from_environment(self.valid_environment(root)))
+            try:
+                self.assertTrue(restarted.reaper_ready)
+                self.assertEqual(dump(restarted.control_plane.store.conn), before)
+                with self.assertRaises(KillSwitchTripped):
+                    restarted.control_plane.ops.check(workspace)
+                self.assertIsNone(restarted.control_plane.auth.resolve_session(revoked.token))
+                self.assertEqual(self.budget_path(root).read_bytes(), budget)
+            finally:
+                restarted.server_close()
 
 
 if __name__ == "__main__":
