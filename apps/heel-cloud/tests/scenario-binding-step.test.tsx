@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApprovalDialog } from "../components/canary/ApprovalDialog";
 import { BOUND_OBJECTIVE_CAVEAT, FindingsCard } from "../components/canary/FindingsCard";
 import { ScenarioBindingStep } from "../components/canary/ScenarioBindingStep";
+import { CanaryApi } from "../lib/canary-api";
 import type {
   CanaryFindingsProjection,
   FrozenScenarioBinding,
@@ -107,6 +108,75 @@ describe("scenario binding step", () => {
     rerender(<ScenarioBindingStep accepting={false} actions={[]} busy={false} entries={ENTRIES} frozen={[]} onFreeze={onFreeze} />);
     expect(screen.getByText("Bindings can no longer be frozen for this run.")).toBeTruthy();
     expect(onFreeze).not.toHaveBeenCalled();
+  });
+
+  test("a four-action role-observation plan shows each check once and freezes through the real client", async () => {
+    // Faithful public runner plan: two signed checks, each observed under two roles, so the bindings
+    // view carries every (check, method, route) tuple twice. Roles are not part of the tuple.
+    const workspace = "ws_0123456789abcdef";
+    const project = "prj_0123456789abcdef0123456789abcdef";
+    const run = "crun_0123456789abcdef0123456789abcdef";
+    const projection = "b".repeat(64);
+    const auth = { catalog_scenario_id: "anonymous_authenticated_read", method: "GET", route_template: "/api/auth-records/{id}" };
+    const plan = { catalog_scenario_id: "plan_entitlement_read", method: "GET", route_template: "/api/exports/{id}" };
+    const viewBody = (bindings: unknown[]) => ({
+      schema_version: "heel.run-scenario-bindings-view.v1", run_id: run, approval_id: "ap_canary",
+      projection_digest: projection, manifest_digest: "c".repeat(64), accepting_bindings: true,
+      actions: [auth, auth, plan, plan], bindings, library_digest: "f".repeat(64),
+    });
+    const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
+    const posted: unknown[] = [];
+    // Mirrors the server contract: exact item keys, unique library ids, tuple must be in the plan's tuple set.
+    const api = new CanaryApi({ transport: async (_path, init) => {
+      if (init.method === "GET") return json(viewBody([]));
+      const body = JSON.parse(String(init.body)) as { items: Array<Record<string, unknown>> };
+      posted.push(body);
+      const tuples = new Set([auth, plan].map((a) => `${a.catalog_scenario_id} ${a.method} ${a.route_template}`));
+      const ids = body.items.map((item) => item.library_scenario_id);
+      if (new Set(ids).size !== ids.length
+        || !body.items.every((item) => tuples.has(`${item.catalog_scenario_id} ${item.method} ${item.route_template}`))) {
+        return json({ schema_version: "heel.scenario-library-error.v1", code: "invalid_binding_request" }, 400);
+      }
+      return json(viewBody(body.items.map((item) => ({
+        catalog_scenario_id: item.catalog_scenario_id, method: item.method, route_template: item.route_template,
+        library_scenario_id: item.library_scenario_id, source: item.source, revision: null,
+        definition_digest: item.definition_digest, library_digest: "f".repeat(64), binding_version: 1,
+        approval_id: "ap_canary", projection_digest: projection, manifest_digest: "c".repeat(64),
+        display: { objective: "Objective", mechanism_id: "m", pack: "core_saas", coverage_statement: "Executed check: x" },
+        bound_at_ms: 1,
+      }))), 201);
+    } });
+    const view = await api.getRunScenarioBindings(workspace, project, run);
+    expect(view.actions).toHaveLength(4);
+    const results: Array<Promise<unknown>> = [];
+    render(<ScenarioBindingStep accepting actions={view.actions} busy={false} entries={ENTRIES} frozen={[]}
+      onFreeze={(items) => { results.push(api.freezeRunScenarioBindings(workspace, project, run, projection, items)); }} />);
+    const authList = screen.getAllByRole("list", { name: "Entries for anonymous_authenticated_read GET /api/auth-records/{id}" });
+    const planList = screen.getAllByRole("list", { name: "Entries for plan_entitlement_read GET /api/exports/{id}" });
+    expect(authList).toHaveLength(1);
+    expect(planList).toHaveLength(1);
+    fireEvent.click(within(authList[0]).getAllByRole("checkbox")[0]);
+    fireEvent.click(within(planList[0]).getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Freeze bindings" }));
+    expect(results).toHaveLength(1);
+    const frozen = await results[0] as Awaited<ReturnType<CanaryApi["freezeRunScenarioBindings"]>>;
+    expect(posted).toEqual([{ schema_version: "heel.run-scenario-bindings.v1", projection_digest: projection, items: [
+      { binding_version: 1, catalog_scenario_id: "anonymous_authenticated_read", definition_digest: DIGEST,
+        library_scenario_id: "sc.endpoint.hidden", method: "GET", route_template: "/api/auth-records/{id}", source: "library" },
+      { binding_version: 1, catalog_scenario_id: "plan_entitlement_read", definition_digest: DIGEST,
+        library_scenario_id: "sc.flag.tiergate", method: "GET", route_template: "/api/exports/{id}", source: "library" },
+    ] }]);
+    expect(frozen.bindings.map((row) => [row.libraryScenarioId, row.catalogScenarioId, row.method, row.routeTemplate])).toEqual([
+      ["sc.endpoint.hidden", "anonymous_authenticated_read", "GET", "/api/auth-records/{id}"],
+      ["sc.flag.tiergate", "plan_entitlement_read", "GET", "/api/exports/{id}"],
+    ]);
+    // Hostile duplicates are still refused by the client before any request leaves the browser.
+    const unsent = vi.fn();
+    const local = new CanaryApi({ transport: unsent });
+    const duplicate = { catalogScenarioId: "anonymous_authenticated_read", method: "GET" as const, routeTemplate: "/api/auth-records/{id}",
+      libraryScenarioId: "sc.endpoint.hidden", source: "library" as const, definitionDigest: DIGEST };
+    await expect(local.freezeRunScenarioBindings(workspace, project, run, projection, [duplicate, duplicate])).rejects.toMatchObject({ code: "invalid_request" });
+    expect(unsent).not.toHaveBeenCalled();
   });
 
   test("approval stays enabled without bindings and never depends on the binding step", () => {
