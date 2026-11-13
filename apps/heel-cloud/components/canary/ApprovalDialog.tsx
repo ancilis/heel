@@ -4,6 +4,8 @@
 
 import { useState } from "react";
 
+import { ScenarioBindingStep, type ScenarioBindingStepProps } from "./ScenarioBindingStep";
+
 
 export interface ApprovalDialogProps {
   open: boolean;
@@ -15,6 +17,8 @@ export interface ApprovalDialogProps {
   egress: string;
   onApprove: (reason: string) => void;
   onClose: () => void;
+  /** Optional selection-provenance step; approval never depends on it. */
+  scenarioBinding?: ScenarioBindingStepProps;
 }
 
 
@@ -28,6 +32,7 @@ export function ApprovalDialog({
   egress,
   onApprove,
   onClose,
+  scenarioBinding,
 }: ApprovalDialogProps) {
   const [hostname, setHostname] = useState("");
   const [reason, setReason] = useState("");
@@ -67,6 +72,8 @@ export function ApprovalDialog({
             <div><span>Scenarios</span><ul>{scenarios.map((scenario) => <li key={scenario}>{scenario}</li>)}</ul></div>
           </div>
         </fieldset>
+
+        {scenarioBinding ? <ScenarioBindingStep {...scenarioBinding} /> : null}
 
         <div className="approval-fields">
           <label>
