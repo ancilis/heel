@@ -14,11 +14,14 @@ import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { FindingsCard } from "../../components/canary/FindingsCard";
 import { RunProgress, type RunPhase } from "../../components/canary/RunProgress";
 import { RunnerPairingCard, pairingPhraseMatches } from "../../components/canary/RunnerPairingCard";
+import { ScenarioLibraryCard } from "../../components/library/ScenarioLibraryCard";
+import { BrowserReviewClient } from "../../lib/browser-review-client";
 import { TargetRegistrationCard, type OwnershipProofMethod, type PendingTarget } from "../../components/onboarding/TargetRegistrationCard";
 import {
   CanaryApi, CanaryApiError, type CanaryApprovalSummary, type CanaryDisclosureState, type CanaryFindingsProjection,
-  type CanaryPendingApprovalRequest, type CanaryRunDashboard, type PendingEnvironmentProof, type RunnerContextBindingDashboard, type RunnerPairingView,
-  type VerifiedEnvironmentRecord,
+  type CanaryPendingApprovalRequest, type CanaryRunDashboard, type FrozenScenarioBinding, type PendingEnvironmentProof,
+  type RunnerContextBindingDashboard, type RunnerPairingView, type RunScenarioBindingsView, type ScenarioBindingItem,
+  type ScenarioLibraryEntry, type VerifiedEnvironmentRecord,
 } from "../../lib/canary-api";
 import {
   canCreateProject, confirmedRunRef, resolveAccount, selectionFromParams, selectionQuery, type AccountSelection, type AccountWorkspaceView,
@@ -238,6 +241,9 @@ export default function Dashboard() {
   const [pairingSession, setPairingSession] = useState<PairingSession | null>(null);
   const [revokeCandidate, setRevokeCandidate] = useState<string | null>(null);
   const [nowSeconds, setNowSeconds] = useState(currentSeconds);
+  // Selection provenance for the open approval, and the frozen rows of a run whose findings are shown.
+  const [bindingState, setBindingState] = useState<{ runId: string; view: RunScenarioBindingsView; entries: readonly ScenarioLibraryEntry[] } | null>(null);
+  const [findingsBindings, setFindingsBindings] = useState<{ runId: string; bindings: readonly FrozenScenarioBinding[] } | null>(null);
 
   const clearPendingApproval = useCallback((): void => {
     setPendingApproval(null);
@@ -619,6 +625,37 @@ export default function Dashboard() {
   const approvalKey = connection.phase === "ready" && pendingApproval !== null
     ? pendingApproval.requestKey : null;
   const approvalDialogOpen = approvalKey !== null && approvalDialog?.requestKey === approvalKey && approvalDialog.open;
+  const bindingRunId = approvalDialogOpen && pendingApproval !== null ? pendingApproval.summary.runId : null;
+  useEffect(() => {
+    if (connection.phase !== "ready" || bindingRunId === null) return;
+    const { workspaceRef } = connection.context;
+    const { projectRef } = connection.context.project;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const [view, library] = await Promise.all([
+          canaryApi.getRunScenarioBindings(workspaceRef, projectRef, bindingRunId, controller.signal),
+          canaryApi.listScenarioLibrary(workspaceRef, controller.signal),
+        ]);
+        if (!controller.signal.aborted) setBindingState({ runId: bindingRunId, view, entries: library.scenarios });
+      } catch {
+        // The binding step is optional; approval stays available without it.
+        if (!controller.signal.aborted) setBindingState(null);
+      }
+    })();
+    return () => controller.abort();
+  }, [bindingRunId, connection]);
+  const findingsRunId = disclosureForRun?.findings ? disclosureForRun.runId : null;
+  useEffect(() => {
+    if (connection.phase !== "ready" || findingsRunId === null) return;
+    const { workspaceRef } = connection.context;
+    const { projectRef } = connection.context.project;
+    const controller = new AbortController();
+    void canaryApi.getRunScenarioBindings(workspaceRef, projectRef, findingsRunId, controller.signal)
+      .then((view) => { if (!controller.signal.aborted) setFindingsBindings({ runId: findingsRunId, bindings: view.bindings }); })
+      .catch(() => { if (!controller.signal.aborted) setFindingsBindings({ runId: findingsRunId, bindings: [] }); });
+    return () => controller.abort();
+  }, [connection, findingsRunId]);
   const hasPlan = pendingApproval !== null && pendingApproval.run.run.status === "awaiting_execution_approval";
   // Progress comes from the server's active records for this project: a runner is paired while its key is active (the
   // bindable list omits a bound runner, so `pairedRunnersOf` adds it back), and it is authorized only by an active,
@@ -649,6 +686,23 @@ export default function Dashboard() {
     if (["cancelled", "expired"].includes(observedRun.run.status)) return "error";
     return "running";
   }, [observedRun]);
+
+  async function freezeScenarioBindings(items: ScenarioBindingItem[]): Promise<void> {
+    if (connection.phase !== "ready" || bindingState === null || pendingApproval === null
+      || bindingState.runId !== pendingApproval.summary.runId) return;
+    const { workspaceRef } = connection.context;
+    const { projectRef } = connection.context.project;
+    const operation = beginWork();
+    try {
+      const view = await canaryApi.freezeRunScenarioBindings(workspaceRef, projectRef, bindingState.runId, bindingState.view.projectionDigest, items);
+      setBindingState((current) => current?.runId === view.runId ? { ...current, view } : current);
+    } catch (error) {
+      if (isSessionLoss(error)) sessionEnded();
+      else setNotice(messageOf(error));
+    } finally {
+      endWork(operation);
+    }
+  }
 
   async function selectProject(projectRef: string): Promise<void> {
     const projects = connection.phase === "ready" ? connection.context.projects
@@ -1063,7 +1117,11 @@ export default function Dashboard() {
         {showActivation ? <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
           onReviewApproval={hasPlan && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
           scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} /> : null}
-        {disclosureState?.status === "synchronized" && disclosureForRun?.findings ? <FindingsCard findings={disclosureForRun.findings} /> : null}
+        {disclosureState?.status === "synchronized" && disclosureForRun?.findings ? <FindingsCard findings={disclosureForRun.findings}
+          frozenBindings={findingsBindings?.runId === disclosureForRun.runId ? findingsBindings.bindings : []} /> : null}
+        {context ? <ScenarioLibraryCard key={context.workspaceRef} api={canaryApi} workspaceRef={context.workspaceRef}
+          canManage={["owner", "admin", "member"].includes(context.account.workspace.role)}
+          createAssessor={() => new BrowserReviewClient()} /> : null}
         {context && executable && !pendingApproval && privateConnectorInUse ? <section className="runner-recovery"><p className="canary-kicker">Paired runner authorization</p><h2>Add canary access</h2><p>Authorize one active paired runner for one verified staging or sandbox environment. The runner alone may submit its signed plan; this dashboard never accepts projection file uploads.</p><p>This runner is fixed to its first claimed environment. To move it, stop and re-pair a fresh runner, then authorize access here.</p>
           <label>Verified environment<select disabled={working} onChange={(event) => setSelectedBindingEnvironment(event.target.value)} value={selectedBindingEnvironment}><option value="">Select environment</option>{context.environments.filter((item) => item.isExecutable && item.verificationRecordDigest !== null).map((item) => <option key={item.environmentId} value={item.environmentId}>{item.origin}</option>)}</select></label>
           <label>Paired runner<select disabled={working} onChange={(event) => setSelectedRunner(event.target.value)} value={selectedRunnerAvailable ? selectedRunner : ""}><option value="">Select runner</option>{context.contextBindings.runners.map((item) => <option key={`${item.runnerId}:${item.runnerKeyId}`} value={item.runnerId}>{item.displayName} · {item.fingerprint.slice(0, 12)}</option>)}</select></label>
@@ -1090,7 +1148,11 @@ export default function Dashboard() {
         {hintedRunRef !== null && runHint?.unavailable ? <p className="run-recovery" role="status">Heel Cloud could not read that rehearsal right now, so nothing is shown for it. Retrying.</p> : null}
       </aside></div>
 
-      {pendingApproval && hasPlan && approvalKey ? <ApprovalDialog key={approvalKey} durationSeconds={pendingApproval.summary.durationSeconds} egress={pendingApproval.summary.egress} onApprove={(reason) => void approveRun(approvalKey, reason)} onClose={() => setApprovalDialog(null)} open={approvalDialogOpen} origin={pendingApproval.summary.origin} requestBudget={pendingApproval.summary.requestBudget} routes={pendingApproval.summary.routes} scenarios={pendingApproval.summary.scenarios} /> : null}
+      {pendingApproval && hasPlan && approvalKey ? <ApprovalDialog key={approvalKey} durationSeconds={pendingApproval.summary.durationSeconds} egress={pendingApproval.summary.egress} onApprove={(reason) => void approveRun(approvalKey, reason)} onClose={() => setApprovalDialog(null)} open={approvalDialogOpen} origin={pendingApproval.summary.origin} requestBudget={pendingApproval.summary.requestBudget} routes={pendingApproval.summary.routes} scenarios={pendingApproval.summary.scenarios}
+        scenarioBinding={bindingState !== null && bindingState.runId === pendingApproval.summary.runId ? {
+          actions: bindingState.view.actions, entries: bindingState.entries, frozen: bindingState.view.bindings,
+          accepting: bindingState.view.acceptingBindings, busy: working, onFreeze: (items) => void freezeScenarioBindings(items),
+        } : undefined} /> : null}
       {disclosureDecisionOpen && disclosureState ? <DisclosureDialog busy={working} byteCount={disclosureState.projection.projectionBytes} completedScenarios={disclosureState.projection.scenarioCount} findingCount={disclosureState.projection.findingCount} onClose={() => setDisclosureOpen(false)} onKeepLocal={() => void decideDisclosure(false)} onPermit={() => void decideDisclosure(true)} open={disclosureOpen} /> : null}
     </main>
   );
