@@ -156,7 +156,8 @@ unchanged.
   `restart: unless-stopped` policy then restarts the same image on the same volume. No backup is
   restored and no rows change. `cloudflared` is not touched, so a fence stays fenced.
 - **Budget.** At most 3 automatic exits per hour. When the budget is exhausted, or the budget
-  file is malformed, symlinked, oversized or unwritable, the process logs
+  file is malformed, symlinked, oversized or unwritable, or any `<database>.recovery.json.tmp`
+  staging path already exists (it is never truncated, adopted or removed), the process logs
   `control_plane_recovery_budget_exhausted` with a `reason` and **stays draining**. It needs an
   operator.
 - **Not covered.** Any other reaper failure, a host-authority death, or a worker that does not

@@ -4,8 +4,12 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -879,6 +883,98 @@ class ReaperLockRecoveryTests(unittest.TestCase):
             result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
             self.assertEqual((result.allowed, result.reason), (False, "budget_unwritable"))
             self.assertFalse(self.budget_path(root).exists())
+
+    def test_preexisting_staging_path_is_never_truncated_adopted_or_removed(self):
+        from heel.saas.server import _RecoveryBudget
+
+        now = 1_800_000_000
+        victim_bytes = b"unrelated synthetic victim\n" * 4
+        for kind in ("hardlink", "regular", "symlink"):
+            for budget_present in (False, True):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp).resolve(strict=True)
+                    staging = Path(str(self.budget_path(root)) + ".tmp")
+                    victim = root / "victim.bin"
+                    victim.write_bytes(victim_bytes)
+                    raw = self.write_budget(root, [now - 10]) if budget_present else None
+                    if kind == "hardlink":
+                        os.link(victim, staging)
+                    elif kind == "regular":
+                        staging.write_bytes(b"leftover")
+                    else:
+                        staging.symlink_to(victim)
+                    before = os.lstat(staging)
+                    result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
+                    label = (kind, budget_present)
+                    self.assertEqual((result.allowed, result.reason), (False, "budget_unwritable"), label)
+                    self.assertEqual(victim.read_bytes(), victim_bytes, label)
+                    after = os.lstat(staging)
+                    self.assertEqual((after.st_ino, after.st_mode, after.st_size),
+                                     (before.st_ino, before.st_mode, before.st_size), label)
+                    if kind == "regular":
+                        self.assertEqual(staging.read_bytes(), b"leftover")
+                    if budget_present:
+                        self.assertEqual(self.budget_path(root).read_bytes(), raw, label)
+                    else:
+                        self.assertFalse(self.budget_path(root).exists(), label)
+        with tempfile.TemporaryDirectory() as tmp:
+            # A hardlinked budget file is existing counter corruption: refused, never rewritten.
+            root = Path(tmp).resolve(strict=True)
+            raw = self.write_budget(root, [])
+            os.link(self.budget_path(root), root / "victim.bin")
+            result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now)
+            self.assertEqual((result.allowed, result.reason), (False, "budget_unreadable"))
+            self.assertEqual((root / "victim.bin").read_bytes(), raw)
+
+    def test_exclusive_staging_keeps_three_durable_exits_then_exhausts(self):
+        from heel.saas.server import _RecoveryBudget
+
+        now = 1_800_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(strict=True)
+            staging = Path(str(self.budget_path(root)) + ".tmp")
+            for attempt in range(3):
+                result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now + attempt)
+                self.assertEqual((result.allowed, result.exits_in_window), (True, attempt + 1))
+                self.assertFalse(os.path.lexists(staging))
+                metadata = os.stat(self.budget_path(root))
+                self.assertEqual((metadata.st_mode & 0o777, metadata.st_nlink), (0o600, 1))
+            raw = self.budget_path(root).read_bytes()
+            self.assertEqual(json.loads(raw)["exits_at"], [now, now + 1, now + 2])
+            result = _RecoveryBudget(str(root / "heel.sqlite3")).consume(now + 3)
+            self.assertEqual((result.allowed, result.reason), (False, "budget_exhausted"))
+            self.assertEqual(self.budget_path(root).read_bytes(), raw)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX-only")
+    def test_fifo_budget_or_staging_path_is_refused_promptly_in_a_bounded_subprocess(self):
+        # A blocking open on a FIFO would hang; run in a child process so a regression is detected
+        # by the timeout and the child is killed, never leaving a stuck thread in this process.
+        probe = (
+            "import json, sys\n"
+            "from heel.saas.server import _RecoveryBudget\n"
+            "result = _RecoveryBudget(sys.argv[1]).consume(1800000000)\n"
+            "print(json.dumps([result.allowed, result.reason]))\n"
+        )
+        repository = str(Path(__file__).resolve().parents[1])
+        for fifo_at, expected in ((".recovery.json", "budget_unreadable"),
+                                  (".recovery.json.tmp", "budget_unwritable")):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve(strict=True)
+                fifo = Path(str(root / "heel.sqlite3") + fifo_at)
+                os.mkfifo(fifo, 0o600)
+                try:
+                    completed = subprocess.run(
+                        [sys.executable, "-c", probe, str(root / "heel.sqlite3")],
+                        cwd=repository, capture_output=True, text=True, timeout=5,
+                        env={**os.environ, "PYTHONPATH": repository},
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail(f"consume() blocked on a FIFO at {fifo_at}")
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout), [False, expected], fifo_at)
+                self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode), fifo_at)
+                if fifo_at.endswith(".tmp"):
+                    self.assertFalse(self.budget_path(root).exists())
 
     def test_unwritable_budget_keeps_draining_and_does_not_exit(self):
         with tempfile.TemporaryDirectory() as tmp:

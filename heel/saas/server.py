@@ -175,7 +175,10 @@ class _RecoveryBudget:
         self.path = database_path + RECOVERY_BUDGET_SUFFIX
 
     def _read(self) -> list[int] | None:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK: a FIFO or device at the budget path must not block the open before the
+        # regular-file check below; it is refused promptly instead.
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
         try:
             descriptor = os.open(self.path, flags)
         except FileNotFoundError:
@@ -214,7 +217,10 @@ class _RecoveryBudget:
             sort_keys=True, separators=(",", ":"),
         ).encode()
         staging = self.path + ".tmp"
-        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+        # O_EXCL: any pre-existing staging path (regular file, hardlink, symlink, FIFO) is refused
+        # without being opened, truncated, adopted or removed.  A failed or interrupted write
+        # leaves its staging file behind, so later attempts also fail closed until an operator acts.
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
                  | getattr(os, "O_NOFOLLOW", 0))
         try:
             descriptor = os.open(staging, flags, 0o600)
