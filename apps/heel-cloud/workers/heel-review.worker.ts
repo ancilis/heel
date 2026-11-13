@@ -21,6 +21,9 @@ const MAX_BROWSER_ANSWERS_BYTES = 64 * 1024;
 // Keep fan-out bounded before the result crosses the structured-clone boundary.
 const MAX_BROWSER_RESULT_BYTES = 4 * 1024 * 1024;
 const MAX_WORKER_REQUEST_BYTES = MAX_BROWSER_INPUT_BYTES * 2 + MAX_BROWSER_ANSWERS_BYTES * 2 + 64 * 1024;
+const MAX_ASSESS_SELECTION_BYTES = 512 * 1024;
+const MAX_WORKER_ASSESS_REQUEST_BYTES = MAX_BROWSER_INPUT_BYTES * 2 + MAX_BROWSER_ANSWERS_BYTES * 2
+  + MAX_ASSESS_SELECTION_BYTES * 2 + 64 * 1024;
 const MAX_FINDINGS_SYNC_BYTES = 256 * 1024;
 const MAX_FINDINGS_REVIEW_BYTES = 4 * 1024 * 1024;
 const REQUEST_ID = /^request_[0-9]+$/;
@@ -45,6 +48,10 @@ const PUBLIC_ERRORS: Readonly<Record<string, string>> = Object.freeze({
   projection_too_large: "The findings projection exceeds the browser limit.",
   operation_in_progress: "A browser-local Heel operation is already running.",
   worker_protocol: "The browser-local review received an invalid request.",
+  invalid_selection: "The scenario selection is invalid or unsupported.",
+  invalid_custom_scenario: "A custom scenario definition is not a supported validated criterion.",
+  definition_digest_mismatch: "A scenario definition does not match its recorded digest.",
+  assessment_failed: "The browser-local assessment could not be completed safely.",
 });
 
 interface RuntimeManifest {
@@ -65,6 +72,15 @@ interface ReviewRequest {
   answers_json: string;
 }
 
+interface AssessRequest {
+  type: "assess";
+  protocol_version: typeof WORKER_PROTOCOL_VERSION;
+  request_id: string;
+  source: string;
+  answers_json: string;
+  selection_json: string;
+}
+
 interface FindingsRequest {
   type: "project_findings";
   protocol_version: typeof WORKER_PROTOCOL_VERSION;
@@ -79,6 +95,7 @@ const scope = globalThis as unknown as DedicatedWorkerGlobalScope;
 let bootstrapFetch: typeof fetch | null = scope.fetch.bind(scope);
 let reviewEntry: PyodideCallable | null = null;
 let findingsEntry: PyodideCallable | null = null;
+let assessEntry: PyodideCallable | null = null;
 let acceptingInput = false;
 let reviewing = false;
 
@@ -220,6 +237,79 @@ function parseRequest(message: string): ReviewRequest {
 }
 
 
+function parseAssessRequest(value: Record<string, unknown>): AssessRequest {
+  if (!exactFields(value, [
+    "type", "protocol_version", "request_id", "source", "answers_json", "selection_json",
+  ])) throw new Error("worker assess request shape mismatch");
+  if (
+    value.type !== "assess"
+    || value.protocol_version !== WORKER_PROTOCOL_VERSION
+    || typeof value.request_id !== "string"
+    || !REQUEST_ID.test(value.request_id)
+    || typeof value.source !== "string"
+    || typeof value.answers_json !== "string"
+    || typeof value.selection_json !== "string"
+  ) throw new Error("worker assess request fields are invalid");
+  if (new TextEncoder().encode(value.source).byteLength > MAX_BROWSER_INPUT_BYTES
+    || new TextEncoder().encode(value.answers_json).byteLength > MAX_BROWSER_ANSWERS_BYTES
+    || new TextEncoder().encode(value.selection_json).byteLength > MAX_ASSESS_SELECTION_BYTES) {
+    throw new Error("worker assess input exceeds its bound");
+  }
+  return value as unknown as AssessRequest;
+}
+
+
+/** Browser-local static assessment: selected definitions only, no discovery, no network, result stays here. */
+function assess(request: AssessRequest): void {
+  const entry = assessEntry;
+  if (!acceptingInput || entry === null) {
+    error(request.request_id, "engine_not_ready");
+    return;
+  }
+  if (reviewing) {
+    error(request.request_id, "operation_in_progress");
+    return;
+  }
+  reviewing = true;
+  try {
+    const response = entry(request.source, request.answers_json, request.selection_json);
+    if (typeof response !== "string" || response.length < 2) {
+      error(request.request_id, "assessment_failed");
+      return;
+    }
+    if (response[0] === "E") {
+      let failure: unknown;
+      try {
+        failure = JSON.parse(response.slice(1));
+      } catch {
+        error(request.request_id, "assessment_failed");
+        return;
+      }
+      error(request.request_id, isRecord(failure) && typeof failure.code === "string" ? failure.code : "assessment_failed");
+      return;
+    }
+    if (response[0] !== "R") {
+      error(request.request_id, "assessment_failed");
+      return;
+    }
+    if (new TextEncoder().encode(response).byteLength - 1 > MAX_BROWSER_RESULT_BYTES) {
+      error(request.request_id, "result_too_large");
+      return;
+    }
+    send({
+      type: "assess_result",
+      protocol_version: WORKER_PROTOCOL_VERSION,
+      request_id: request.request_id,
+      result_json: response.slice(1),
+    });
+  } catch {
+    error(request.request_id, "assessment_failed");
+  } finally {
+    reviewing = false;
+  }
+}
+
+
 function parseFindingsRequest(value: unknown): FindingsRequest {
   if (!isRecord(value) || !exactFields(value, [
     "type", "protocol_version", "request_id", "review_json", "project_ref", "namespace_key",
@@ -311,6 +401,7 @@ async function boot(): Promise<void> {
     pyodide.runPython(`
 from heel.browser_review import BrowserReviewError as _HeelBrowserReviewError
 from heel.browser_review import review_openapi_json as _heel_review_openapi_json
+from heel.browser_assess import assess_scenarios_json as _heel_assess_scenarios_json
 from heel.findings_sync import project_findings_sync as _heel_project_findings_sync
 from heel.review_contract import stable_json as _heel_stable_json
 import json as _heel_json
@@ -319,6 +410,13 @@ def _heel_browser_entry(source, answers_json):
         return "R" + _heel_review_openapi_json(source, answers_json)
     except _HeelBrowserReviewError as error:
         return "E" + _heel_stable_json({"code": error.code})
+def _heel_assess_entry(source, answers_json, selection_json):
+    try:
+        return "R" + _heel_assess_scenarios_json(source, answers_json, selection_json)
+    except _HeelBrowserReviewError as error:
+        return "E" + _heel_stable_json({"code": error.code})
+    except Exception:
+        return "E" + _heel_stable_json({"code": "assessment_failed"})
 def _heel_findings_entry(review_json, project_ref, namespace_key_hex):
     try:
         review = _heel_json.loads(review_json)
@@ -337,6 +435,10 @@ def _heel_findings_entry(review_json, project_ref, namespace_key_hex):
       throw new Error("Heel findings entry point is unavailable");
     }
     findingsEntry = findingsCallable as PyodideCallable;
+    const assessCallable = pyodide.globals.get("_heel_assess_entry");
+    pyodide.globals.delete("_heel_assess_entry");
+    if (typeof assessCallable !== "function") throw new Error("Heel assessment entry point is unavailable");
+    assessEntry = assessCallable as PyodideCallable;
 
     guardDynamicPackages(pyodide);
     guardAmbientNetwork();
@@ -378,6 +480,25 @@ scope.onmessage = (event: MessageEvent<unknown>) => {
   if (!acceptingInput || reviewEntry === null) {
     error("request_0", "engine_not_ready");
     return;
+  }
+  if (new TextEncoder().encode(event.data).byteLength <= MAX_WORKER_ASSESS_REQUEST_BYTES && event.data.includes('"assess"')) {
+    let candidate: unknown = null;
+    try {
+      candidate = JSON.parse(event.data);
+    } catch {
+      candidate = null;
+    }
+    if (isRecord(candidate) && candidate.type === "assess") {
+      let assessRequest: AssessRequest;
+      try {
+        assessRequest = parseAssessRequest(candidate);
+      } catch {
+        error("request_0", "worker_protocol");
+        return;
+      }
+      assess(assessRequest);
+      return;
+    }
   }
   let request: ReviewRequest;
   try {

@@ -666,3 +666,113 @@ describe("BrowserReviewClient", () => {
     expect(client.retainedInput?.source).toBe("retained-post-source");
   });
 });
+
+
+describe("BrowserReviewClient browser-local scenario assessment", () => {
+  const DIGEST = "a".repeat(64);
+  const selection = {
+    library_digest: "f".repeat(64),
+    scenarios: [
+      { scenario_id: "sc.endpoint.hidden", source: "library" as const, revision: null, definition_digest: DIGEST, definition: { id: "sc.endpoint.hidden", kind: "endpoint" } },
+      { scenario_id: "sc.internal.admin", source: "custom" as const, revision: 2, definition_digest: "b".repeat(64), definition: { id: "sc.internal.admin", kind: "endpoint", severity_model: { likelihood: 0.5, impact: 0.7 } } },
+    ],
+  };
+
+  function assessment(overrides: Record<string, unknown> = {}, rows?: unknown[]): Record<string, unknown> {
+    return {
+      schema_version: "heel.scenario-assessment.v1", engine_version: "1.3.0rc4", source_hash: "1".repeat(64),
+      model_hash: "2".repeat(64), answers_hash: "3".repeat(64), library_digest: selection.library_digest,
+      selection_hash: "4".repeat(64),
+      custom: [{ scenario_id: "sc.internal.admin", revision: 2, definition_digest: "b".repeat(64) }],
+      model_coverage: { product_model_fields: "evaluated", entitlement_graph_edges: "not_evaluated", agent_surface: "unknown" },
+      results: rows ?? [
+        { scenario_id: "sc.endpoint.hidden", source: "library", revision: null, definition_digest: DIGEST, mechanism_id: "route-access",
+          outcome: "investigation_prompt", applicability: "matched_surface", evidence_state: "inferred", rule_source: "unknown",
+          surface: { method: "GET", route: "/admin/users" }, match_count: 1,
+          matches: [{ outcome: "investigation_prompt", surface: { method: "GET", route: "/admin/users" }, evidence_state: "inferred", rule_source: "unknown" }],
+          recommended_control: "control", note: "investigation prompt: confirm the intended product rule; nothing was executed" },
+        { scenario_id: "sc.internal.admin", source: "custom", revision: 2, definition_digest: "b".repeat(64), mechanism_id: "sc.internal.admin",
+          outcome: "no_matching_surface", applicability: "unknown", evidence_state: "unknown", rule_source: "unknown", surface: null,
+          match_count: 0, matches: [], recommended_control: "control", note: "no matching surface in the supplied model; not evidence of absence" },
+      ],
+      privacy: { execution: "browser_local", network_calls: false, uploaded: false },
+      ...overrides,
+    };
+  }
+
+  async function readyClient(): Promise<{ client: BrowserReviewClient; workers: FakeWorker[] }> {
+    const workers: FakeWorker[] = [];
+    const client = new BrowserReviewClient({ workerFactory: () => { const worker = new FakeWorker(); workers.push(worker); return worker; } });
+    ready(workers[0]);
+    await client.whenReady();
+    return { client, workers };
+  }
+
+  function respond(worker: FakeWorker, body: unknown, type = "assess_result"): void {
+    const request = JSON.parse(worker.sent.at(-1)!);
+    worker.emit(JSON.stringify({ type, protocol_version: WORKER_PROTOCOL_VERSION, request_id: request.request_id, result_json: JSON.stringify(body) }));
+  }
+
+  test("round-trips an assess message with the exact selection and keeps retained review input unchanged", async () => {
+    const { client, workers } = await readyClient();
+    const answers = [{ surface: "listitems", field: "tenant_filter" as const, value: "unknown" as const }];
+    const pending = client.assessScenarios('{"openapi":"3.1.0"}', answers, selection);
+    const request = JSON.parse(workers[0].sent.at(-1)!);
+    expect(Object.keys(request).sort()).toEqual(["answers_json", "protocol_version", "request_id", "selection_json", "source", "type"]);
+    expect(request.type).toBe("assess");
+    expect(JSON.parse(request.answers_json)).toEqual(answers);
+    expect(JSON.parse(request.selection_json)).toEqual({ schema_version: "heel.scenario-assessment-selection.v1", ...selection });
+    respond(workers[0], assessment());
+    const envelope = await pending;
+    expect(envelope.results.map((row) => row.scenario_id)).toEqual(["sc.endpoint.hidden", "sc.internal.admin"]);
+    expect(envelope.privacy).toEqual({ execution: "browser_local", network_calls: false, uploaded: false });
+    expect(client.retainedInput).toBeNull();
+    expect(client.status).toBe("complete");
+  });
+
+  test("bounds the selection before any worker message and binds the result to that selection", async () => {
+    const { client, workers } = await readyClient();
+    const sent = workers[0].sent.length;
+    const big = { library_digest: selection.library_digest, scenarios: [{ ...selection.scenarios[0], definition: { id: "x", pad: "p".repeat(600 * 1024) } }] };
+    expect((await failureOf(client.assessScenarios("{}", [], big))).code).toBe("invalid_selection");
+    const many = { library_digest: selection.library_digest, scenarios: Array.from({ length: 161 }, (_, index) => ({ ...selection.scenarios[0], scenario_id: `sc.x.${index}` })) };
+    expect((await failureOf(client.assessScenarios("{}", [], many))).code).toBe("invalid_selection");
+    const duplicate = { library_digest: selection.library_digest, scenarios: [selection.scenarios[0], selection.scenarios[0]] };
+    expect((await failureOf(client.assessScenarios("{}", [], duplicate))).code).toBe("invalid_selection");
+    expect((await failureOf(client.assessScenarios("{}", [], { library_digest: "x", scenarios: selection.scenarios }))).code).toBe("invalid_selection");
+    expect((await failureOf(client.assessScenarios("x".repeat(MAX_BROWSER_INPUT_BYTES + 1), [], selection))).code).toBe("input_too_large");
+    expect(workers[0].sent.length).toBe(sent);
+
+    const rows = (assessment().results as unknown[]);
+    const bad: Array<[string, Record<string, unknown>, string]> = [
+      ["unselected scenario", assessment({}, [rows[0], { ...(rows[1] as object), scenario_id: "sc.other" }]), "worker_protocol"],
+      ["reordered results", assessment({}, [rows[1], rows[0]]), "worker_protocol"],
+      ["missing result", assessment({}, [rows[0]]), "worker_protocol"],
+      ["rewritten note", assessment({}, [{ ...(rows[0] as object), note: "proven safe" }, rows[1]]), "worker_protocol"],
+      ["absence presented as matched", assessment({}, [rows[0], { ...(rows[1] as object), applicability: "matched_surface" }]), "worker_protocol"],
+      ["uploaded flag", assessment({ privacy: { execution: "browser_local", network_calls: false, uploaded: true } }), "worker_protocol"],
+      ["other library digest", assessment({ library_digest: "e".repeat(64) }), "worker_protocol"],
+    ];
+    for (const [label, body, code] of bad) {
+      const pending = client.assessScenarios("{}", [], selection);
+      respond(workers.at(-1)!, body);
+      expect((await failureOf(pending)).code, label).toBe(code);
+      ready(workers.at(-1)!);
+      await client.whenReady();
+    }
+    const pending = client.assessScenarios("{}", [], selection);
+    respond(workers.at(-1)!, assessment(), "result");
+    expect((await failureOf(pending)).code).toBe("worker_protocol");
+  });
+
+  test("surfaces closed assessment error codes from the worker", async () => {
+    const { client, workers } = await readyClient();
+    const pending = client.assessScenarios("{}", [], selection);
+    const request = JSON.parse(workers[0].sent.at(-1)!);
+    workers[0].emit(JSON.stringify({ type: "error", protocol_version: WORKER_PROTOCOL_VERSION, request_id: request.request_id,
+      code: "invalid_custom_scenario", message: "A custom scenario definition is not a supported validated criterion." }));
+    const failure = await failureOf(pending);
+    expect(failure.code).toBe("invalid_custom_scenario");
+    expect(failure.message).not.toContain("sc.internal.admin");
+  });
+});

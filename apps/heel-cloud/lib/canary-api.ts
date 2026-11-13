@@ -152,6 +152,82 @@ export interface CanaryApprovalSummary {
   egress: string;
 }
 
+export type ScenarioExecutionSupport = "static_only" | "runner_supported";
+export type ScenarioBindableCatalogId = "anonymous_authenticated_read" | "plan_entitlement_read";
+
+/** One effective library or current private custom scenario exactly as the workspace listing returns it. */
+export interface ScenarioLibraryEntry {
+  id: string;
+  source: "library" | "custom";
+  revision: number | null;
+  definitionDigest: string;
+  /** The full evaluation definition (digest subject); browser-local assessment uses it unchanged. */
+  definition: Readonly<Record<string, unknown>>;
+  objective: string;
+  category: string;
+  kind: string;
+  pack: string;
+  recommendedControl: string;
+  mechanismId: string;
+  applicability: "unknown";
+  applicabilityRule: string;
+  evidenceState: "inferred" | "customer_declared";
+  executionSupport: ScenarioExecutionSupport;
+  catalogScenarioId: string | null;
+  bindingVersion: 1 | null;
+  coverageStatement: string | null;
+  prerequisites: readonly string[];
+}
+
+export interface ScenarioLibrary {
+  libraryDigest: string;
+  engineVersion: string;
+  bindingVersion: 1;
+  customCoverageStatements: Readonly<Record<ScenarioBindableCatalogId, string>>;
+  scenarios: readonly ScenarioLibraryEntry[];
+}
+
+export interface CustomScenarioInput {
+  definition: Readonly<Record<string, unknown>>;
+  supersedesRevision: number | null;
+  executionBinding: null | { catalogScenarioId: ScenarioBindableCatalogId; coverageAck: string };
+}
+
+export interface ScenarioPlanAction {
+  catalogScenarioId: string;
+  method: "GET" | "HEAD";
+  routeTemplate: string;
+}
+
+export interface ScenarioBindingItem extends ScenarioPlanAction {
+  libraryScenarioId: string;
+  source: "library" | "custom";
+  definitionDigest: string;
+}
+
+/** A write-once association frozen before approval; its display snapshot never follows later edits. */
+export interface FrozenScenarioBinding extends ScenarioBindingItem {
+  revision: number | null;
+  libraryDigest: string;
+  bindingVersion: 1;
+  approvalId: string;
+  projectionDigest: string;
+  manifestDigest: string;
+  display: Readonly<{ objective: string; mechanismId: string; pack: string; coverageStatement: string }>;
+  boundAtMs: number;
+}
+
+export interface RunScenarioBindingsView {
+  runId: string;
+  approvalId: string;
+  projectionDigest: string;
+  manifestDigest: string;
+  acceptingBindings: boolean;
+  actions: readonly ScenarioPlanAction[];
+  bindings: readonly FrozenScenarioBinding[];
+  libraryDigest: string;
+}
+
 export interface CanaryPendingApprovalRequest extends CanaryApprovalSummary {
   submittedAtMs: number;
   expiresAtMs: number;
@@ -256,6 +332,26 @@ const PUBLIC_MESSAGES = Object.freeze({
   invalid_runner_pairing: "That runner pairing request is invalid or expired.",
   runner_pairing_not_found: "That runner pairing request is no longer available.",
   invalid_runner_revocation: "That runner is already revoked or no longer available in this workspace.",
+  not_found: "That workspace library is unavailable.",
+  browser_session_required: "Open the scenario library from the signed-in Heel dashboard.",
+  forbidden: "Your workspace role cannot change the scenario library.",
+  invalid_custom_request: "Heel could not safely accept that custom scenario request.",
+  invalid_scenario: "The custom scenario did not pass validation.",
+  custom_definition_too_large: "The custom scenario definition is too large.",
+  library_id_collision: "That identifier belongs to the shared library. Choose a workspace identifier.",
+  revision_conflict: "This custom scenario changed. Reload it before saving a new revision.",
+  binding_ack_required: "Confirm the exact executed-check statement to bind a runner check.",
+  custom_scenario_limit: "This workspace has reached its custom scenario limit.",
+  custom_revision_limit: "This custom scenario has reached its revision limit.",
+  run_not_found: "That rehearsal is unavailable in this project.",
+  run_bindings_frozen: "Library bindings are frozen once a rehearsal leaves approval.",
+  run_bindings_exist: "Library bindings for this rehearsal are already frozen.",
+  projection_mismatch: "The signed plan changed. Refresh it before freezing bindings.",
+  projection_unavailable: "The signed plan for this rehearsal is unavailable.",
+  invalid_binding_request: "Heel could not safely prepare those library bindings.",
+  action_not_in_plan: "A selected check is not an action in the signed plan.",
+  binding_not_allowed: "That scenario is not bound to the selected runner check.",
+  stale_definition: "A selected scenario changed. Reload the library before freezing bindings.",
 } as const);
 
 type CanaryErrorCode = keyof typeof PUBLIC_MESSAGES;
@@ -264,13 +360,16 @@ const PUBLIC_ERROR_CODES = new Set(Object.keys(PUBLIC_MESSAGES));
 export class CanaryApiError extends Error {
   readonly code: CanaryErrorCode;
   readonly status: number;
+  /** Validator messages for an invalid custom scenario only; bounded and plain text. */
+  readonly details: readonly string[];
 
-  constructor(code: string, status: number) {
+  constructor(code: string, status: number, details: readonly string[] = []) {
     const safeCode = (PUBLIC_ERROR_CODES.has(code) ? code : "unavailable") as CanaryErrorCode;
     super(PUBLIC_MESSAGES[safeCode]);
     this.name = "CanaryApiError";
     this.code = safeCode;
     this.status = status;
+    this.details = Object.freeze(safeCode === "invalid_scenario" ? [...details] : []);
   }
 }
 
@@ -333,6 +432,107 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+const SCENARIO_ID = /^[a-z0-9][a-z0-9._-]{2,127}$/;
+const BINDABLE_CATALOG_IDS: readonly ScenarioBindableCatalogId[] = ["anonymous_authenticated_read", "plan_entitlement_read"];
+const ROUTE_TEMPLATE = /^\/[A-Za-z0-9._~!$&'()*+,;=:@/{}-]{0,511}$/;
+const MAX_CUSTOM_DEFINITION_BYTES = 4096;
+const MAX_SCENARIO_BINDING_ITEMS = 8;
+
+function plainJson(value: unknown, depth = 0): boolean {
+  if (depth > 16) return false;
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.length <= 256 && value.every((item) => plainJson(item, depth + 1));
+  return record(value) && Object.keys(value).length <= 64
+    && Object.values(value).every((item) => plainJson(item, depth + 1));
+}
+
+function parseLibraryEntry(value: unknown): ScenarioLibraryEntry {
+  if (!exact(value, ["id", "source", "revision", "definition_digest", "definition", "mechanism_id", "applicability", "applicability_rule", "evidence_state", "execution_support", "catalog_scenario_id", "binding_version", "coverage_statement", "prerequisites"])
+    || typeof value.id !== "string" || !SCENARIO_ID.test(value.id) || !digest(value.definition_digest)
+    || !record(value.definition) || !plainJson(value.definition) || value.definition.id !== value.id
+    || !closedString(value.definition.objective, 2000) || !closedString(value.definition.category, 128)
+    || !closedString(value.definition.kind, 128) || !closedString(value.definition.recommended_control, 2000)
+    || !closedString(value.mechanism_id, 128) || value.applicability !== "unknown"
+    || !closedString(value.applicability_rule, 64)
+    || !["static_only", "runner_supported"].includes(String(value.execution_support))
+    || !Array.isArray(value.prerequisites) || value.prerequisites.length > 16
+    || !value.prerequisites.every((item) => closedString(item, 256))) invalidResponse();
+  const bound = value.execution_support === "runner_supported";
+  if (bound !== (value.catalog_scenario_id !== null) || bound !== (value.binding_version === 1)
+    || bound !== (value.coverage_statement !== null) || bound !== (value.prerequisites.length > 0)
+    || (bound && (!identifier(value.catalog_scenario_id) || !closedString(value.coverage_statement, 512)))
+    || (!bound && value.binding_version !== null)) invalidResponse();
+  if (value.source === "library") {
+    if (value.revision !== null || value.evidence_state !== "inferred") invalidResponse();
+  } else if (value.source === "custom") {
+    if (!integer(value.revision, 1) || value.evidence_state !== "customer_declared") invalidResponse();
+  } else invalidResponse();
+  const pack = value.definition.pack;
+  return {
+    id: value.id, source: value.source as "library" | "custom", revision: value.revision as number | null,
+    definitionDigest: value.definition_digest, definition: value.definition,
+    objective: value.definition.objective as string, category: value.definition.category as string,
+    kind: value.definition.kind as string, pack: typeof pack === "string" ? pack : "custom",
+    recommendedControl: value.definition.recommended_control as string, mechanismId: value.mechanism_id as string,
+    applicability: "unknown", applicabilityRule: value.applicability_rule as string,
+    evidenceState: value.evidence_state as "inferred" | "customer_declared",
+    executionSupport: value.execution_support as ScenarioExecutionSupport,
+    catalogScenarioId: value.catalog_scenario_id as string | null, bindingVersion: bound ? 1 : null,
+    coverageStatement: value.coverage_statement as string | null, prerequisites: value.prerequisites as string[],
+  };
+}
+
+function parsePlanAction(value: unknown): ScenarioPlanAction {
+  if (!exact(value, ["catalog_scenario_id", "method", "route_template"]) || !identifier(value.catalog_scenario_id)
+    || (value.method !== "GET" && value.method !== "HEAD") || typeof value.route_template !== "string"
+    || !ROUTE_TEMPLATE.test(value.route_template)) invalidResponse();
+  return { catalogScenarioId: value.catalog_scenario_id, method: value.method, routeTemplate: value.route_template };
+}
+
+function parseFrozenBinding(value: unknown, view: JsonRecord): FrozenScenarioBinding {
+  if (!exact(value, ["catalog_scenario_id", "method", "route_template", "library_scenario_id", "source", "revision", "definition_digest", "library_digest", "binding_version", "approval_id", "projection_digest", "manifest_digest", "display", "bound_at_ms"])
+    || typeof value.library_scenario_id !== "string" || !SCENARIO_ID.test(value.library_scenario_id)
+    || !digest(value.definition_digest) || !digest(value.library_digest) || value.binding_version !== 1
+    || value.approval_id !== view.approval_id || value.projection_digest !== view.projection_digest
+    || value.manifest_digest !== view.manifest_digest || !integer(value.bound_at_ms)
+    || !exact(value.display, ["objective", "mechanism_id", "pack", "coverage_statement"])
+    || !closedString(value.display.objective, 500) || !closedString(value.display.mechanism_id, 128)
+    || !closedString(value.display.pack, 64) || !closedString(value.display.coverage_statement, 512)) invalidResponse();
+  if (!(value.source === "library" && value.revision === null) && !(value.source === "custom" && integer(value.revision, 1))) invalidResponse();
+  const action = parsePlanAction({ catalog_scenario_id: value.catalog_scenario_id, method: value.method, route_template: value.route_template });
+  return {
+    ...action, libraryScenarioId: value.library_scenario_id, source: value.source as "library" | "custom",
+    definitionDigest: value.definition_digest, revision: value.revision as number | null,
+    libraryDigest: value.library_digest, bindingVersion: 1, approvalId: value.approval_id as string,
+    projectionDigest: value.projection_digest as string, manifestDigest: value.manifest_digest as string,
+    display: { objective: value.display.objective, mechanismId: value.display.mechanism_id,
+      pack: value.display.pack, coverageStatement: value.display.coverage_statement },
+    boundAtMs: value.bound_at_ms,
+  };
+}
+
+function parseBindingsView(value: unknown, runRef: string): RunScenarioBindingsView {
+  if (!exact(value, ["schema_version", "run_id", "approval_id", "projection_digest", "manifest_digest", "accepting_bindings", "actions", "bindings", "library_digest"])
+    || value.schema_version !== "heel.run-scenario-bindings-view.v1" || value.run_id !== runRef
+    || !identifier(value.approval_id) || !digest(value.projection_digest) || !digest(value.manifest_digest)
+    || typeof value.accepting_bindings !== "boolean" || !Array.isArray(value.actions) || value.actions.length > 20
+    || !Array.isArray(value.bindings) || value.bindings.length > MAX_SCENARIO_BINDING_ITEMS
+    || !digest(value.library_digest) || (!value.accepting_bindings && value.actions.length !== 0)) invalidResponse();
+  return deepFreeze({
+    runId: runRef, approvalId: value.approval_id, projectionDigest: value.projection_digest,
+    manifestDigest: value.manifest_digest, acceptingBindings: value.accepting_bindings,
+    actions: value.actions.map(parsePlanAction),
+    bindings: value.bindings.map((item) => parseFrozenBinding(item, value)),
+    libraryDigest: value.library_digest,
+  });
+}
+
+/** A bounded JSON body serialized by its caller (custom scenario definitions only). */
+class PreserializedJson {
+  constructor(readonly text: string) {}
+}
+
 function invalidRequest(): never {
   throw new CanaryApiError("invalid_request", 0);
 }
@@ -354,6 +554,11 @@ function canonicalJson(value: unknown): string {
   if (!record(value)) invalidRequest();
   const fields = Object.keys(value).sort();
   return `{${fields.map((field) => `${JSON.stringify(field)}:${canonicalJson(value[field])}`).join(",")}}`;
+}
+
+function workspacePath(workspaceRef: string, suffix: string): string {
+  if (!WORKSPACE_REF.test(workspaceRef)) invalidRequest();
+  return `${CONTROL_PLANE_PREFIX}/v1/workspaces/${workspaceRef}${suffix}`;
 }
 
 function projectPath(workspaceRef: string, projectRef: string, suffix: string): string {
@@ -1051,6 +1256,74 @@ export class CanaryApi {
     if (!exact(value, ["schema_version", "revoked"]) || value.schema_version !== "heel.runner-revoke-result.v1" || value.revoked !== true) invalidResponse();
   }
 
+  async listScenarioLibrary(workspaceRef: string, signal?: AbortSignal): Promise<Readonly<ScenarioLibrary>> {
+    const value = await this.#json(workspacePath(workspaceRef, "/scenario-library"), "GET", undefined, 200, {}, signal);
+    if (!exact(value, ["schema_version", "library_digest", "engine_version", "binding_version", "custom_coverage_statements", "scenarios"])
+      || value.schema_version !== "heel.scenario-library.v1" || !digest(value.library_digest)
+      || !identifier(value.engine_version) || value.binding_version !== 1
+      || !exact(value.custom_coverage_statements, [...BINDABLE_CATALOG_IDS])
+      || !BINDABLE_CATALOG_IDS.every((id) => closedString((value.custom_coverage_statements as JsonRecord)[id], 512))
+      || !Array.isArray(value.scenarios) || value.scenarios.length > 400) invalidResponse();
+    const scenarios = value.scenarios.map(parseLibraryEntry);
+    if (new Set(scenarios.map((item) => item.id)).size !== scenarios.length) invalidResponse();
+    return deepFreeze({
+      libraryDigest: value.library_digest, engineVersion: value.engine_version, bindingVersion: 1,
+      customCoverageStatements: value.custom_coverage_statements as Record<ScenarioBindableCatalogId, string>,
+      scenarios,
+    });
+  }
+
+  async createCustomScenario(workspaceRef: string, input: CustomScenarioInput): Promise<Readonly<ScenarioLibraryEntry & { warnings: readonly string[] }>> {
+    const binding = input.executionBinding;
+    if (!record(input.definition) || !plainJson(input.definition) || typeof input.definition.id !== "string"
+      || !SCENARIO_ID.test(input.definition.id)
+      || (input.supersedesRevision !== null && !integer(input.supersedesRevision, 1))
+      || (binding !== null && (!BINDABLE_CATALOG_IDS.includes(binding.catalogScenarioId) || !closedString(binding.coverageAck, 512)))) invalidRequest();
+    const definitionText = JSON.stringify(input.definition);
+    if (new TextEncoder().encode(definitionText).byteLength > MAX_CUSTOM_DEFINITION_BYTES) invalidRequest();
+    const body = JSON.stringify({
+      definition: input.definition,
+      execution_binding: binding === null ? null : { binding_version: 1, catalog_scenario_id: binding.catalogScenarioId, coverage_ack: binding.coverageAck },
+      schema_version: "heel.custom-scenario.v1",
+      supersedes_revision: input.supersedesRevision,
+    });
+    if (new TextEncoder().encode(body).byteLength > 16 * 1024) invalidRequest();
+    const response = await this.#send(workspacePath(workspaceRef, "/scenario-library/custom"), "POST", new PreserializedJson(body), {});
+    if (response.status !== 201) throw await this.#error(response);
+    const value = await this.#parsed(response);
+    if (!record(value) || !Array.isArray(value.warnings) || value.warnings.length > 32
+      || !value.warnings.every((item) => closedString(item, 512))) invalidResponse();
+    const { warnings, ...row } = value;
+    const entry = parseLibraryEntry(row);
+    if (entry.source !== "custom" || entry.id !== input.definition.id
+      || (binding === null) !== (entry.catalogScenarioId === null)
+      || (binding !== null && entry.catalogScenarioId !== binding.catalogScenarioId)) invalidResponse();
+    return deepFreeze({ ...entry, warnings: warnings as string[] });
+  }
+
+  async getRunScenarioBindings(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<RunScenarioBindingsView> {
+    return parseBindingsView(await this.#json(runPath(workspaceRef, projectRef, runRef, "/scenario-bindings"), "GET", undefined, 200, {}, signal), runRef);
+  }
+
+  async freezeRunScenarioBindings(workspaceRef: string, projectRef: string, runRef: string, projectionDigest: string, items: readonly ScenarioBindingItem[]): Promise<RunScenarioBindingsView> {
+    if (!digest(projectionDigest) || !Array.isArray(items) || items.length < 1 || items.length > MAX_SCENARIO_BINDING_ITEMS
+      || new Set(items.map((item) => item.libraryScenarioId)).size !== items.length
+      || !items.every((item) => identifier(item.catalogScenarioId) && (item.method === "GET" || item.method === "HEAD")
+        && ROUTE_TEMPLATE.test(item.routeTemplate) && SCENARIO_ID.test(item.libraryScenarioId)
+        && (item.source === "library" || item.source === "custom") && digest(item.definitionDigest))) invalidRequest();
+    const value = await this.#json(runPath(workspaceRef, projectRef, runRef, "/scenario-bindings"), "POST", {
+      schema_version: "heel.run-scenario-bindings.v1",
+      projection_digest: projectionDigest,
+      items: items.map((item) => ({
+        binding_version: 1, catalog_scenario_id: item.catalogScenarioId, definition_digest: item.definitionDigest,
+        library_scenario_id: item.libraryScenarioId, method: item.method, route_template: item.routeTemplate, source: item.source,
+      })),
+    }, 201);
+    const view = parseBindingsView(value, runRef);
+    if (view.projectionDigest !== projectionDigest || view.bindings.length !== items.length) invalidResponse();
+    return view;
+  }
+
   async #json(path: string, method: "GET" | "POST", body: unknown, expectedStatus: number, extraHeaders: Record<string, string> = {}, signal?: AbortSignal): Promise<JsonRecord> {
     const response = await this.#send(path, method, body, extraHeaders, signal);
     if (response.status !== expectedStatus) throw await this.#error(response);
@@ -1064,7 +1337,8 @@ export class CanaryApi {
     const headers = new Headers({ Accept: "application/json", ...extraHeaders });
     let payload: string | undefined;
     if (body !== undefined) {
-      payload = canonicalJson(body);
+      // Custom definitions carry fractional severities, which the integer-only canonical encoder refuses.
+      payload = body instanceof PreserializedJson ? body.text : canonicalJson(body);
       if (new TextEncoder().encode(payload).byteLength > MAX_REQUEST_BYTES) invalidRequest();
       headers.set("Content-Type", "application/json");
     }
@@ -1118,6 +1392,14 @@ export class CanaryApi {
         && PUBLIC_ERROR_CODES.has(value.code)) code = value.code;
       else if (exact(value, ["error", "code"]) && closedString(value.error, 512)
         && typeof value.code === "string" && PUBLIC_ERROR_CODES.has(value.code)) code = value.code;
+      else if (record(value) && value.schema_version === "heel.scenario-library-error.v1"
+        && typeof value.code === "string" && PUBLIC_ERROR_CODES.has(value.code)
+        && (exact(value, ["schema_version", "code"]) || exact(value, ["schema_version", "code", "errors", "warnings"]))) {
+        code = value.code;
+        if (Array.isArray(value.errors) && value.errors.length <= 32 && value.errors.every((item) => closedString(item, 512))) {
+          return new CanaryApiError(code, response.status, value.errors as string[]);
+        }
+      }
     } catch {
       // A malformed error response never widens the public error surface.
     }
