@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import worker, { CANARY_ID, MODES, ROUTES } from "./worker.mjs";
+import worker, { AUTH_CANARY_ID, CANARY_ID, MODES, ROUTES } from "./worker.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../../..");
@@ -93,12 +93,16 @@ test("unknown paths are 404 and other methods on known routes are 405", async ()
     "/api/exports/heel-canary-export-0002", "/api/exports/HEEL-CANARY-EXPORT-0001", `${EXPORT_PATH}/`, `${EXPORT_PATH}x`,
     `/api/exports/%68eel-canary-export-0001`, `/API/exports/${CANARY_ID}`, `/api/exports/${CANARY_ID}/rows`,
     "/api/exports/attacker-id-0001", "/.well-known/", "/exports/1", "/api/pricing", "/healthz/x", "/openapi.yaml",
+    "/api/auth-records", "/api/auth-records/", "/api/auth-records/heel-canary-auth-0002", "/api/auth-records/HEEL-CANARY-AUTH-0001",
+    `/api/auth-records/${AUTH_CANARY_ID}/`, `/api/auth-records/${AUTH_CANARY_ID}x`, `/api/auth-records/%68eel-canary-auth-0001`,
+    `/API/auth-records/${AUTH_CANARY_ID}`, `/api/auth-record/${AUTH_CANARY_ID}`, `/api/exports/${AUTH_CANARY_ID}`,
+    `/api/auth-records/${CANARY_ID}`, "/api/auth-records/attacker-id-0001",
   ];
   for (const path of unknown) {
     for (const method of ["GET", "HEAD", "POST", "DELETE"]) {
       const got = await call(path, { method, token: PRO });
       assert.equal(got.status, 404, `${method} ${path}`);
-      assert.ok(!got.text.includes("attacker-id") && !got.text.includes("acct_canary"), path);
+      assert.ok(!got.text.includes("attacker-id") && !got.text.includes("acct_canary") && !got.text.includes("canary-auth"), path);
       if (method === "GET") assert.deepEqual(JSON.parse(got.text), { error: "not found" });
     }
   }
@@ -286,7 +290,7 @@ test("source has no outbound fetch, redirect, import, binding or plan metadata",
   }
   for (const forbidden of [FREE, PRO, VERIFY]) assert.ok(!config.includes(forbidden));
   const openapi = JSON.parse(readFileSync(join(HERE, "openapi.json"), "utf8"));
-  assert.deepEqual(Object.keys(openapi.paths), ["/api/export", "/api/exports/{id}"]);
+  assert.deepEqual(Object.keys(openapi.paths), ["/api/export", "/api/exports/{id}", "/api/auth-records/{id}"]);
   // The ordinary route has no parameter, so its mapping needs no fixture binding.
   assert.deepEqual(Object.keys(openapi.paths["/api/export"]).sort(), ["get", "head"]);
   for (const operation of Object.values(openapi.paths["/api/export"])) assert.deepEqual(Object.keys(operation).sort(), ["operationId", "responses"]);
@@ -294,7 +298,12 @@ test("source has no outbound fetch, redirect, import, binding or plan metadata",
   assert.deepEqual(Object.keys(item).sort(), ["get", "head", "parameters"]);
   // An ordinary required path parameter: no example, enum, default or marker value.
   assert.deepEqual(item.parameters, [{ name: "id", in: "path", required: true, schema: { type: "string" } }]);
-  assert.doesNotMatch(JSON.stringify(openapi), /"x-|plan|finding|security|canary|protected|example|enum|default/i);
+  // The record route is the same shape: an ordinary required string id, two plain operations.
+  const record = openapi.paths["/api/auth-records/{id}"];
+  assert.deepEqual(Object.keys(record).sort(), ["get", "head", "parameters"]);
+  assert.deepEqual(record.parameters, [{ name: "id", in: "path", required: true, schema: { type: "string" } }]);
+  for (const operation of [record.get, record.head]) assert.deepEqual(Object.keys(operation).sort(), ["operationId", "responses"]);
+  assert.doesNotMatch(JSON.stringify(openapi), /"x-|plan|finding|security|canary|protected|example|enum|default|privilege|criterion|anonymous|authenticated/i);
 });
 
 test("the target serves its own inventory at /openapi.json, byte-identical to openapi.json", async () => {
@@ -309,8 +318,8 @@ test("the target serves its own inventory at /openapi.json, byte-identical to op
   const head = await call("/openapi.json", { method: "HEAD" });
   assert.equal(head.status, 200);
   assert.equal(head.bytes.length, 0);
-  // The inventory lists only the two export routes: no ownership, health or spec endpoint.
-  assert.deepEqual(Object.keys(JSON.parse(file).paths), ["/api/export", "/api/exports/{id}"]);
+  // The inventory lists only the export and record routes: no ownership, health or spec endpoint.
+  assert.deepEqual(Object.keys(JSON.parse(file).paths), ["/api/export", "/api/exports/{id}", "/api/auth-records/{id}"]);
 });
 
 // Component proof only: the worker's own responses are evaluated by the UNCHANGED product
@@ -508,8 +517,10 @@ test("canary-dependent paired read: the unchanged paired evaluator decides the w
       [`ordinary ${method} ${mode}`, mode, method, null, FREE, PRO, { outcome: "inconclusive", protected: [null, null] }])),
   ];
   const prepared = paired({ phase: "prepare", openapi, cases: matrix.map(([, , method, fixture_id]) => ({ method, fixture_id })) });
-  // The runner reads exactly the served inventory: one templated export route, GET and HEAD.
+  // The runner reads exactly the served inventory: three routes, GET and HEAD each.
   assert.deepEqual(prepared.inventory, [
+    { method: "GET", route_template: "/api/auth-records/{id}", operation_id: "getauthrecord", placeholders: ["id"] },
+    { method: "HEAD", route_template: "/api/auth-records/{id}", operation_id: "headauthrecord", placeholders: ["id"] },
     { method: "GET", route_template: "/api/export", operation_id: "getaccountexport", placeholders: [] },
     { method: "HEAD", route_template: "/api/export", operation_id: "headaccountexport", placeholders: [] },
     { method: "GET", route_template: "/api/exports/{id}", operation_id: "getexport", placeholders: ["id"] },
@@ -533,4 +544,262 @@ test("canary-dependent paired read: the unchanged paired evaluator decides the w
   const results = paired({ phase: "evaluate", openapi, cases });
   assert.equal(results.length, matrix.length);
   results.forEach((result, index) => assert.deepEqual(result, matrix[index][6], matrix[index][0]));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Authentication read route: GET/HEAD /api/auth-records/heel-canary-auth-0001.
+// Only a request WITH NO Authorization header depends on the operator mode; any configured
+// identity is the positive control; malformed/unknown credentials are refused in every mode.
+const AUTH_PATH = `/api/auth-records/${AUTH_CANARY_ID}`;
+const AUTH_RECORD = { record_id: "rec_canary", account_id: "acct_canary", display_name: "Synthetic Record", protected_canary: AUTH_CANARY_ID };
+const AUTH_BYTES = 130;
+const AUTH_SHA = "e05f9db1b4cde34ee1a00b4077f2e541ade727d9208c8ba58427ec809a9489d2";
+// Malformed or unknown credentials: never the record, in any mode.
+const REFUSED_CREDENTIALS = [
+  { token: OTHER },
+  { token: sha(FREE) },
+  { authorization: `bearer ${PRO}` },
+  { authorization: `Basic ${PRO}` },
+  { authorization: "Bearer" },
+  { authorization: "Bearer " },
+  { authorization: "" },
+  { authorization: `Bearer ${PRO} ${PRO}` },
+  { authorization: `Bearer ${PRO}, Bearer ${FREE}` },
+  { authorization: `Bearer ${"a".repeat(513)}` },
+];
+
+test("auth record: every configured identity is the positive control in every mode", async () => {
+  for (const mode of MODES) {
+    const config = env({ HEEL_TARGET_MODE: mode });
+    for (const token of [FREE, PRO]) {
+      const got = await call(AUTH_PATH, { token, config });
+      assert.equal(got.status, 200, `${mode}`);
+      assert.equal(got.text, JSON.stringify(AUTH_RECORD));
+      assert.equal(got.bytes.length, AUTH_BYTES);
+      assert.equal(sha(got.bytes), AUTH_SHA);
+      assert.equal(got.headers.get("content-type"), "application/json");
+      assert.equal(got.headers.get("cache-control"), "no-store");
+      const head = await call(AUTH_PATH, { method: "HEAD", token, config });
+      assert.equal(head.status, 200);
+      assert.equal(head.bytes.length, 0);
+      assert.equal(head.headers.get("content-length"), String(AUTH_BYTES));
+    }
+  }
+});
+
+test("auth record: a missing Authorization header is the only mode-dependent case", async () => {
+  const anon = async (mode, extra = {}) => call(AUTH_PATH, { config: env({ HEEL_TARGET_MODE: mode }), ...extra });
+  const vulnerable = await anon("vulnerable");
+  assert.equal(vulnerable.status, 200);
+  assert.equal(vulnerable.text, JSON.stringify(AUTH_RECORD));
+  assert.equal(sha(vulnerable.bytes), AUTH_SHA);
+  const patched = await anon("patched");
+  assert.equal(patched.status, 401);
+  assert.equal(patched.bytes.length, 0);
+  assert.equal(patched.headers.get("content-length"), "0");
+  assert.equal(patched.headers.get("content-type"), null);
+  assert.equal(patched.headers.get("www-authenticate"), "Bearer");
+  const envelope = await anon("error_envelope");
+  assert.equal(envelope.status, 401);
+  assert.deepEqual(JSON.parse(envelope.text), { error: "unauthenticated" });
+  assert.equal(envelope.headers.get("www-authenticate"), "Bearer");
+  // HEAD mirrors GET status with no body.
+  for (const [mode, status] of [["vulnerable", 200], ["patched", 401], ["error_envelope", 401]]) {
+    const head = await anon(mode, { method: "HEAD" });
+    assert.equal(head.status, status, mode);
+    assert.equal(head.bytes.length, 0);
+  }
+  // No query, header or cookie toggles the mode.
+  for (const extra of [{ headers: { "x-heel-target-mode": "vulnerable" } }, { headers: { cookie: "mode=vulnerable" } }]) {
+    assert.equal((await anon("patched", extra)).status, 401);
+  }
+  assert.equal((await call(`${AUTH_PATH}?mode=vulnerable`, { config: env({ HEEL_TARGET_MODE: "patched" }) })).status, 401);
+});
+
+test("auth record: malformed or unknown credentials are refused with no protected content in every mode", async () => {
+  for (const mode of MODES) {
+    for (const options of REFUSED_CREDENTIALS) {
+      for (const method of ["GET", "HEAD"]) {
+        const got = await call(AUTH_PATH, { method, config: env({ HEEL_TARGET_MODE: mode }), ...options });
+        const label = `${mode} ${method} ${JSON.stringify(options).length}`;
+        assert.equal(got.status, 401, label);
+        assert.equal(got.headers.get("www-authenticate"), "Bearer");
+        const visible = got.text + JSON.stringify([...got.headers]);
+        assert.ok(!/canary-auth|rec_canary|acct_canary|Synthetic Record/.test(visible), label);
+        if (method === "GET") assert.deepEqual(JSON.parse(got.text), { error: "unauthenticated" });
+      }
+    }
+  }
+});
+
+test("auth record fails closed (503) on missing or invalid config, for every caller", async () => {
+  const broken = [
+    { HEEL_FREE_TOKEN_SHA256: undefined }, { HEEL_PRO_TOKEN_SHA256: "" }, { HEEL_FREE_TOKEN_SHA256: sha(PRO) },
+    { HEEL_FREE_TOKEN_SHA256: sha(FREE).toUpperCase() }, { HEEL_TARGET_MODE: undefined }, { HEEL_TARGET_MODE: "Vulnerable" },
+  ];
+  for (const overrides of broken) {
+    for (const options of [{}, { token: FREE }, { token: PRO }, { token: OTHER }]) {
+      const got = await call(AUTH_PATH, { config: env(overrides), ...options });
+      assert.equal(got.status, 503, JSON.stringify(overrides));
+      assert.deepEqual(JSON.parse(got.text), { error: "target not configured" });
+    }
+  }
+  for (const config of [null, {}]) assert.equal((await call(AUTH_PATH, { config })).status, 503);
+});
+
+test("the existing export routes keep refusing a missing Authorization header in every mode", async () => {
+  for (const [path] of EXPORTS) {
+    for (const mode of MODES) {
+      for (const method of ["GET", "HEAD"]) {
+        const got = await call(path, { method, config: env({ HEEL_TARGET_MODE: mode }) });
+        assert.equal(got.status, 401, `${path} ${mode} ${method}`);
+        if (method === "GET") assert.deepEqual(JSON.parse(got.text), { error: "unauthenticated" });
+      }
+    }
+  }
+});
+
+test("auth record receipts are bounded and carry no token, digest, header, query or body", async () => {
+  logs.length = 0;
+  const secrets = [FREE, PRO, OTHER, sha(FREE), sha(PRO), VERIFY, "query-value-0002", "posted-body-0002", "header-value-0002"];
+  let count = 0;
+  for (const mode of MODES) {
+    for (const options of [{}, { token: FREE }, { token: PRO }, { token: OTHER }, { authorization: `Basic ${PRO}` }]) {
+      for (const method of ["GET", "HEAD", "POST"]) {
+        const got = await call(`${AUTH_PATH}?q=query-value-0002`, {
+          method, config: env({ HEEL_TARGET_MODE: mode }), headers: { "x-probe": "header-value-0002" },
+          body: method === "POST" ? "posted-body-0002" : undefined, ...options,
+        });
+        count += 1;
+        const visible = got.text + JSON.stringify([...got.headers]);
+        for (const value of secrets.slice(0, 5)) assert.ok(!visible.includes(value));
+      }
+    }
+  }
+  assert.equal(logs.length, count);
+  const roles = new Set();
+  for (const line of logs) {
+    for (const value of [...secrets, "authorization", "Bearer"]) assert.ok(!line.includes(value));
+    const receipt = JSON.parse(line);
+    assert.deepEqual(Object.keys(receipt).sort(), ["body_sha256", "method", "mode", "receipt", "role", "route", "status"]);
+    assert.equal(receipt.route, "/api/auth-records/{id}");
+    roles.add(receipt.role);
+  }
+  assert.deepEqual([...roles].sort(), ["-", "free", "malformed", "none", "pro", "unknown"]);
+});
+
+// Authentication-read validation (component proof, not deployed acceptance): the same
+// unchanged product composition as the paired canary test above, for the catalog's
+// anonymous_authenticated_read scenario. The anonymous action uses the anonymous auth
+// profile (the runner sends no credential); the authenticated action uses bearer.
+const AUTH_PAIRED = `
+import base64, json, sys
+sys.path.insert(0, sys.argv[1])
+from heel.runner.adapters import evaluate_pair, prepare_action
+from heel.runner.catalog import CATALOG_BY_ID
+from heel.runner.content_assertion import protected_content
+from heel.runner.http_transport import _body_shape
+from heel.runner.openapi_routes import RouteInventory
+from heel.runner.store import _mapping_record
+
+SCENARIO = "anonymous_authenticated_read"
+request = json.load(sys.stdin)
+inventory = RouteInventory(json.loads(base64.b64decode(request["openapi"])))
+listed = {(r["method"], r["route_template"]) for r in inventory.read_routes()}
+catalog = CATALOG_BY_ID[SCENARIO]
+
+def actions(method, fixture_id):
+    assert (method, "/api/auth-records/{id}") in listed
+    mapping = _mapping_record({
+        "scenario_id": SCENARIO, "method": method, "route_template": "/api/auth-records/{id}",
+        "fixture_bindings": [{"parameter_name": "id", "fixture_id": fixture_id}],
+    })
+    return [{
+        "ordinal": ordinal, "scenario_id": SCENARIO, "adapter_version": catalog["adapter_version"],
+        "method": method, "route_template": mapping["route_template"],
+        "fixture_bindings": [dict(item) for item in mapping["fixture_bindings"]],
+        "semantic_auth_role": role, "auth_profile": "anonymous" if role == "anonymous" else "bearer",
+        "assertion_class": catalog["assertion_class"],
+        "allowed_status_codes": list(catalog["allowed_status_codes"]),
+        "allowed_body_shapes": list(catalog["allowed_body_shapes"]),
+        "side_effect_class": catalog["side_effect_class"],
+    } for ordinal, role in enumerate(catalog["semantic_roles"])]
+
+if request["phase"] == "prepare":
+    out = []
+    for case in request["cases"]:
+        prepared = [prepare_action(action) for action in actions(case["method"], case["fixture_id"])]
+        out.append([{"role": p.semantic_auth_role, "profile": p.auth_profile, "method": p.method, "route": p.route} for p in prepared])
+    json.dump(out, sys.stdout)
+else:
+    out = []
+    for case in request["cases"]:
+        observations = []
+        for action, side in zip(actions(case["method"], case["fixture_id"]), case["responses"]):
+            body = base64.b64decode(side["body"])
+            markers = [b["fixture_id"] for b in action["fixture_bindings"] if b["fixture_id"].startswith("heel-canary-")]
+            observations.append({
+                "status": side["status"],
+                "shape": _body_shape(body, method=action["method"]),
+                "protected": protected_content(body, marker=markers[0] if len(markers) == 1 else None,
+                                               status=side["status"], method=action["method"]),
+            })
+        pair = evaluate_pair(
+            SCENARIO, observations[0]["status"], observations[1]["status"], method=case["method"],
+            first_body_shape=observations[0]["shape"], second_body_shape=observations[1]["shape"],
+            first_protected=observations[0]["protected"], second_protected=observations[1]["protected"],
+        )
+        out.append({"outcome": pair.outcome, "protected": [o["protected"] for o in observations]})
+    json.dump(out, sys.stdout)
+`;
+
+test("authentication read: the unchanged anonymous/authenticated evaluator decides the worker's responses", async () => {
+  const served = await call("/openapi.json");
+  const openapi = Buffer.from(served.bytes).toString("base64");
+  const run = (payload) => {
+    const result = spawnSync(python(), ["-I", "-B", "-c", AUTH_PAIRED, REPO], { input: JSON.stringify(payload), encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  // [label, mode, method, bound fixture id, anonymous-side options, authenticated-side options, expected]
+  const matrix = [
+    ...[FREE, PRO].flatMap((token) => [
+      ["vulnerable", "vulnerable", "GET", AUTH_CANARY_ID, {}, { token }, { outcome: "observed", protected: [true, true] }],
+      ["patched", "patched", "GET", AUTH_CANARY_ID, {}, { token }, { outcome: "blocked", protected: [false, true] }],
+      ["error_envelope", "error_envelope", "GET", AUTH_CANARY_ID, {}, { token }, { outcome: "inconclusive", protected: [null, true] }],
+    ]),
+    // HEAD carries no body: never a finding, in any mode.
+    ...MODES.map((mode) => [`HEAD ${mode}`, mode, "HEAD", AUTH_CANARY_ID, {}, { token: PRO }, { outcome: "inconclusive", protected: [null, null] }]),
+    // Positive control failure: the authenticated side is unknown or malformed.
+    ...MODES.flatMap((mode) => [
+      [`control unknown ${mode}`, mode, "GET", AUTH_CANARY_ID, {}, { token: OTHER }, { outcome: "inconclusive" }],
+      [`control malformed ${mode}`, mode, "GET", AUTH_CANARY_ID, {}, { authorization: `Basic ${PRO}` }, { outcome: "inconclusive" }],
+    ]),
+    // Unknown fixture ids reach only 404s and stay inconclusive.
+    ["other canary", "vulnerable", "GET", "heel-canary-auth-0002", {}, { token: PRO }, { outcome: "inconclusive", protected: [null, null] }],
+    ["no marker", "vulnerable", "GET", "auth-0001", {}, { token: PRO }, { outcome: "inconclusive", protected: [null, null] }],
+  ];
+  const prepared = run({ phase: "prepare", openapi, cases: matrix.map(([, , method, fixture_id]) => ({ method, fixture_id })) });
+  const cases = [];
+  for (const [index, [label, mode, method, fixture_id, anonymous, authenticated]] of matrix.entries()) {
+    const actions = prepared[index];
+    assert.deepEqual(actions.map((a) => [a.role, a.profile]), [["anonymous", "anonymous"], ["authenticated", "bearer"]], label);
+    assert.ok(actions.every((a) => a.method === method && a.route === `/api/auth-records/${fixture_id}`), label);
+    const config = env({ HEEL_TARGET_MODE: mode });
+    const responses = [];
+    for (const [action, options] of [[actions[0], anonymous], [actions[1], authenticated]]) {
+      const got = await call(action.route, { method, config, ...options });
+      responses.push({ status: got.status, body: Buffer.from(got.bytes).toString("base64") });
+    }
+    cases.push({ method, fixture_id, responses });
+  }
+  const results = run({ phase: "evaluate", openapi, cases });
+  assert.equal(results.length, matrix.length);
+  results.forEach((result, index) => {
+    const want = matrix[index][6];
+    assert.equal(result.outcome, want.outcome, matrix[index][0]);
+    if (want.protected) assert.deepEqual(result.protected, want.protected, matrix[index][0]);
+    // The anonymous side is never "protected" unless the target is vulnerable.
+    if (matrix[index][1] !== "vulnerable") assert.notEqual(result.protected[0], true, matrix[index][0]);
+  });
 });

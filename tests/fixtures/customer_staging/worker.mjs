@@ -2,8 +2,9 @@
 //
 // A standalone Cloudflare Worker with no bindings, storage, outbound fetch, redirect or
 // dependency. It serves one ownership-proof file, two plan-gated export routes (an ordinary
-// markerless one and a canary-bound one), one health route and its own static OpenAPI
-// inventory. All data is static and fake. Nothing here is Heel product code.
+// markerless one and a canary-bound one), one authentication-gated canary read route, one
+// health route and its own static OpenAPI inventory. All data is static and fake. Nothing
+// here is Heel product code.
 //
 // Operator configuration (never request-controlled):
 //   HEEL_TARGET_MODE       var:    vulnerable | patched | error_envelope
@@ -28,12 +29,23 @@ const EXPORT = Object.freeze({
 });
 // Canary export at /api/exports/heel-canary-export-0001: the same payload plus the marker.
 const CANARY_EXPORT = Object.freeze({ ...EXPORT, protected_canary: CANARY_ID });
+// The one approved synthetic authentication-read fixture id, served only at
+// /api/auth-records/heel-canary-auth-0001. Public, fake and not a secret.
+export const AUTH_CANARY_ID = "heel-canary-auth-0001";
+// Fake protected record. Its marker is in the top-level protected_canary field only.
+const AUTH_RECORD = Object.freeze({
+  record_id: "rec_canary",
+  account_id: "acct_canary",
+  display_name: "Synthetic Record",
+  protected_canary: AUTH_CANARY_ID,
+});
+const AUTH_ROUTE = "/api/auth-records/{id}";
 // Served verbatim at /openapi.json; byte-for-byte equal to openapi.json beside this file.
-// Two export paths; the id route has an ordinary path parameter only. No marker value,
-// example, plan, finding or extension annotation.
+// Two export paths and one record path; each id route has an ordinary path parameter only.
+// No marker value, example, plan, finding, privilege or extension annotation.
 const OPENAPI = JSON.stringify({
   openapi: "3.1.0",
-  info: { title: "Heel controlled staging target API", version: "1.2.0" },
+  info: { title: "Heel controlled staging target API", version: "1.3.0" },
   paths: {
     "/api/export": {
       get: { operationId: "getAccountExport", responses: { 200: { description: "ok" } } },
@@ -43,6 +55,11 @@ const OPENAPI = JSON.stringify({
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
       get: { operationId: "getExport", responses: { 200: { description: "ok" } } },
       head: { operationId: "headExport", responses: { 200: { description: "ok" } } },
+    },
+    "/api/auth-records/{id}": {
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      get: { operationId: "getAuthRecord", responses: { 200: { description: "ok" } } },
+      head: { operationId: "headAuthRecord", responses: { 200: { description: "ok" } } },
     },
   },
 }, null, 2) + "\n";
@@ -55,6 +72,7 @@ export const ROUTES = Object.freeze({
   "/.well-known/heel-verify.txt": "/.well-known/heel-verify.txt",
   "/api/export": "/api/export",
   [`/api/exports/${CANARY_ID}`]: "/api/exports/{id}",
+  [`/api/auth-records/${AUTH_CANARY_ID}`]: AUTH_ROUTE,
   "/healthz": "/healthz",
   "/openapi.json": "/openapi.json",
 });
@@ -131,6 +149,18 @@ function exportResponse(route, mode, plan) {
   return json(403, DENIAL_ENVELOPE);
 }
 
+// Authentication read: any configured identity (free or pro) is the positive control and
+// always gets the record. Only a request with NO Authorization header depends on the mode.
+// A malformed or unknown credential is refused with the 401 envelope in every mode.
+function authRecordResponse(mode, caller) {
+  if (caller === "free" || caller === "pro") return json(200, AUTH_RECORD);
+  if (caller === "none" && mode === "vulnerable") return json(200, AUTH_RECORD);
+  if (caller === "none" && mode === "patched") {
+    return { status: 401, type: null, body: new Uint8Array(0), authenticate: true };
+  }
+  return { ...json(401, { error: "unauthenticated" }), authenticate: true };
+}
+
 async function decide(request, env, method, route) {
   if (route === "/healthz") {
     const revision = configString(env, "HEEL_TARGET_REVISION");
@@ -156,6 +186,7 @@ async function decide(request, env, method, route) {
   const config = exportConfig(env);
   if (config === null) return { role: "-", ...json(503, { error: "target not configured" }) };
   const plan = await role(request, config);
+  if (route === AUTH_ROUTE) return { role: plan, ...authRecordResponse(config.mode, plan) };
   if (plan !== "free" && plan !== "pro") {
     return { role: plan, ...json(401, { error: "unauthenticated" }), authenticate: true };
   }
