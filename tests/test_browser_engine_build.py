@@ -24,7 +24,9 @@ WHEEL_NAME = f"heel_browser-{ENGINE_VERSION}-py3-none-any.whl"
 DIST_INFO = f"heel_browser-{ENGINE_VERSION}.dist-info"
 MODULE_PATHS = (
     "heel/__init__.py",
+    "heel/browser_assess.py",
     "heel/browser_review.py",
+    "heel/contracts.py",
     "heel/findings_sync.py",
     "heel/openapi_model.py",
     "heel/product_model.py",
@@ -32,6 +34,7 @@ MODULE_PATHS = (
     "heel/review_contract.py",
     "heel/review_rules.py",
     "heel/review_service.py",
+    "heel/semantic.py",
     "heel/static_review.py",
 )
 LICENSE_PATHS = (
@@ -135,6 +138,7 @@ class BrowserEngineBuildTests(unittest.TestCase):
     def test_actual_local_import_closure_is_the_exact_wheel_module_allowlist(self):
         closure = (
             _local_import_closure("__init__")
+            | _local_import_closure("browser_assess")
             | _local_import_closure("browser_review")
             | _local_import_closure("findings_sync")
         )
@@ -144,8 +148,31 @@ class BrowserEngineBuildTests(unittest.TestCase):
         }
 
         self.assertEqual(closure, packaged_modules)
-        self.assertNotIn("contracts", closure)
-        self.assertNotIn("entitlements", closure)
+        # The static assessment reuses only the pure data contracts and semantic families; the
+        # legacy engine, its network-capable model and the entitlement graph stay outside.
+        self.assertIn("contracts", closure)
+        self.assertIn("semantic", closure)
+        for excluded in ("agents", "model", "importers", "targets", "entitlements",
+                         "scenarios", "scenario_validate", "business_rules"):
+            self.assertNotIn(excluded, closure)
+
+    def test_engine_closure_includes_assess_only_reviewed_forms(self):
+        wheel, _manifest = self._require_build()
+        with zipfile.ZipFile(wheel) as archive:
+            names = archive.namelist()
+            sources = {path: archive.read(path).decode("utf-8") for path in MODULE_PATHS}
+        self.assertIn("heel/browser_assess.py", names)
+        self.assertFalse(any(name.endswith(".json") for name in names),
+                         "scenario definitions arrive with digests; no package data ships")
+        joined = "\n".join(sources.values())
+        for forbidden in ("import urllib", "from .model", "from .agents", "get_model",
+                          "from .importers", "from .scenarios", "import glob", "import os"):
+            self.assertNotIn(forbidden, joined)
+        assess = ast.parse(sources["heel/browser_assess.py"])
+        relative = sorted({node.module for node in ast.walk(assess)
+                           if isinstance(node, ast.ImportFrom) and node.level == 1})
+        self.assertEqual(relative, ["browser_review", "contracts", "openapi_model",
+                                    "review_answers", "review_contract", "semantic"])
 
     def test_package_initializer_is_subject_to_the_pure_import_policy(self):
         with tempfile.TemporaryDirectory() as temporary:
