@@ -33,7 +33,10 @@ function actionKey(action: ScenarioPlanAction): string {
  * Optional, separate from approval: freezes which library or custom revisions this exact run stands for.
  * Nothing here changes the signed plan or the approval; a run approved without bindings stands for no entry.
  */
-export function ScenarioBindingStep({ actions, entries, frozen, accepting, busy, onFreeze }: ScenarioBindingStepProps) {
+export function ScenarioBindingStep({ actions: planActions, entries, frozen, accepting, busy, onFreeze }: ScenarioBindingStepProps) {
+  // A binding names a (check, method, route) tuple; a plan observing one check under several roles repeats
+  // that tuple once per role, so offer and post each tuple once.
+  const actions = [...new Map(planActions.map((action) => [actionKey(action), action])).values()];
   // One library entry can be frozen against one action of the plan.
   const [selected, setSelected] = useState<Readonly<Record<string, string>>>({});
   const items: ScenarioBindingItem[] = [];
