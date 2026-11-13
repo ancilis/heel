@@ -35,11 +35,12 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 
 ## [1.3.0rc5]: unpublished candidate
 
-Runner preview candidate for the customer scenario library and result-chain recovery. It is not a
-GitHub release, not on PyPI and not publicly deployed. Every customer install surface keeps the
-published, hash-pinned 1.3.0rc4 install until this candidate's own release passes an anonymous
-public verification. The same-origin `/downloads/` files are labeled as this not-yet-published
-candidate.
+Runner preview candidate for the customer scenario library and result-chain recovery. It is not on
+PyPI and not publicly deployed, and it is not a public release until its own GitHub prerelease passes
+an anonymous public verification. A prepared customer-copy change moves every customer install
+surface to this release's one hash-pinned install, whose wheel digest equals the bundled
+`/downloads/` wheel; it is promoted only after that verification passes. The publication date,
+release URL and verification evidence are recorded here at that event, not before.
 
 - Version identity 1.3.0rc5 (npm 1.3.0-rc.5) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc4 stays an accepted saved-review and

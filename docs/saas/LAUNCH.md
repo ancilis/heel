@@ -21,16 +21,16 @@ include a Stripe or PostgreSQL integration.
 - Anonymous browser-local OpenAPI review with a committed sample on first visit.
 - Same-origin, pinned Pyodide runtime and Heel wheel; no analyzer network calls.
 - Explicit local browser save/export without retaining the source document.
-- Checked-in Heel 1.3.0rc5 runner preview candidate wheel, source archive, and manifest under
-  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The 1.3.0rc5 candidate
-  is not yet published. 1.3.0rc4 is published
-  as the public GitHub prerelease <https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>
-  (2026-11-11), and the current public one-command install is its hash-pinned wheel; the release
-  owner's anonymous verify-public passed, which proves packaging only. No independent clean-room
-  customer run of that command is recorded yet. The earlier prerelease
-  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2> stays published as history; its
-  one-command install's independent anonymous run passed on Apple silicon macOS with Python
-  3.13.5. 1.3.0rc4 is not a stable release, its release record is not immutable, it is not
+- Checked-in Heel 1.3.0rc5 runner preview wheel, source archive, and manifest under
+  `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The current public
+  one-command install is the hash-pinned 1.3.0rc5 wheel from the GitHub prerelease
+  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>, whose digest equals the bundled
+  wheel. That copy is deployed only after the release owner's anonymous verify-public for
+  v1.3.0rc5 passes, which proves packaging only. No independent clean-room customer run of that
+  command is recorded yet. 1.3.0rc4 (<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>,
+  2026-11-11) and the earlier prerelease <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>
+  stay published as history; the rc2 one-command install's independent anonymous run passed on
+  Apple silicon macOS with Python 3.13.5. 1.3.0rc5 is not a stable release, its release record is not immutable, it is not
   published to PyPI, and the website that bundles these files is not publicly deployed. It corrects the public 1.3.0rc1 prerelease's `error_envelope` and `hardened`
   errata (an error envelope is inconclusive at every HTTP status), stores no inconclusive
   plan-differential pair as a finding, and never passes a regression whose denial status still

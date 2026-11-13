@@ -108,26 +108,26 @@ it("rejects a runner revoke result outside the typed contract and names the refu
   await expect(refused.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_runner_revocation", status: 400 });
 });
 
-// The 1.3.0rc4 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC4.md ("Customer install
+// The 1.3.0rc5 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC5.md ("Customer install
 // command"), pinned here rather than read from the runbook. It may be deployed only after the release owner's anonymous
-// verify-public for v1.3.0rc4 passes. Every self-serve install surface shows this one command.
-const RC4_WHEEL_SHA256 = "27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af";
-const RC4_RUNBOOK_INSTALL = "python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install "
-  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=${RC4_WHEEL_SHA256}'`
-  + " && ./heel-rc4/bin/heel --version";
+// verify-public for v1.3.0rc5 passes. Every self-serve install surface shows this one command.
+const RC5_WHEEL_SHA256 = "a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226";
+const RC5_RUNBOOK_INSTALL = "python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install "
+  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=${RC5_WHEEL_SHA256}'`
+  + " && ./heel-rc5/bin/heel --version";
 
-it("the dashboard pairing card, /runner and /agent show the exact rc4 runbook install line", async () => {
-  const { RUNNER_RC4_INSTALL, RUNNER_RC4_CLI, RUNNER_RC4_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
-  assert.equal(RUNNER_RC4_INSTALL, RC4_RUNBOOK_INSTALL);
-  assert.equal(RUNNER_RC4_CLI, "./heel-rc4/bin/heel");
-  assert.equal(RUNNER_RC4_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc4");
+it("the dashboard pairing card, /runner and /agent show the exact rc5 runbook install line", async () => {
+  const { RUNNER_RC5_INSTALL, RUNNER_RC5_CLI, RUNNER_RC5_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
+  assert.equal(RUNNER_RC5_INSTALL, RC5_RUNBOOK_INSTALL);
+  assert.equal(RUNNER_RC5_CLI, "./heel-rc5/bin/heel");
+  assert.equal(RUNNER_RC5_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc5");
   const runner = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
-  assert.ok(runner.includes(RC4_RUNBOOK_INSTALL));
-  assert.doesNotMatch(runner, /heel-rc[123]\/|releases\/(tag|download)\/v1\.3\.0rc[23]/);
+  assert.ok(runner.includes(RC5_RUNBOOK_INSTALL));
+  assert.doesNotMatch(runner, /heel-rc[1234]\/|releases\/(tag|download)\/v1\.3\.0rc[234]/);
   const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
-  assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc[123]|heel-rc[123]\b/);
-  assert.ok(agent.includes(`const PUBLIC_WHEEL_SHA256 = "${RC4_WHEEL_SHA256}";`));
-  assert.match(agent, /releases\/download\/v1\.3\.0rc4\/heel_sim-1\.3\.0rc4-py3-none-any\.whl#sha256=\$\{PUBLIC_WHEEL_SHA256\}/);
+  assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc[1234]|heel-rc[1234]\b/);
+  assert.ok(agent.includes(`const PUBLIC_WHEEL_SHA256 = "${RC5_WHEEL_SHA256}";`));
+  assert.match(agent, /releases\/download\/v1\.3\.0rc5\/heel_sim-1\.3\.0rc5-py3-none-any\.whl#sha256=\$\{PUBLIC_WHEEL_SHA256\}/);
 });
 
 it("discovers only a closed pending approval summary", async () => {

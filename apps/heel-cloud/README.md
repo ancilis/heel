@@ -28,23 +28,22 @@ The browser experience works on supported Windows browsers. The machine credenti
 fallback and durable machine sync queue require POSIX descriptor and file-locking
 semantics; Windows CLI/MCP cloud continuity is not launch-supported.
 
-The public Heel 1.3.0rc4 runner preview is a GitHub prerelease at
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>. Like 1.3.0rc2 and 1.3.0rc3, it reports both
+The public Heel 1.3.0rc5 runner preview is a GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>. Like 1.3.0rc2, 1.3.0rc3 and 1.3.0rc4, it reports both
 1.3.0rc1 reference errata cases, the HTTP 200 `error_envelope` case and the HTTP 403 `hardened`
 error-envelope case, as inconclusive, not a passed regression. That prerelease is not a stable release,
 its release record is not immutable, it is not a deployed Heel Cloud URL, and it does not indicate
 customer acceptance. `heel-sim` is not yet published to PyPI. `/agent`, `/runner` and the dashboard
 pairing card show the same one-command, hash-pinned install, which needs Python 3.11 or newer with
 `venv` on Apple silicon macOS or Linux x86_64/aarch64 (Intel macOS is unsupported by this preview),
-puts the CLI at `./heel-rc4/bin/heel`, and requires a physical, symlink-free `HEEL_HOME` (for example
-`"$(pwd -P)/.heel"`). The earlier 1.3.0rc1, 1.3.0rc2 and 1.3.0rc3 prereleases remain published and
+puts the CLI at `./heel-rc5/bin/heel`, and requires a physical, symlink-free `HEEL_HOME` (for example
+`"$(pwd -P)/.heel"`). The earlier 1.3.0rc1, 1.3.0rc2, 1.3.0rc3 and 1.3.0rc4 prereleases remain published and
 unchanged, and the pages keep the rc1 errata as history.
 
-The builder-verified Agent files advertised on `/agent` are the bundled artifacts of the deployed
-build, not themselves a verified public release. In this repository they are the 1.3.0rc5 candidate,
-which is not yet published as a public release; a bundled version becomes a public release only
-through a separate publication and verification, and deploying the Worker with these files exposes
-the unpublished candidate only under an explicit exposure decision. The same-origin files are:
+The builder-verified Agent files advertised on `/agent` are the bundled 1.3.0rc5 artifacts of the
+deployed build. `/agent` refuses to build unless the bundled manifest's wheel digest equals the digest
+pinned in its public command. Deploying the Worker with these files remains a separate deployment
+decision. The same-origin files are:
 
 - `/downloads/heel_sim-1.3.0rc5-py3-none-any.whl`
 - `/downloads/heel_sim-1.3.0rc5.tar.gz`

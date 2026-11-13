@@ -4,8 +4,8 @@ This optional local preview runs a synthetic reference product on your machine. 
 the default Heel journey (signup, product URL and credentials, explicit authorization, then discovery
 and scanning), which needs no OpenAPI document or manual runner setup.
 
-Heel 1.3.0rc4 is a public preview prerelease at
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>. It is not a stable release, its GitHub
+Heel 1.3.0rc5 is a public preview prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>. It is not a stable release, its GitHub
 release record is not immutable, and it is not published to PyPI. The release is not a deployed Heel
 Cloud URL and does not indicate customer acceptance.
 
@@ -14,19 +14,19 @@ You need a POSIX shell and Python 3.11 or newer as `python3` (`python3 --version
 preview: its pinned `cryptography` dependency ships no Intel macOS wheel, and a source build needs an
 additional (Rust) toolchain and is untested. No source checkout, manual download, or Heel Cloud
 deployment is needed. Work in an empty private directory you own. The first command below creates a
-virtual environment in `./heel-rc4`, installs the hash-pinned public wheel with its `runner` extra,
-and prints `heel 1.3.0rc4`; the CLI is then `./heel-rc4/bin/heel`. pip installs the public wheel only
+virtual environment in `./heel-rc5`, installs the hash-pinned public wheel with its `runner` extra,
+and prints `heel 1.3.0rc5`; the CLI is then `./heel-rc5/bin/heel`. pip installs the public wheel only
 if it matches the pinned SHA-256. `--isolated` makes pip ignore environment variables and user
 configuration. The `runner` extra then downloads the pinned `cryptography` dependency and its
 dependencies from the Python package index (PyPI by default) under pip's normal verification; this
-command does not hash-pin them. No independent clean-room run of this exact 1.3.0rc4 install command
+command does not hash-pin them. No independent clean-room run of this exact 1.3.0rc5 install command
 is recorded yet on any platform or Python version.
 
 ```sh
-python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version
+python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && ./heel-rc5/bin/heel --version
 export HEEL_HOME="$(pwd -P)/.heel"
-./heel-rc4/bin/heel reference prepare
-./heel-rc4/bin/heel scope create --target reference:export --operator "demo owner" --confirm
+./heel-rc5/bin/heel reference prepare
+./heel-rc5/bin/heel scope create --target reference:export --operator "demo owner" --confirm
 ```
 
 Use the same absolute physical `HEEL_HOME`, in which no component is a symbolic link, from the first
@@ -39,21 +39,20 @@ refuses that `HEEL_HOME`. Do not disable or work around that check. Run the comm
 same shell so that `HEEL_HOME` stays set.
 
 A Heel Cloud deployment built from the current repository also serves its own bundled wheel on its
-`/agent` page. That file is the build's artifact, not a separate verified public release: in this
-repository it is the 1.3.0rc5 candidate, which is not yet published as a public release. The public
-command above is the recommended install. If you did download `heel_sim-1.3.0rc5-py3-none-any.whl`
+`/agent` page. That file is the build's bundled 1.3.0rc5 wheel; the bundled manifest's wheel digest
+equals the digest pinned in the public command above, which is the recommended install. If you did download `heel_sim-1.3.0rc5-py3-none-any.whl`
 there, you can install that file instead with
-`python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install './heel_sim-1.3.0rc5-py3-none-any.whl[runner]'`.
+`python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install './heel_sim-1.3.0rc5-py3-none-any.whl[runner]'`.
 
 Replace SCOPE_ID below with the returned ID. Each attempt ID is consumed once, including cancelled or interrupted attempts; choose fresh 32-character lowercase hexadecimal IDs on repetition.
 
 ```sh
-./heel-rc4/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
-./heel-rc4/bin/heel reference run --scope SCOPE_ID --case public --attempt 22222222222222222222222222222222
-./heel-rc4/bin/heel reference run --scope SCOPE_ID --case error_envelope --attempt 33333333333333333333333333333333
-./heel-rc4/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 44444444444444444444444444444444
-./heel-rc4/bin/heel reference run --scope SCOPE_ID --case inconclusive --attempt 55555555555555555555555555555555
-./heel-rc4/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 66666666666666666666666666666666 --stop
+./heel-rc5/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 11111111111111111111111111111111
+./heel-rc5/bin/heel reference run --scope SCOPE_ID --case public --attempt 22222222222222222222222222222222
+./heel-rc5/bin/heel reference run --scope SCOPE_ID --case error_envelope --attempt 33333333333333333333333333333333
+./heel-rc5/bin/heel reference run --scope SCOPE_ID --case hardened --attempt 44444444444444444444444444444444
+./heel-rc5/bin/heel reference run --scope SCOPE_ID --case inconclusive --attempt 55555555555555555555555555555555
+./heel-rc5/bin/heel reference run --scope SCOPE_ID --case vulnerable --attempt 66666666666666666666666666666666 --stop
 ```
 
 Results, in order: verified_violation; invariant_held with regression_passed=true for `public`, a

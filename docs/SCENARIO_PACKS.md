@@ -2,6 +2,13 @@
 
 Current evidence boundary (September 4, 2026): library matches are hypotheses or investigation prompts, not verified behavior. Relevant commercial mechanisms require a declared applicable rule and source. Coupon stacking, concurrent sessions, bulk access, sequential IDs, public documentation and versioned/admin routes alone do not establish abuse. Alternate encodings share mechanism IDs and do not multiply executed coverage. Persona characteristics and economic estimates are assumptions. The executable slice and broader gaps are documented in [CAPABILITIES.md](CAPABILITIES.md). Historical vocabulary scores below are not live detection accuracy and are not current after predicate changes.
 
+Library breadth is not executed coverage. The shared library holds 120 entries across the six packs
+below, and the Heel Cloud workspace library (1.3.0rc5 source, not yet deployed) lists them with
+applicability unknown. A library or custom entry reaches the runner only through one of two
+explicit checks, `anonymous_authenticated_read` or `plan_entitlement_read`: bounded `GET`/`HEAD`
+reads under a human-signed scope or a human-approved plan. The bound entry's own objective is not
+executed. See [CAPABILITIES.md](CAPABILITIES.md).
+
 Heel covers SaaS abuse broadly. Agent/MCP is a premium pack for products with agentic surfaces.
 
 Scenario packs let operators focus a run without changing the safety model. Every run still requires

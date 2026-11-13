@@ -1,5 +1,15 @@
 # Customer acceptance readiness
 
+> **Historical plan (November 2026 note).** This page records an earlier managed-scanning
+> acceptance plan: a Heel-operated executor scanning the customer's target. The current product
+> does not take that path. Reads run on the customer's own paired local runner, and credentials and
+> raw evidence stay on the customer's machine. For current behavior and limits see
+> [`docs/CAPABILITIES.md`](../CAPABILITIES.md),
+> [`docs/PLAN_DIFFERENTIAL_RUNNER.md`](../PLAN_DIFFERENTIAL_RUNNER.md), [`LAUNCH.md`](LAUNCH.md) and
+> [`BUILD_STATE.md`](BUILD_STATE.md). The text below is kept unchanged as evidence of that plan and
+> of the preflight gates it defined; its "Current status" line describes that plan, not the
+> current product.
+
 Current status: **BLOCKED**. No public deployment exists (`apps/heel-cloud/README.md`), and
 discovery, managed scanning, credentials, findings and regression on the default path are not
 implemented. Nothing in this document, the preflight or the local tests is customer acceptance.

@@ -13,19 +13,24 @@ if (WHEEL_SHA256 === undefined) {
   throw new Error("verified Heel Agent wheel is missing from the release manifest");
 }
 
-const INSTALL_AGENT = `python3 -m venv heel-rc4
-./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc5-py3-none-any.whl`;
+const INSTALL_AGENT = `python3 -m venv heel-rc5
+./heel-rc5/bin/python -m pip install ./heel_sim-1.3.0rc5-py3-none-any.whl`;
 
-// The public v1.3.0rc4 release wheel digest, pinned literally from docs/RUNNER_PREVIEW_RELEASE_RC4.md. The bundled
-// same-origin files are the unpublished 1.3.0rc5 candidate, whose own digest is shown with its download below.
-const PUBLIC_WHEEL_SHA256 = "27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af";
+// The public v1.3.0rc5 release wheel digest, pinned literally from docs/RUNNER_PREVIEW_RELEASE_RC5.md. The build refuses
+// to render this page unless it equals the bundled manifest's wheel digest, so the public command and the same-origin
+// download name the same bytes.
+const PUBLIC_WHEEL_SHA256 = "a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226";
 
-const INSTALL_PUBLIC_AGENT = `python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}' && ./heel-rc4/bin/heel --version`;
+if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {
+  throw new Error("the public Heel Agent wheel digest does not match the bundled release manifest");
+}
+
+const INSTALL_PUBLIC_AGENT = `python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}' && ./heel-rc5/bin/heel --version`;
 
 const MCP_CONFIGURATION = `{
   "mcpServers": {
     "heel": {
-      "command": "/absolute/path/to/heel-rc4/bin/heel-mcp",
+      "command": "/absolute/path/to/heel-rc5/bin/heel-mcp",
       "env": {
         "HEEL_HOME": "/absolute/path/to/private/heel-data",
         "HEEL_CLOUD_ORIGIN": "https://YOUR_HEEL_DOMAIN"
@@ -38,7 +43,7 @@ const VERIFY_SERVER = `printf '%s\\n' \\
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"heel-quickstart-check","version":"1.0"}}}' \\
   '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \\
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \\
-  | ./heel-rc4/bin/heel-mcp`;
+  | ./heel-rc5/bin/heel-mcp`;
 
 
 export const metadata: Metadata = {
@@ -64,7 +69,7 @@ export default function AgentQuickstart() {
       <article className="mcp-quickstart">
         <header className="quickstart-hero">
           <div>
-            <p className="eyebrow">Heel Agent 1.3.0rc4 public preview · local MCP quickstart</p>
+            <p className="eyebrow">Heel Agent 1.3.0rc5 public preview · local MCP quickstart</p>
             <h1>Investigate product abuse from your AI client.</h1>
             <p>
               Bring product rules and abuse hypotheses into your workflow. Download
@@ -92,13 +97,13 @@ export default function AgentQuickstart() {
             <p>
               Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. Install the
               public preview directly from the public release with one command and no manual wheel
-              download. The downloads further below are this build&apos;s bundled files; the source
-              archive is provided alongside the wheel for inspection.
+              download. The downloads further below are this build&apos;s bundled copies of the same
+              files; the source archive is provided alongside the wheel for inspection.
             </p>
             <p>
-              Version 1.3.0rc4 is a public preview prerelease at{" "}
-              <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc4">
-                github.com/ancilis/heel/releases/tag/v1.3.0rc4
+              Version 1.3.0rc5 is a public preview prerelease at{" "}
+              <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc5">
+                github.com/ancilis/heel/releases/tag/v1.3.0rc5
               </a>
               . It is not a stable release, its GitHub release record is not immutable, it is not
               published to PyPI, and it does not indicate customer acceptance. Python 3.11 or newer
@@ -106,8 +111,8 @@ export default function AgentQuickstart() {
               silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview: its
               pinned <code>cryptography</code> dependency ships no Intel macOS wheel, and a source
               build needs an additional toolchain and is untested. In an empty private directory, this
-              one command creates <code>./heel-rc4</code>, installs the hash-pinned public wheel with
-              its <code>runner</code> extra, and prints <code>heel 1.3.0rc4</code>. pip refuses the
+              one command creates <code>./heel-rc5</code>, installs the hash-pinned public wheel with
+              its <code>runner</code> extra, and prints <code>heel 1.3.0rc5</code>. pip refuses the
               wheel unless its SHA-256 matches; <code>--isolated</code> ignores pip environment
               variables and user configuration, and the <code>runner</code> extra downloads the pinned{" "}
               <code>cryptography</code> package from your Python package index, which this command
@@ -115,9 +120,9 @@ export default function AgentQuickstart() {
             </p>
             <pre><code>{INSTALL_PUBLIC_AGENT}</code></pre>
             <p>
-              The CLI is then <code>./heel-rc4/bin/heel</code> and the MCP server{" "}
-              <code>./heel-rc4/bin/heel-mcp</code>. No independent clean-room run of this 1.3.0rc4
-              command is recorded yet on any platform. Version 1.3.0rc4, like 1.3.0rc2 and 1.3.0rc3,
+              The CLI is then <code>./heel-rc5/bin/heel</code> and the MCP server{" "}
+              <code>./heel-rc5/bin/heel-mcp</code>. No independent clean-room run of this 1.3.0rc5
+              command is recorded yet on any platform. Version 1.3.0rc5, like 1.3.0rc2, 1.3.0rc3 and 1.3.0rc4,
               reports the <code>error_envelope</code> and{" "}
               <code>hardened</code> reference cases as inconclusive. Known 1.3.0rc1 errata: that
               earlier prerelease&apos;s synthetic reference reports the HTTP 200{" "}
@@ -126,9 +131,8 @@ export default function AgentQuickstart() {
               inconclusive at any status; treat each result as inconclusive, not a pass.
             </p>
             <p>
-              The downloads below are this build&apos;s bundled files, not themselves a verified
-              public release: they are the 1.3.0rc5 candidate, which is not yet published as a
-              public release. The public command above is the recommended install.
+              The downloads below are this build&apos;s bundled 1.3.0rc5 files. Their wheel digest
+              equals the one pinned in the public command above, which is the recommended install.
             </p>
             <div className="hero-actions" aria-label="Heel Agent downloads">
               <a
@@ -136,7 +140,7 @@ export default function AgentQuickstart() {
                 download
                 href="/downloads/heel_sim-1.3.0rc5-py3-none-any.whl"
               >
-                Download Heel Agent 1.3.0rc5 candidate
+                Download Heel Agent 1.3.0rc5
               </a>
               <a
                 className="button button-secondary"
@@ -213,8 +217,8 @@ export default function AgentQuickstart() {
               dashboard and findings history, authorize this machine in your browser, choose a project,
               and let the agent prepare an immutable findings-only request.
             </p>
-            <pre><code>{`./heel-rc4/bin/heel cloud --origin https://YOUR_HEEL_DOMAIN login
-./heel-rc4/bin/heel cloud --origin https://YOUR_HEEL_DOMAIN projects`}</code></pre>
+            <pre><code>{`./heel-rc5/bin/heel cloud --origin https://YOUR_HEEL_DOMAIN login
+./heel-rc5/bin/heel cloud --origin https://YOUR_HEEL_DOMAIN projects`}</code></pre>
             <p>
               Your AI client can call <code>heel_sync_prepare</code>, then show you the preview and local
               status. Raw OpenAPI and review context stay on this machine; only the exact minimized
@@ -224,7 +228,7 @@ export default function AgentQuickstart() {
               To send, leave the AI surface and run the interactive command below in your own terminal.
               Replace the references and digest with the values from the prepared record.
             </p>
-            <pre><code>{`./heel-rc4/bin/heel cloud sync approve \\
+            <pre><code>{`./heel-rc5/bin/heel cloud sync approve \\
   --workspace WORKSPACE_REF \\
   --project PROJECT_REF \\
   --digest REQUEST_DIGEST`}</code></pre>

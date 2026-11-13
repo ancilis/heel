@@ -7,14 +7,14 @@ import type { RunnerPairingView } from "../../lib/canary-api";
 
 
 /**
- * The 1.3.0rc4 runner install line, verbatim from the rc4 release-owner runbook (docs/RUNNER_PREVIEW_RELEASE_RC4.md,
- * "Customer install command"). Deploy it only after the release owner's anonymous `verify-public` for v1.3.0rc4 has
- * passed; the wheel digest is the published rc4 wheel, kept byte for byte under tests/fixtures/runner_preview_rc4/.
+ * The 1.3.0rc5 runner install line, verbatim from the rc5 release-owner runbook (docs/RUNNER_PREVIEW_RELEASE_RC5.md,
+ * "Customer install command"). Deploy it only after the release owner's anonymous `verify-public` for v1.3.0rc5 has
+ * passed; the wheel digest is the rc5 wheel bundled byte for byte under public/downloads.
  */
-export const RUNNER_RC4_INSTALL = "python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version";
-export const RUNNER_RC4_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc4";
-/** The CLI that {@link RUNNER_RC4_INSTALL} creates; every runner command the dashboard shows starts with it. */
-export const RUNNER_RC4_CLI = "./heel-rc4/bin/heel";
+export const RUNNER_RC5_INSTALL = "python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && ./heel-rc5/bin/heel --version";
+export const RUNNER_RC5_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc5";
+/** The CLI that {@link RUNNER_RC5_INSTALL} creates; every runner command the dashboard shows starts with it. */
+export const RUNNER_RC5_CLI = "./heel-rc5/bin/heel";
 const PAIRING_ID_SHAPE = /^pending_[0-9a-f]{32}$/;
 export const PAIRING_UNCONFIGURED = "Runner pairing is unavailable: this dashboard's public address is not configured, so no pair command can be shown. No invitation was created; contact your Heel operator.";
 
@@ -68,12 +68,12 @@ export function RunnerPairingCard({
   return (
     <section className="runner-recovery" aria-labelledby="pair-runner-title"><p className="canary-kicker">Local runner</p><h2 id="pair-runner-title">Pair a runner</h2>
       <p>The runner runs on your machine and sends the only target traffic. Target credentials stay on that machine; this browser never asks for them.</p>
-      <p>1. Install the public preview runner (<a href={RUNNER_RC4_RELEASE_URL}>Heel 1.3.0rc4 release</a>):</p>
-      <p><code>{RUNNER_RC4_INSTALL}</code></p>
+      <p>1. Install the public preview runner (<a href={RUNNER_RC5_RELEASE_URL}>Heel 1.3.0rc5 release</a>):</p>
+      <p><code>{RUNNER_RC5_INSTALL}</code></p>
       <p>2. Create a one-time invitation. It expires after 10 minutes and is shown only here, once.</p>
       {origin === null ? <p role="status">{PAIRING_UNCONFIGURED}</p> : invitation !== null && !invitationExpired ? <div role="group" aria-label="Runner pairing invitation">
         <p>Run this on the runner machine before {clock(invitation.expiresAt)}. It prints a pairing id, six words and a fingerprint:</p>
-        <p><code>{`${RUNNER_RC4_CLI} runner pair --origin ${origin} --invite ${invitation.token}`}</code></p>
+        <p><code>{`${RUNNER_RC5_CLI} runner pair --origin ${origin} --invite ${invitation.token}`}</code></p>
       </div> : <>
         {invitationExpired ? <p role="status">This invitation expired unused or unopened. Create a new one.</p> : null}
         <button className="button button-primary" disabled={busy} onClick={onCreateInvitation} type="button">Create pairing invitation</button>
