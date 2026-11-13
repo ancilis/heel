@@ -12,7 +12,7 @@ deployed (T-1), serves an ownership-proof file (T-2), and has a `patched` mode w
 existing matcher can decide (T-3). The export payload, the `{"error": "upgrade required"}`
 envelope and the marker id are reused from that harness.
 
-The target serves the same export through two routes. They share the same digest-only auth and
+The target serves the same export through two export routes. They share the same digest-only auth and
 operator-controlled mode, and differ only in the payload and in which Heel path can decide them.
 
 **Ordinary route: `GET`/`HEAD /api/export`** (no path parameter, no marker). This is the
@@ -35,9 +35,19 @@ path, never in the ordinary body or the OpenAPI document. Body: 142 bytes, sha25
 `32dcd0f899e627cf3d7c41cedf3a1ad67aba36523af5e404a71312304b3c28aa`:
 `{"account_id":"acct_canary","format":"csv","rows":[{"id":"row_1","amount_cents":1200}],"total":1,"protected_canary":"heel-canary-export-0001"}`.
 
-Neither route is a coverage claim. Each one exercises a single synthetic read on this fixture.
+**Authentication read route: `GET`/`HEAD /api/auth-records/{id}`** (*anonymous vs
+authenticated read*, catalog scenario `anonymous_authenticated_read`). The export routes refuse
+every missing, malformed or unknown credential with the `401 {"error":"unauthenticated"}`
+envelope in every mode. The content predicate correctly treats that envelope as inconclusive,
+so those routes cannot show a decisive anonymous `blocked` or `observed` result. This route
+fills that gap. It is served only for the one approved synthetic id `heel-canary-auth-0001`
+and uses the same operator mode and the same two configured digests (no new secret). Body:
+130 bytes, sha256 `e05f9db1b4cde34ee1a00b4077f2e541ade727d9208c8ba58427ec809a9489d2`:
+`{"record_id":"rec_canary","account_id":"acct_canary","display_name":"Synthetic Record","protected_canary":"heel-canary-auth-0001"}`.
 
-`openapi.json`: 1025 bytes, sha256 `dd562a1345fac05aec6cb3152ebf47c85caf354541b25d967238ed7ff48e0359`.
+None of the routes is a coverage claim. Each one exercises a single synthetic read on this fixture.
+
+`openapi.json`: 1575 bytes, sha256 `38eeb21edaf16cefeff573c97aca50e1be56cafeb11c78736a2b04848e8ec132`.
 
 ## Contract
 
@@ -46,28 +56,44 @@ Neither route is a coverage claim. Each one exercises a single synthetic read on
 | `/.well-known/heel-verify.txt` | GET, HEAD | `200 text/plain`, body = `HEEL_VERIFY_TOKEN` + `\n`; `503` if unset or not 16-512 printable ASCII. No setter. |
 | `/api/export` | GET, HEAD | Ordinary export (97 bytes, no marker). `Authorization: Bearer <token>`; the SHA-256 of the token must equal exactly one configured digest. Missing/malformed/unknown → `401 {"error":"unauthenticated"}`. |
 | `/api/exports/heel-canary-export-0001` | GET, HEAD | Canary export (142 bytes, `protected_canary`). Same auth and modes as `/api/export`. |
+| `/api/auth-records/heel-canary-auth-0001` | GET, HEAD | Auth record (130 bytes, `protected_canary`). Either configured identity → `200` record in every mode. Malformed/unknown credential → `401 {"error":"unauthenticated"}` in every mode. **No** `Authorization` header → depends on mode (table below). |
 | `/healthz` | GET, HEAD | `{"status","mode","revision","ownership_configured","export_configured"}` only. |
 | `/openapi.json` | GET, HEAD | `200 application/json`, byte-identical to `openapi.json` here, so a clean-room user can download the inventory without repository access. |
-| any other path (including any other export id) | any | `404 {"error":"not found"}`; the path is never reflected. |
+| any other path (including any other export or record id) | any | `404 {"error":"not found"}`; the path is never reflected. |
 | known path | other methods | `405`, `Allow: GET, HEAD` |
 
-The served inventory lists only `GET`/`HEAD /api/export` (no parameter) and `GET`/`HEAD
-/api/exports/{id}` (an ordinary required `string` path parameter): no ownership, health or
-spec endpoint, no marker value, no example value, and no plan, finding or `x-` annotation.
+The served inventory (`info.version` `1.3.0`) lists only `GET`/`HEAD /api/export` (no
+parameter), `GET`/`HEAD /api/exports/{id}` and `GET`/`HEAD /api/auth-records/{id}` (each an
+ordinary required `string` path parameter): no ownership, health or spec endpoint, no marker
+value, no example value, and no plan, privilege, criterion, finding, security or `x-` annotation.
 
-Both export routes fail closed with `503` unless `HEEL_TARGET_MODE` is a known mode and
+All three routes fail closed with `503` unless `HEEL_TARGET_MODE` is a known mode and
 `HEEL_FREE_TOKEN_SHA256` / `HEEL_PRO_TOKEN_SHA256` are two different 64-character lowercase hex
 digests. The mode is set only by the operator at deploy time; no header, query or cookie
-changes it. The pro identity always receives that route's export (positive control). Both
-routes use the same mode on every request.
+changes it. On the two export routes the pro identity always receives that route's export
+(positive control). All routes use the same mode on every request.
 
-| `HEEL_TARGET_MODE` | free identity receives (either route) | Comparator (`evaluate_plan_pair`, `marker=None`), both routes | Paired canary evaluator (`adapters.evaluate_pair`), `/api/exports/{id}` only |
+| `HEEL_TARGET_MODE` | free identity receives (either export route) | Comparator (`evaluate_plan_pair`, `marker=None`), both routes | Paired canary evaluator (`adapters.evaluate_pair`), `/api/exports/{id}` only |
 |---|---|---|---|
 | `vulnerable` | `200` + that route's full pro export | finding, `body_superset` (row 6) | `observed` |
 | `patched` | `403`, empty body | held, `lower_denied` (row 7) | `blocked` |
 | `error_envelope` | `403 {"error":"upgrade required"}` | inconclusive, `lower_denial_envelope` (row 9) | `inconclusive` |
 
 On `/api/export` the paired canary evaluator is `inconclusive` in every mode (no marker).
+
+On `/api/auth-records/heel-canary-auth-0001`, only a request with no `Authorization` header
+depends on the mode. The authentication-read evaluator (`adapters.evaluate_pair`,
+`anonymous_authenticated_read`, anonymous action first and authenticated action second) gives:
+
+| `HEEL_TARGET_MODE` | anonymous (no `Authorization`) receives | authenticated (free or pro) receives | Evaluator |
+|---|---|---|---|
+| `vulnerable` | `200` + the full record | `200` + the record | `observed` |
+| `patched` | `401`, empty body, `WWW-Authenticate: Bearer` | `200` + the record | `blocked` |
+| `error_envelope` | `401 {"error":"unauthenticated"}` | `200` + the record | `inconclusive` |
+
+On this route `HEAD` is `inconclusive` in every mode. An unknown or malformed credential on the
+authenticated side (failed positive control), or any other record id (`404`), is also
+`inconclusive`. Malformed or unknown credentials never receive the record in any mode.
 
 `HEAD` is never a finding on either route. The comparator gives status parity only (row 8,
 `inconclusive`) in `vulnerable`, and a status-only hold (row 7, `held`, `body_superset` null) in
@@ -85,6 +111,18 @@ heel runner map --scenario plan_entitlement_read --method GET --route /api/expor
 # Canary route (paired canary validation only):
 heel runner map --scenario plan_entitlement_read --method GET --route '/api/exports/{id}' \
   --fixture-fd 3 3< <(printf '%s' '{"id":"heel-canary-export-0001"}')
+# Authentication read route (anonymous vs authenticated; the anonymous role sends no credential):
+heel runner map --scenario anonymous_authenticated_read --method GET --route '/api/auth-records/{id}' \
+  --fixture-fd 3 3< <(printf '%s' '{"id":"heel-canary-auth-0001"}')
+```
+
+For the authentication read, the `anonymous` role needs no credential. The `authenticated` role
+needs one runner credential whose bearer token is either canary token (free or pro). Use the
+same Keychain item as step 3 below:
+
+```sh
+heel runner credential add --role authenticated --profile bearer --label "staging authenticated" --backend keychain --secret-fd 3 \
+  3< <(/usr/bin/security find-generic-password -s "$SVC" -a pro -w | tr -d '\n')
 ```
 
 On the canary route the fixture id must be exactly `heel-canary-export-0001`; any other id
@@ -105,6 +143,9 @@ code: the standalone comparator, and the paired composition (served inventory �
 `protected_content` with the bound marker → `evaluate_pair`), without mocks.
 CI runs it in the `browser-alpha` job. It proves nothing about DNS, TLS, workers.dev response
 framing, the released runner or the browser journey; those need the deployed run below.
+For `/api/auth-records/{id}` it runs the same unchanged composition for
+`anonymous_authenticated_read` (anonymous profile for the anonymous role, bearer for the
+authenticated role).
 For `/api/export` it also proves the inventory → empty-binding mapping → `prepare_action` steps
 and the comparator rows; it does not run the runner's ordinary plan-differential executor bridge,
 which is implemented and reviewed separately.
@@ -176,10 +217,16 @@ for ROLE in free pro; do
   /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
     | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
     | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/exports/heel-canary-export-0001"
+  /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
+    | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
+    | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/auth-records/heel-canary-auth-0001"
 done
+curl -sS -o /dev/null -w "anonymous %{http_code} %{size_download}\n" "https://HOST/api/auth-records/heel-canary-auth-0001"
 ```
 
-In `vulnerable` mode the `/api/export` lines should read `200 97` and the canary lines `200 142`.
+In `vulnerable` mode the `/api/export` lines should read `200 97`, the canary lines `200 142`,
+the authenticated record lines `200 130` and the anonymous line `200 130`. In `patched` mode the
+anonymous line reads `401 0`, and in `error_envelope` mode it reads `401 27`.
 
 ### 5. Receipts during the journey (bounded fields only)
 
@@ -217,5 +264,9 @@ HTTPS and each runner request appears as one receipt.
   `inconclusive` (row 9) in `error_envelope`. Without that bridge the run is `inconclusive`.
 - **Canary-dependent paired read validation**, `GET /api/exports/{id}`: `observed` in
   `vulnerable`, `blocked` in `patched` and `inconclusive` in `error_envelope`.
+- **Authentication read**, `GET /api/auth-records/{id}` (`anonymous_authenticated_read`):
+  `observed` in `vulnerable`, `blocked` in `patched` and `inconclusive` in `error_envelope`.
+  This is expected only. The fixture tests above are in-process component proof. No deployed
+  run of this route has happened, and the deployed target has not been redeployed with it.
 
-Both are checks of this one synthetic target, not a product coverage claim.
+All three are checks of this one synthetic target, not a product coverage claim.
