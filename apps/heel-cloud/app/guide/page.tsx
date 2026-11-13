@@ -8,14 +8,19 @@ const CLI = RUNNER_RC5_CLI;
 
 const LINUX_VAULT = `sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
 dbus-run-session -- bash                                   # headless only: private session bus
-read -rs pw && printf '%s' "$pw" \\
-    | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw`;
+IFS= read -rs pw && printf '%s' "$pw" \\
+    | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
+(umask 077 && rm -f .heel-bus && printf '%s\\n' "$DBUS_SESSION_BUS_ADDRESS" > .heel-bus)   # headless only`;
 
 const PAIR = `export HEEL_HOME="$(pwd -P)/.heel"
 ${CLI} runner pair --origin https://YOUR_HEEL_DASHBOARD_ORIGIN --invite INVITATION`;
 
-const SERVE = `${CLI} runner serve      # keep this running; use a second terminal with the same HEEL_HOME
-${CLI} runner status     # in the second terminal`;
+const SERVE = `${CLI} runner serve      # keep this running in the first terminal`;
+
+const SECOND_TERMINAL = `cd SAME_PRIVATE_DIRECTORY
+export HEEL_HOME="$(pwd -P)/.heel"
+IFS= read -r DBUS_SESSION_BUS_ADDRESS < .heel-bus && export DBUS_SESSION_BUS_ADDRESS   # headless Linux only
+${CLI} runner status`;
 
 const CREDENTIALS = `${CLI} runner credential add --role lower_plan --plan-label free --profile bearer --label "free canary" --backend keychain
 ${CLI} runner credential add --role higher_plan --plan-label pro --profile bearer --label "pro canary" --backend keychain
@@ -29,7 +34,7 @@ printf '{"id":"heel-canary-record-0001"}' > record-fixture.json
 ${CLI} runner map --scenario anonymous_authenticated_read --method GET \\
     --route '/records/{id}' --fixture-fd 3 3<record-fixture.json`;
 
-const MARKER = `{"id": "heel-canary-export-0001", "protected_canary": "heel-canary-export-0001", ...}`;
+const MARKER = `{"id": "heel-canary-export-0001", "protected_canary": "heel-canary-export-0001"}`;
 
 const PREPARE = `${CLI} runner prepare           # local readiness check; sends nothing
 ${CLI} runner prepare --live    # queue the signed plan; serve submits it for browser review`;
@@ -167,7 +172,12 @@ export default function Guide() {
               The runner keeps its signing key and credentials only in the operating system vault: macOS
               Keychain or the Linux Secret Service. Without one, pairing fails; there is no file
               fallback. A desktop Linux session normally has an unlocked keyring already. On a headless
-              Linux host, install and unlock one first. Type the keyring password at the hidden prompt.
+              Linux host, install and unlock one first, in the empty private directory. Type the keyring
+              password at the hidden prompt; it goes to the daemon on standard input only. The last line
+              saves only the session bus address, which is local connection metadata and not a secret,
+              to <code>.heel-bus</code> with mode 0600, so that a second terminal can reach the same
+              unlocked keyring. Keep this shell open and run the following steps in it: exiting it ends
+              the bus and the keyring session.
             </p>
             <pre><code>{LINUX_VAULT}</code></pre>
           </article>
@@ -198,6 +208,13 @@ export default function Guide() {
             <p className="step-number">05 · Serve</p>
             <h2>Keep the runner online</h2>
             <pre><code>{SERVE}</code></pre>
+            <p>
+              Run every later runner command in a second terminal, as the same user, in the same private
+              directory and with the same <code>HEEL_HOME</code>. On a headless Linux host, a new
+              terminal does not inherit the private session bus, so the vault is unavailable there until
+              you load the address saved in step 03. On macOS or a desktop Linux session, skip that line.
+            </p>
+            <pre><code>{SECOND_TERMINAL}</code></pre>
             <p>
               <code>serve</code> polls Heel Cloud over the paired, signed channel and is the only
               process that sends target requests. If it reports <code>offline</code>, it retries by
@@ -253,7 +270,8 @@ export default function Guide() {
               The marker is a staging-data requirement, not something Heel reads from OpenAPI. In your
               staging product, create each canary record with an ID that starts with{" "}
               <code>heel-canary-</code>. Return it as a JSON object whose <code>protected_canary</code>{" "}
-              field equals that ID, and only to identities that are entitled to it:
+              field equals that ID, and only to identities that are entitled to it. A minimal example
+              (your record may carry other fields too):
             </p>
             <pre><code>{MARKER}</code></pre>
             <p>
@@ -383,7 +401,7 @@ export default function Guide() {
             <h2>What has been recorded, and its limits</h2>
             <p>
               On November 13, 2026, one fresh preview account ran this workflow from a clean Linux
-              machine with the public release and the browser. The target was a controlled synthetic
+              container with the public release and the browser. The target was a controlled synthetic
               staging app that Heel operates on the public network. This is not a customer target or
               customer acceptance. The workflow produced two observed findings, an authorization one
               and an entitlement one. It also produced a redacted shared summary, two saved regressions

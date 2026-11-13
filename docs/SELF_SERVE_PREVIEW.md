@@ -63,8 +63,26 @@ it.
    ```
 
    The signing key and credentials live only in macOS Keychain or the Linux Secret Service. There
-   is no file fallback. For the headless Linux setup, see the `secret-service` prerequisites in the
-   [runner doc](PLAN_DIFFERENTIAL_RUNNER.md).
+   is no file fallback. A desktop Linux session normally has an unlocked keyring already. On a
+   headless Linux host, install and unlock one first, in the private directory where you ran the
+   install:
+
+   ```sh
+   sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
+   dbus-run-session -- bash                                   # headless only: private session bus
+   IFS= read -rs pw && printf '%s' "$pw" \
+       | gnome-keyring-daemon --unlock --components=secrets >/dev/null; unset pw
+   (umask 077 && rm -f .heel-bus && printf '%s\n' "$DBUS_SESSION_BUS_ADDRESS" > .heel-bus)   # headless only
+   ```
+
+   - Type the keyring password at the hidden prompt. It reaches the daemon on standard input only.
+   - The last line saves only the session bus address to `.heel-bus` with mode 0600. The address is
+     local connection metadata, not a secret, and lets a second terminal reach the same unlocked
+     keyring.
+   - Keep this shell open and run steps 4 and 5 in it. Exiting it ends the bus and the keyring
+     session.
+
+   See also the `secret-service` prerequisites in the [runner doc](PLAN_DIFFERENTIAL_RUNNER.md).
 4. **Pair.**
    1. Choose Create pairing invitation. The invitation is shown once and expires after 10
       minutes.
@@ -75,8 +93,20 @@ it.
    5. Check that the six words and the fingerprint match the terminal exactly, then approve.
 
    Pairing alone authorizes no target traffic.
-5. **Serve.** Keep `CLI runner serve` running, and use a second terminal with the same
-   `HEEL_HOME` for `CLI runner status`.
+5. **Serve.** Keep `CLI runner serve` running in the first terminal. Run every later runner
+   command in a second terminal, as the same user, in the same private directory and with the same
+   `HEEL_HOME`:
+
+   ```sh
+   cd SAME_PRIVATE_DIRECTORY
+   export HEEL_HOME="$(pwd -P)/.heel"
+   IFS= read -r DBUS_SESSION_BUS_ADDRESS < .heel-bus && export DBUS_SESSION_BUS_ADDRESS   # headless Linux only
+   CLI runner status
+   ```
+
+   On a headless Linux host, a new terminal does not inherit the private session bus, so the vault
+   is unavailable there until you load the address saved in step 3. On macOS or a desktop Linux
+   session, skip that line.
    - If `serve` stops with `response_rejected`, start it once more on the same `HEEL_HOME`.
    - If it stops again, report it instead of looping.
 6. **Authorize the target.** Under Add canary access, select the verified environment and the
@@ -108,7 +138,11 @@ it.
    The marker is a staging-data requirement, not something Heel reads from OpenAPI:
    - Create each canary record with an ID that starts with `heel-canary-`.
    - Return it as a JSON object whose `protected_canary` field equals that ID, and only to
-     entitled identities.
+     entitled identities. A minimal example (your record may carry other fields too):
+
+     ```json
+     {"id": "heel-canary-export-0001", "protected_canary": "heel-canary-export-0001"}
+     ```
 
    The higher-plan or signed-in read is the positive control and must succeed with the marker.
    The possible outcomes:
@@ -167,7 +201,7 @@ example.
 
 ## Recorded evidence and limits
 
-On 2026-11-13, one fresh preview account ran the steps above. It used a clean Linux machine,
+On 2026-11-13, one fresh preview account ran the steps above. It used a clean Linux container,
 the public [1.3.0rc5 release](https://github.com/ancilis/heel/releases/tag/v1.3.0rc5) and the
 browser, with the hosted build that includes
 [PR #94](https://github.com/ancilis/heel/pull/94). The target was a controlled synthetic staging

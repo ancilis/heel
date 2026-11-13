@@ -100,7 +100,7 @@ describe("target registration card", () => {
     expect(screen.queryByText("stale")).toBeNull();
     expect(screen.queryAllByRole("button")).toEqual([]);
     // Private-connector information is an optional link, never a pairing or install action.
-    expect(screen.getByRole("link", { name: "About private connectors" }).getAttribute("href")).toBe("/runner");
+    expect(screen.getByRole("link", { name: "Paired runner guide" }).getAttribute("href")).toBe("/guide");
     expect(document.body.textContent).not.toMatch(/pair the local runner|install|open pairing guide/i);
   });
 

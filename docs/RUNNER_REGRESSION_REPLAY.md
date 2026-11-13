@@ -6,8 +6,11 @@ runner preview (<https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>; instal
 hash-pinned command in the [README](../README.md)). These commands are **not** in the earlier
 `1.3.0rc2` or `1.3.0rc1` previews. Beyond local test fixtures, one pre-release staging run (a
 paired 1.3.0rc3 candidate runner) recorded a regression and replayed it through a real browser
-approval against a controlled synthetic HTTPS target. No replay against a customer target and no
-deployed 1.3.0rc5 replay is recorded.
+approval against a controlled synthetic HTTPS target. On 2026-11-13, a fresh preview account
+using the public 1.3.0rc5 release and the deployed Heel Cloud saved two regressions and recorded
+each `pass` on a replay after the controlled synthetic staging target was patched (see the
+[self-serve preview guide](SELF_SERVE_PREVIEW.md)). No replay against a customer target is
+recorded.
 
 Replay depends on the Cloud canary approval flow: it runs only the existing read-only
 (`GET`/`HEAD`) canary scenarios, and only in a Cloud-bound context.
