@@ -21,7 +21,9 @@ overreach, or support/workflow gaming after an incident.
 
 Static OpenAPI/ProductModel review and the broader scenario library remain useful investigation tools. They do not prove runtime control failures. Unknown specification fields become questions; customer answers are declarations. AI/agent abuse is one optional surface. Trial/promotion eligibility and cumulative usage are modeled but not live-validated.
 
-See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export demo](docs/EXPORT_DEMO.md). The core static analyzer has zero runtime dependencies; the signed reference runner requires the `runner` extra. No production targets, real payments, bulk extraction or exhaustion are supported in this workflow. Cloud pairing and arbitrary customer-target execution are incomplete public journeys.
+See the [current capability matrix](docs/CAPABILITIES.md) and [runnable export demo](docs/EXPORT_DEMO.md). The core static analyzer has zero runtime dependencies; the signed reference runner requires the `runner` extra. No production targets, real payments, bulk extraction or exhaustion are supported in this workflow.
+
+To rehearse your own staging target, follow the [self-serve preview guide](docs/SELF_SERVE_PREVIEW.md) (served by Heel Cloud at `/guide`): verify ownership of one staging HTTPS origin, pair a local runner, and approve each signed plan in the browser. The paired runner runs two fixed marker-backed read checks; general execution against arbitrary customer targets and the broader catalog reads remain incomplete public journeys. Sign-up is public but rate-limited (retry later if refused), and the one recorded run used a controlled synthetic staging target, not a customer target.
 
 ## Five-minute local launch review
 
@@ -331,13 +333,13 @@ or escape a signed authorization scope.* See **[TRUST.md](TRUST.md)** and **[SEC
 [CONTROL SIMULATOR](docs/CONTROL_SIMULATOR.md) ·
 [ECONOMIC SEVERITY](docs/ECONOMIC_SEVERITY.md) · [HEELBENCH](docs/HEELBENCH.md) ·
 [HELDOUT PROVENANCE](docs/HELDOUT_PROVENANCE.md) ·
-[MCP QUICKSTART](docs/MCP_QUICKSTART.md) ·
+[MCP QUICKSTART](docs/MCP_QUICKSTART.md) · [SELF-SERVE PREVIEW](docs/SELF_SERVE_PREVIEW.md) ·
 [RESEARCH LIBRARY](docs/RESEARCH_LIBRARY.md) · [ROADMAP](docs/ROADMAP.md) · [CONTRIBUTING](CONTRIBUTING.md) ·
 [CHANGELOG](CHANGELOG.md) · red-team reports under [`docs/`](docs/)
 
 ## Status
 
-**Status: local reference validation and static triage preview.** The export reference workflow demonstrates one protected-content invariant and its regression. It does not establish broad SaaS readiness, arbitrary-target onboarding, production transport acceptance, or customer effectiveness.
+**Status: local reference validation and static triage preview.** The export reference workflow demonstrates one protected-content invariant and its regression. It does not establish broad SaaS readiness, arbitrary-target onboarding, production transport acceptance, or customer effectiveness. The paired self-serve preview ([guide](docs/SELF_SERVE_PREVIEW.md)) has one recorded run against a controlled synthetic staging target. Its first finding took about 29.4 minutes, missing the 15-minute goal.
 
 Pre-launch and existing-product investigations help teams reason about existing products. Legacy documentation references explicitly authorized production-like targets; this reference workflow accepts none. There is no scope creation or widening through MCP. Broader claims require new evidence beyond held-out vocabulary evaluation.
 

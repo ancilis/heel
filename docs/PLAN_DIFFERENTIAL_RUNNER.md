@@ -41,9 +41,9 @@ directory the command creates `./heel-rc5`, installs the hash-pinned public whee
 `runner` extra, and prints `heel 1.3.0rc5`. pip refuses the wheel unless its SHA-256 matches;
 the `cryptography` dependency comes from the package index and is not hash-pinned by this
 command. Activating the environment puts `heel` on `PATH` for the steps below. This journey is
-the standalone CLI. It does not use Heel Cloud pairing (see [capabilities](CAPABILITIES.md) for the
-paired path, its recorded controlled-staging evidence, and the clean-room customer journey not yet
-recorded).
+the standalone CLI. It does not use Heel Cloud pairing and is not a prerequisite for it; the paired
+customer workflow, with its recorded controlled-staging evidence and limits, is in
+[SELF_SERVE_PREVIEW.md](SELF_SERVE_PREVIEW.md).
 
 ```sh
 python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && ./heel-rc5/bin/heel --version

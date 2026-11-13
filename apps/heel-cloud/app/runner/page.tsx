@@ -53,7 +53,7 @@ export default function Runner() {
     <section className="runner-command">
       <div className="runner-command-number" aria-hidden="true">01</div>
       <div><h2>1. Review the rule and authorize the reference product</h2>
-      <p>This optional local preview is not a step in the default Heel journey. Heel 1.3.0rc5 is a public preview prerelease at <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc5">github.com/ancilis/heel/releases/tag/v1.3.0rc5</a>. It is not a stable release, PyPI publication is not yet available, and it does not indicate live-target support or launch readiness. No source checkout or manual wheel download is needed; pip fetches the pinned wheel directly from the public release.</p>
+      <p>This optional local preview is not a step in the default Heel journey; for your own staging target, follow the <Link href="/guide">paired runner guide</Link>. Heel 1.3.0rc5 is a public preview prerelease at <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc5">github.com/ancilis/heel/releases/tag/v1.3.0rc5</a>. It is not a stable release, PyPI publication is not yet available, and it does not indicate live-target support or launch readiness. No source checkout or manual wheel download is needed; pip fetches the pinned wheel directly from the public release.</p>
       <p>In an empty private directory, with Python 3.11 or newer as python3 and its standard venv module, on Apple silicon macOS or Linux x86_64/aarch64 (Intel macOS is unsupported by this preview), one command creates ./heel-rc5, installs the hash-pinned public wheel with the local runner extra, and prints heel 1.3.0rc5. Then inspect the bounded plan and create a signed scope with the CLI at ./heel-rc5/bin/heel. pip refuses the wheel unless its SHA-256 matches, and --isolated ignores pip environment variables and user configuration. Installing the extra fetches the pinned cryptography package from your Python package index, which this command does not hash-pin; these commands contact no product target.</p>
       <pre><code>{`python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && ./heel-rc5/bin/heel --version
 export HEEL_HOME="$(pwd -P)/.heel"
@@ -81,7 +81,7 @@ export HEEL_HOME="$(pwd -P)/.heel"
     </section>
     <aside className="runner-recovery"><h2>What this establishes</h2>
       <p>Only the two synthetic reads are validated. Trial eligibility, cumulative usage, scraping limits, plan-change sequences, and other access paths remain untested. No findings does not establish launch safety.</p>
-      <p>Cloud runner pairing and arbitrary customer-target execution are incomplete public workflows. The supported validation path here is the local reference product; the browser does not execute target requests.</p>
+      <p>This page is an optional local reference and contacts no product target. To rehearse your own verified staging target, use the paired workflow in the <Link href="/guide">paired runner guide</Link>: it runs two fixed read checks from a runner on your machine after you approve each plan in the browser. It is not general execution against arbitrary customer targets, and the browser does not send target requests.</p>
     </aside>
   </main>;
 }
