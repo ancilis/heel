@@ -8,8 +8,10 @@ real GitHub publication, and no test reads a real credential.
 The rc4 tool is a copy of the reviewed, published rc3 tool (scripts/publish_runner_preview_release_rc3.py)
 that differs only in the enumerated hunks E1-E3 and E5-E7; E4 (the FINAL pin status and its refusal
 of every other status) is carried over byte for byte.  DiffBoundTests enforces that.  Its candidate is
-the 1.3.0rc4 bytes this checkout carries, bound below by git blob id, SHA-256 and size; this module
-fails at import on purpose if they differ.
+the published 1.3.0rc4 bytes, bound below by git blob id, SHA-256 and size.  The 1.3.0rc5 candidate
+replaced the checkout's downloads and version sources, so, as the rc1, rc2 and rc3 precedents did, those
+rc4 bytes now load from the historical fixture tests/fixtures/runner_preview_rc4/, exported from the
+pinned rc4 commit and verified offline; this module still fails at import on purpose if they differ.
 
 The pins below are the rc4 candidate built once at source b7aee6e6 and the tool's PIN_STATUS is FINAL.
 InterimPinTests keeps proving that any other status refuses every mode; FinalizationTests requires the
@@ -45,6 +47,10 @@ SCRIPT = ROOT / "scripts/publish_runner_preview_release_rc4.py"
 BASE_SCRIPT = ROOT / "scripts/publish_runner_preview_release_rc3.py"
 RUNBOOK = ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC4.md"
 DOWNLOADS = "apps/heel-cloud/public/downloads"
+# The publisher names the public 1.3.0rc4 release, whatever candidate this checkout carries, so its
+# input is the historical rc4 bytes: exported from the pinned rc4 commit, committed here and bound by
+# git blob id, so a shallow or source-only checkout loads them without history or git.
+HISTORICAL_FIXTURE = ROOT / "tests/fixtures/runner_preview_rc4"
 # The rc4 candidate at b7aee6e67eb5318dda739422ff725fa1bb9e2e76
 # (tree 9061df2b09fadd8a0922bbef16a11dc36ca9f5a9), written out here independently of the tool.
 PINNED_COMMIT = "b7aee6e67eb5318dda739422ff725fa1bb9e2e76"
@@ -145,30 +151,43 @@ def _git_blob_id(payload: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(payload) + payload).hexdigest()
 
 
-def load_pinned_rc4(directory: Path = ROOT) -> tuple[dict[str, bytes], dict[str, bytes]]:
+FIXTURE_LAYOUT = {f"{DOWNLOADS}/{name}": f"artifacts/{name}" for name in P.ASSET_NAMES}
+FIXTURE_LAYOUT.update({source: f"version_sources/{Path(source).name}.txt" for source in P.VERSION_SOURCES})
+
+
+def load_pinned_rc4(directory: Path = HISTORICAL_FIXTURE) -> tuple[dict[str, bytes], dict[str, bytes]]:
     """The pinned rc4 artifacts by asset name and version sources by path, each pinned by blob id.
 
-    A mismatch is a hard failure, never a skip: it means this checkout no longer carries the pinned
-    rc4 candidate (see the module docstring).
+    A mismatch is a hard failure, never a skip: it means the historical fixture no longer holds the
+    pinned rc4 bytes (see the module docstring).
     """
     try:
-        downloads = directory / DOWNLOADS
-        if sorted(os.listdir(downloads)) != sorted(P.ASSET_NAMES):
-            raise PinnedCandidateError("downloads are not exactly the pinned rc4 wheel, sdist and manifest")
+        present = sorted(path.relative_to(directory).as_posix()
+                         for path in directory.rglob("*") if not path.is_dir())
+        if present != sorted([*FIXTURE_LAYOUT.values(), "provenance.json"]):
+            raise PinnedCandidateError("fixture is not exactly the rc4 artifacts, sources and provenance")
+        provenance = json.loads((directory / "provenance.json").read_text(encoding="utf-8"))
+        entries = [*provenance["artifacts"], *provenance["version_sources"]]
+        if (provenance["source_commit"] != PINNED_COMMIT or provenance["version"] != P.VERSION
+                or [entry["source_path"] for entry in entries] != list(FIXTURE_LAYOUT)):
+            raise PinnedCandidateError("provenance does not name the rc4 commit, version and layout")
         loaded = {}
-        for source in [f"{DOWNLOADS}/{name}" for name in P.ASSET_NAMES] + list(P.VERSION_SOURCES):
-            path = directory / source
+        for entry in entries:
+            source = entry["source_path"]
+            path = directory / FIXTURE_LAYOUT[source]
             if path.is_symlink() or not path.is_file():
-                raise PinnedCandidateError(f"{source} is not a regular file")
+                raise PinnedCandidateError(f"{FIXTURE_LAYOUT[source]} is not a regular file")
             payload = path.read_bytes()
-            if _git_blob_id(payload) != PINNED_BLOBS[source]:
-                raise PinnedCandidateError(f"{source} is not the pinned rc4 blob")
+            if not (_git_blob_id(payload) == entry["git_blob"] == PINNED_BLOBS[source]
+                    and len(payload) == entry["size"]
+                    and hashlib.sha256(payload).hexdigest() == entry["sha256"]):
+                raise PinnedCandidateError(f"{FIXTURE_LAYOUT[source]} is not the pinned rc4 blob")
             loaded[source] = payload
         for name in P.ASSET_NAMES:
             payload = loaded[f"{DOWNLOADS}/{name}"]
             if (hashlib.sha256(payload).hexdigest(), len(payload)) != (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]):
                 raise PinnedCandidateError(f"{name} digest or size is not the pinned rc4 value")
-    except (OSError, KeyError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         raise PinnedCandidateError(f"pinned rc4 candidate unreadable ({type(error).__name__})") from None
     artifacts = {name: loaded[f"{DOWNLOADS}/{name}"] for name in P.ASSET_NAMES}
     return artifacts, {source: loaded[source] for source in P.VERSION_SOURCES}
@@ -558,7 +577,7 @@ class FixtureCheckout:
 
 
 class PinnedLoaderTests(unittest.TestCase):
-    """The candidate is the pinned rc4 bytes this checkout carries, loaded offline."""
+    """The candidate is the historical pinned rc4 fixture, loaded offline."""
 
     def setUp(self):
         self.temporary = Path(tempfile.mkdtemp(prefix="heel-publisher-rc4-pinned-")).resolve()
@@ -566,11 +585,7 @@ class PinnedLoaderTests(unittest.TestCase):
 
     def copy(self, name="pinned") -> Path:
         target = self.temporary / name
-        for relative, payload in {**{f"{DOWNLOADS}/{n}": p for n, p in CANDIDATE.items()},
-                                  **CANDIDATE_SOURCES}.items():
-            path = target / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(payload)
+        shutil.copytree(HISTORICAL_FIXTURE, target)
         return target
 
     def test_candidate_is_the_pinned_rc4_identity_the_publisher_names(self):
@@ -595,16 +610,20 @@ class PinnedLoaderTests(unittest.TestCase):
             self.assertEqual(load_pinned_rc4(copied), (CANDIDATE, CANDIDATE_SOURCES))
 
     def test_loader_rejects_missing_altered_relabelled_or_extra_bytes(self):
-        downloads = Path(DOWNLOADS)
+        def provenance(directory, change):
+            path = directory / "provenance.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            change(document)
+            path.write_text(json.dumps(document), encoding="utf-8")
 
         def flip_sdist_byte(directory):
-            path = directory / downloads / P.SDIST
+            path = directory / "artifacts" / P.SDIST
             payload = bytearray(path.read_bytes())
             payload[100] ^= 1
             path.write_bytes(bytes(payload))
 
         def symlink_manifest(directory):
-            path = directory / downloads / P.MANIFEST
+            path = directory / "artifacts" / P.MANIFEST
             outside = self.temporary / "outside.json"
             outside.write_bytes(path.read_bytes())
             path.unlink()
@@ -612,21 +631,34 @@ class PinnedLoaderTests(unittest.TestCase):
 
         def canonical_but_wrong(directory):
             for name, payload in canonical_but_unaccepted().items():
-                (directory / downloads / name).write_bytes(payload)
+                (directory / "artifacts" / name).write_bytes(payload)
 
         def relabel_pyproject(directory):
-            path = directory / "pyproject.toml"
-            path.write_bytes(path.read_bytes().replace(b'version = "1.3.0rc4"', b'version = "1.3.0rc5"', 1))
+            # New bytes with a self-consistent provenance entry still differ from the pinned blob.
+            path = directory / "version_sources/pyproject.toml.txt"
+            payload = path.read_bytes().replace(b'version = "1.3.0rc4"', b'version = "1.3.0rc5"', 1)
+            path.write_bytes(payload)
+
+            def change(document):
+                entry = document["version_sources"][0]
+                entry.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                             git_blob=_git_blob_id(payload))
+            provenance(directory, change)
 
         mutations = {
-            "missing wheel": lambda d: (d / downloads / P.WHEEL).unlink(),
+            "missing wheel": lambda d: (d / "artifacts" / P.WHEEL).unlink(),
             "altered sdist": flip_sdist_byte,
-            "extra download": lambda d: (d / downloads / "notes.txt").write_bytes(b"x"),
+            "extra file": lambda d: (d / "artifacts/notes.txt").write_bytes(b"x"),
             "symlinked manifest": symlink_manifest,
             "canonical but unpinned bytes": canonical_but_wrong,
-            "truncated version source": lambda d: (d / "heel/__init__.py").write_bytes(b""),
+            "truncated version source": lambda d: (d / "version_sources/__init__.py.txt").write_bytes(b""),
             "relabelled version source": relabel_pyproject,
-            "missing version source": lambda d: (d / "release/open-core-v1.json").unlink(),
+            "missing version source": lambda d: (d / "version_sources/open-core-v1.json.txt").unlink(),
+            "movable reference": lambda d: provenance(d, lambda doc: doc.update(source_commit="main")),
+            "other version": lambda d: provenance(d, lambda doc: doc.update(version="1.3.0rc5")),
+            "reordered sources": lambda d: provenance(d, lambda doc: doc["version_sources"].reverse()),
+            "malformed provenance": lambda d: (d / "provenance.json").write_bytes(b"{not json"),
+            "missing provenance field": lambda d: provenance(d, lambda doc: doc.pop("artifacts")),
         }
         for index, (label, mutate) in enumerate(mutations.items()):
             with self.subTest(label):
@@ -833,7 +865,7 @@ class ImportAndCommandLineTests(unittest.TestCase):
         self.assertNotIn("http", notes.replace("HTTPS target traffic", "").replace(install, ""))
         self.assertNotIn(TOKEN, notes)
         # The manifest is the artifact; rendering external metadata leaves its bytes unchanged.
-        self.assertEqual((ROOT / DOWNLOADS / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
+        self.assertEqual((HISTORICAL_FIXTURE / "artifacts" / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
 
     def test_default_credential_source_is_gh_without_token_in_argv(self):
         completed = subprocess.CompletedProcess([], 0, stdout=TOKEN + "\n", stderr="")
@@ -1858,13 +1890,17 @@ class DiffBoundTests(unittest.TestCase):
 
 
 class PinnedCandidateTests(unittest.TestCase):
-    def test_checkout_artifacts_and_version_sources_are_the_pinned_rc4_blobs(self):
-        self.assertEqual(sorted(os.listdir(ROOT / DOWNLOADS)), sorted(ACCEPTED_SHA256))
+    def test_fixture_artifacts_and_version_sources_are_the_pinned_rc4_blobs(self):
+        self.assertEqual(sorted(os.listdir(HISTORICAL_FIXTURE / "artifacts")), sorted(ACCEPTED_SHA256))
         for relative, blob in PINNED_BLOBS.items():
             with self.subTest(relative):
-                path = ROOT / relative
+                path = HISTORICAL_FIXTURE / FIXTURE_LAYOUT[relative]
                 self.assertFalse(path.is_symlink())
                 self.assertEqual(_git_blob_id(path.read_bytes()), blob)
+        for name in ACCEPTED_SHA256:
+            payload = (HISTORICAL_FIXTURE / "artifacts" / name).read_bytes()
+            self.assertEqual((hashlib.sha256(payload).hexdigest(), len(payload)),
+                             (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]))
         sources = {source: payload.decode("utf-8") for source, payload in CANDIDATE_SOURCES.items()}
         self.assertIn('version = "1.3.0rc4"', sources["pyproject.toml"])
         self.assertIn('requires-python = ">=3.11"', sources["pyproject.toml"])
