@@ -2153,7 +2153,7 @@ describe("CUSTOMER-TRACK-UX-F1: a pending ownership proof survives a reload and 
     fireEvent.click(within(await pendingGroup()).getByRole("button", { name: "Resume ownership proof" }));
     await screen.findByText(/Your session ended/);
     expect(document.body.textContent).not.toContain(tokenOf(environmentId));
-    expect(nav.search).toBe("");
+    await waitFor(() => expect(nav.search).toBe(""));
   });
 
   for (const afterLogin of ["live", "expired"] as const) {
