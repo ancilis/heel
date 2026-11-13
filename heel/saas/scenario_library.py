@@ -207,7 +207,9 @@ def library_definition_digest(scenario_id: str) -> str | None:
     return _LIBRARY_DEFINITION_DIGESTS.get(scenario_id)
 
 
-_SCHEMA = """
+# Registered as control-plane migration 34 (heel.saas.migrate); the service still runs it with
+# IF NOT EXISTS so direct construction matches a migrated database.
+SCENARIO_LIBRARY_MIGRATION = """
 CREATE TABLE IF NOT EXISTS workspace_custom_scenarios(
   workspace_id TEXT NOT NULL,
   scenario_id TEXT NOT NULL CHECK(length(scenario_id) BETWEEN 3 AND 128),
@@ -296,7 +298,7 @@ class ScenarioLibraryService:
         self.conn = conn
         self.clock = clock
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(_SCHEMA)
+        self.conn.executescript(SCENARIO_LIBRARY_MIGRATION)
 
     # --- listing ---------------------------------------------------------------------------
     def _library_row(self, definition: Mapping[str, Any]) -> dict:

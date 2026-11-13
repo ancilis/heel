@@ -35,6 +35,7 @@ from .runner_auth import (
     RUNNER_AUTH_SINGLE_OPEN_ROTATION_MIGRATION, RUNNER_AUTH_KEY_HISTORY_EXPIRY_MIGRATION,
     RUNNER_AUTH_BOUNDED_RETENTION_MIGRATION, RUNNER_AUTH_INACTIVE_CLAIM_ATTESTATION_MIGRATION,
 )
+from .scenario_library import SCENARIO_LIBRARY_MIGRATION
 
 _TRACKING = """
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -401,6 +402,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_canary_fault_refund
     Migration(31, "host_authority_generations", HOST_AUTHORITY_GENERATIONS_MIGRATION),
     Migration(32, "stop_ack_signed_witness", STOP_ACK_WITNESS_MIGRATION),
     Migration(33, "inactive_claim_attestation_audit", RUNNER_AUTH_INACTIVE_CLAIM_ATTESTATION_MIGRATION),
+    Migration(34, "scenario_library_and_run_bindings", SCENARIO_LIBRARY_MIGRATION),
 ]
 
 
