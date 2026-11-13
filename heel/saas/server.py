@@ -21,6 +21,7 @@ import signal
 import sqlite3
 import stat
 import threading
+import time
 from types import MethodType
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -132,6 +133,146 @@ class _SingleProcessDatabaseLock:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+# Bounded automatic recovery after the reaper's confirmed SQLite lock exhaustion.  The node still
+# fails closed (draining) first; only a durable, bounded budget lets the process take the ordinary
+# graceful SIGTERM shutdown so the container's existing ``restart: unless-stopped`` policy starts the
+# same image on the same volume.  Every other reaper, host-authority, or startup failure keeps its
+# existing behavior.
+RECOVERY_BUDGET_SCHEMA = "heel.control-plane-recovery-budget.v1"
+RECOVERY_BUDGET_SUFFIX = ".recovery.json"
+RECOVERY_BUDGET_MAX_EXITS = 3
+RECOVERY_BUDGET_WINDOW_SECONDS = 3600
+RECOVERY_BUDGET_MAX_BYTES = 4096
+RECOVERY_EXIT_CODE = 75  # EX_TEMPFAIL
+_recovery_now = time.time
+
+
+def _is_reaper_lock_exhaustion(error: BaseException) -> bool:
+    """Only a genuine SQLite BUSY/LOCKED primary result code qualifies; message text never does."""
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    code = getattr(error, "sqlite_errorcode", None)
+    return type(code) is int and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
+@dataclass(frozen=True)
+class _RecoveryDecision:
+    allowed: bool
+    exits_in_window: int
+    reason: str
+
+
+class _RecoveryBudget:
+    """At most three automatic recovery exits per hour, persisted beside the database.
+
+    Any state that cannot be proven well-formed and writable fails closed: no exit.  Entries in
+    the future (clock skew) are retained and counted, so skew can only spend the budget sooner.
+    """
+
+    def __init__(self, database_path: str):
+        self.path = database_path + RECOVERY_BUDGET_SUFFIX
+
+    def _read(self) -> list[int] | None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self.path, flags)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return None
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or metadata.st_size > RECOVERY_BUDGET_MAX_BYTES):
+                return None
+            raw = os.read(descriptor, RECOVERY_BUDGET_MAX_BYTES + 1)
+        except OSError:
+            return None
+        finally:
+            os.close(descriptor)
+        if len(raw) > RECOVERY_BUDGET_MAX_BYTES:
+            return None
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if (type(document) is not dict or set(document) != {"schema_version", "exits_at"}
+                or document["schema_version"] != RECOVERY_BUDGET_SCHEMA
+                or type(document["exits_at"]) is not list
+                or len(document["exits_at"]) > RECOVERY_BUDGET_MAX_EXITS):
+            return None
+        exits = document["exits_at"]
+        if any(type(value) is not int or value < 0 for value in exits):
+            return None
+        return exits
+
+    def _write(self, exits: list[int]) -> bool:
+        payload = json.dumps(
+            {"schema_version": RECOVERY_BUDGET_SCHEMA, "exits_at": exits},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+        staging = self.path + ".tmp"
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            descriptor = os.open(staging, flags, 0o600)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    return False
+                os.fchmod(descriptor, 0o600)
+                if os.write(descriptor, payload) != len(payload):
+                    return False
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(staging, self.path)
+            directory = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return True
+        except OSError:
+            return False
+
+    def consume(self, now: float) -> _RecoveryDecision:
+        exits = self._read()
+        if exits is None:
+            return _RecoveryDecision(False, 0, "budget_unreadable")
+        instant = int(now)
+        recent = sorted(value for value in exits if value > instant - RECOVERY_BUDGET_WINDOW_SECONDS)
+        if len(recent) >= RECOVERY_BUDGET_MAX_EXITS:
+            return _RecoveryDecision(False, len(recent), "budget_exhausted")
+        recent.append(instant)
+        if not self._write(recent):
+            return _RecoveryDecision(False, len(recent) - 1, "budget_unwritable")
+        return _RecoveryDecision(True, len(recent), "budget_available")
+
+
+def _request_recovery_exit(server, budget: _RecoveryBudget) -> None:
+    """Persist one budget entry, then take the ordinary graceful shutdown path; else stay draining."""
+    decision = budget.consume(_recovery_now())
+    if not decision.allowed:
+        _LOGGER.error(json.dumps({
+            "budget": RECOVERY_BUDGET_MAX_EXITS,
+            "event": "control_plane_recovery_budget_exhausted",
+            "exits_in_window": decision.exits_in_window,
+            "reason": decision.reason,
+            "window_seconds": RECOVERY_BUDGET_WINDOW_SECONDS,
+        }, sort_keys=True, separators=(",", ":")))
+        return
+    _LOGGER.error(json.dumps({
+        "attempt": decision.exits_in_window,
+        "budget": RECOVERY_BUDGET_MAX_EXITS,
+        "event": "control_plane_recovery_exit",
+        "window_seconds": RECOVERY_BUDGET_WINDOW_SECONDS,
+    }, sort_keys=True, separators=(",", ":")))
+    server.exit_code = RECOVERY_EXIT_CODE
+    # Identical to the SIGTERM handler: serve_forever returns, then main's server_close drains
+    # accepted requests and joins every worker before the checkpoint, close, and lock release.
+    threading.Thread(target=server.shutdown, name="heel-recovery-shutdown", daemon=True).start()
 
 
 def _canonical_pepper(value: str, name: str) -> bytes:
@@ -323,7 +464,8 @@ def _host_authority_from_environment(
         or not (socket_directory == volume or socket_directory.startswith(volume.rstrip("/") + "/"))
         or socket_value in {
             str(database), str(database) + ".lock", str(database) + "-wal", str(database) + "-shm",
-            str(database) + "-journal",
+            str(database) + "-journal", str(database) + RECOVERY_BUDGET_SUFFIX,
+            str(database) + RECOVERY_BUDGET_SUFFIX + ".tmp",
         }
     ):
         raise ProductionConfigurationError(
@@ -486,11 +628,19 @@ def build_server(config: ProductionConfiguration):
             server.reaper_ready = False
             control_plane.draining = True
 
+        server.exit_code = 0
+        recovery_budget = _RecoveryBudget(config.database_path)
+
+        def reaper_died(error: BaseException) -> None:
+            reaper_failed(error)
+            if _is_reaper_lock_exhaustion(error):
+                _request_recovery_exit(server, recovery_budget)
+
         reaper = CanaryReaper(
             config.database_path,
             signing=config.grant_authority,
             runner_auth_pepper=config.runner_auth_pepper,
-            on_unexpected_death=reaper_failed,
+            on_unexpected_death=reaper_died,
         )
         server.canary_reaper = reaper
         # From here until a stop proves its join, a worker thread may run: every failure below,
@@ -663,7 +813,7 @@ def main() -> int:
         server.serve_forever(poll_interval=0.25)
     finally:
         server.server_close()
-    return 0
+    return int(getattr(server, "exit_code", 0))
 
 
 if __name__ == "__main__":
