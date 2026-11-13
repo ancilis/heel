@@ -67,9 +67,9 @@ UNCHANGED_SHA256 = {
     # H2-LINK-DIAGNOSTICS-R1: H0's default-disabled capture observer (was a1b32cc4...). A shared-helper
     # change: H0/H1F regressions and a fresh H0 qualification are required; it is not H2-only.
     "scripts/host_ingress_proof.py": "76958e1896110155aea9802996f00408c097a2a238b8c73ede138eafbccd4aa4",
-    # RC4 pin refresh: only app.lockfile_sha256 changes (was 333c7034..., RC3); the npm root version
-    # is now 1.3.0-rc.4, so it names the tracked lockfile ef8b25ed.... H2 closure moves; UNRUN.
-    "deploy/host/ingress/runtime-lock.json": "e011c0cfee75125a449f551685e7e33b8c97e404420dd6100d0ec7afb19641e6",
+    # RC5 pin refresh: only app.lockfile_sha256 changes (was e011c0cf..., RC4); the npm root version
+    # is now 1.3.0-rc.5, so it names the tracked lockfile d942fca3.... H2 closure moves; UNRUN.
+    "deploy/host/ingress/runtime-lock.json": "eb5c9d3ca2462df59dda2951cc600b7287f7aa5b8b6588ebc6faf2d969e9b77e",
 }
 RECORDED_PICK = {"targets": ("8.8.8.8", "8.8.4.4"), "unapproved_target": "1.1.1.1", "wrong_source": "9.9.9.9",
                  "dual_stack_ipv6": "2001:4860:4860::8888"}
@@ -94,7 +94,7 @@ def test_staged_closure_is_the_design_list_plus_exactly_the_tracked_heel_tree(tm
     assert LAUNCHER.STAGE_FILES == DESIGN_STAGE_FILES
     tracked = subprocess.run(["git", "ls-files", "-z", "--", "heel"], cwd=ROOT, capture_output=True, check=True).stdout
     assert tuple(name for name in tracked.decode().split("\0") if name) == LAUNCHER.HEEL_TREE_FILES
-    assert len(LAUNCHER.HEEL_TREE_FILES) == 111 and LAUNCHER.staged_files() == LAUNCHER.HEEL_TREE_FILES + DESIGN_STAGE_FILES
+    assert len(LAUNCHER.HEEL_TREE_FILES) == 113 and LAUNCHER.staged_files() == LAUNCHER.HEEL_TREE_FILES + DESIGN_STAGE_FILES
     # The staged copy is exactly the closure, byte for byte, and its digest moves with any one byte.
     source = LAUNCHER.stage_tree(tmp_path / "src")
     staged = sorted(str(path.relative_to(source)) for path in source.rglob("*") if path.is_file())
@@ -117,21 +117,21 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def test_private_codec_is_one_ordered_member_and_the_launcher_refuses_a_missing_or_extra_member(tmp_path, monkeypatch):
-    """C4 P01 moved the commercial codec under heel/saas: the closure is 111 heel + 14 stage files. An
+    """C4 P01 moved the commercial codec under heel/saas: the closure is 113 heel + 14 stage files. An
     owned git fixture (an exact staged copy, committed) shows the launcher's own provenance check refuses
     a missing or an unexpected tracked heel member, and that one byte of the new member moves the digest."""
     tree = LAUNCHER.HEEL_TREE_FILES
     assert tree.count(PRIVATE_CODEC) == 1 and "heel/managed_authority_contracts.py" not in tree
     index = tree.index(PRIVATE_CODEC)
     assert tree[index - 1:index + 2] == ("heel/saas/ledger.py", PRIVATE_CODEC, "heel/saas/migrate.py")
-    assert len(tree) + len(LAUNCHER.STAGE_FILES) == 125 == len(set(LAUNCHER.staged_files()))
+    assert len(tree) + len(LAUNCHER.STAGE_FILES) == 127 == len(set(LAUNCHER.staged_files()))
     fixture = LAUNCHER.stage_tree(tmp_path / "fixture")
     _git(fixture, "init", "-q")
     _git(fixture, "add", "--", ".")
     _git(fixture, "commit", "-q", "-m", "exact staged closure")
     monkeypatch.setattr(LAUNCHER, "ROOT", fixture)
     exact = LAUNCHER.candidate_provenance()
-    assert exact["heel_tree_file_count"] == 111 and exact["proof_file_count"] == 14
+    assert exact["heel_tree_file_count"] == 113 and exact["proof_file_count"] == 14
     assert exact["heel_tree_files"][PRIVATE_CODEC] == LAUNCHER._sha256(ROOT / PRIVATE_CODEC)
     assert exact["staged_closure_sha256"] == LAUNCHER.closure_digest(
         {name: LAUNCHER._sha256(ROOT / name) for name in tree}, LAUNCHER.STAGE_FILES)
@@ -157,7 +157,7 @@ def test_private_codec_is_one_ordered_member_and_the_launcher_refuses_a_missing_
     codec.write_bytes(codec.read_bytes() + b"\n")
     _git(fixture, "commit", "-q", "-am", "member byte change")
     changed = LAUNCHER.candidate_provenance()
-    assert changed["heel_tree_file_count"] == 111
+    assert changed["heel_tree_file_count"] == 113
     assert changed["heel_tree_files"][PRIVATE_CODEC] != exact["heel_tree_files"][PRIVATE_CODEC]
     assert {k: v for k, v in changed["heel_tree_files"].items() if k != PRIVATE_CODEC} == {
         k: v for k, v in exact["heel_tree_files"].items() if k != PRIVATE_CODEC}

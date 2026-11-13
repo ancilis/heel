@@ -27,6 +27,10 @@ tree 111 paths (closure 111 + 14 = 125), and the accepted plan-submit change re-
 **Runner rc4 integration amendment:** the accepted H2 result-handoff change re-pins the TLS harness
 (`edge_tls_harness.py`, test support only, disclosure-poll route family) at `846bc9d4…`, and the
 1.3.0-rc.4 npm root re-pins the runtime lock; the heel tree stays 111 paths and that closure is **UNRUN**.
+**Runner rc5 integration amendment:** the accepted scenario-library change adds the public
+`heel/browser_assess.py` and the private `heel/saas/scenario_library.py`, which makes the tree 113 paths
+(closure 113 + 14 = 127), and the 1.3.0-rc.5 npm root re-pins the runtime lock; the TLS harness is
+unchanged and that closure is **UNRUN**.
 The new staged closure digest is **UNRUN**: no earlier run, including the cycles above and any H2-3
 run, covers it. It becomes evidence only after a fresh, unfiltered launcher run on the literal proof
 branch (all 18 cases, eight p0-p7 records, zero skips) and an independent runtime review. Earlier
@@ -62,7 +66,7 @@ H2K1's launcher (`scripts/host_lease_key_shape.py`), which stays unchanged. The 
 
 1. refuses any `GITHUB_REF` but `refs/heads/codex/self-serve-host-h2-policy-proof`;
 2. requires a clean checkout, `STAGE_FILES` tracked, and `HEEL_TREE_FILES` equal to `git ls-files heel`
-   (111 paths at the candidate, including the private `heel/saas/managed_authority_contracts.py`);
+   (113 paths at the candidate, including the private `heel/saas/managed_authority_contracts.py`);
 3. checks the pinned Python 3.13.5 and the host tools, lints `codeql.yml` with H0's pinned actionlint;
 4. fetches the **eight wheels** byte-pinned in the H0 lock (`deploy/host/ingress/runtime-lock.json`):
    the H1F pytest closure (iniconfig, packaging, pluggy, pygments, pytest 9.0.2) plus cryptography
