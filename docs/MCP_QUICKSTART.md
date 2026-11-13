@@ -11,43 +11,43 @@ UTF-8 JSON file no larger than 2 MiB.
 
 ## Install the current Agent
 
-The current public Agent is the 1.3.0rc4 runner preview, published as a public GitHub prerelease at
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>. It is a preview, not a stable release.
+The current public Agent is the 1.3.0rc5 runner preview, published as a public GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>. It is a preview, not a stable release.
 Its GitHub release record is not immutable. It is not a deployed Heel Cloud URL and does not indicate
 customer acceptance. No source checkout, manual download, or Heel Cloud deployment is needed to
 install it. You need a POSIX shell and Python 3.11 or newer as `python3` with its standard `venv`
 module, on Apple silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview:
 its pinned `cryptography` dependency ships no Intel macOS wheel, and a source build needs an
 additional (Rust) toolchain and is untested. In an empty private directory, this one copy-paste
-command creates a virtual environment in `./heel-rc4`, installs the hash-pinned public wheel with its
-`runner` extra, and prints `heel 1.3.0rc4`:
+command creates a virtual environment in `./heel-rc5`, installs the hash-pinned public wheel with its
+`runner` extra, and prints `heel 1.3.0rc5`:
 
 ```bash
-python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version
+python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && ./heel-rc5/bin/heel --version
 ```
 
-The CLI is then `./heel-rc4/bin/heel` and the stdio MCP server is `./heel-rc4/bin/heel-mcp`. pip
+The CLI is then `./heel-rc5/bin/heel` and the stdio MCP server is `./heel-rc5/bin/heel-mcp`. pip
 installs the public wheel only if it matches that SHA-256. `--isolated` makes pip ignore environment
 variables and user configuration. The `runner` extra, which the optional synthetic
 [export reference](EXPORT_DEMO.md) needs, downloads the pinned `cryptography` dependency from the
 Python package index under pip's normal verification; this command does not hash-pin it. The local
-review and MCP tools below do not need it. No independent clean-room run of this exact 1.3.0rc4
+review and MCP tools below do not need it. No independent clean-room run of this exact 1.3.0rc5
 command is recorded yet on any platform or Python version.
 
 1.3.0rc2 corrected two errata of the earlier 1.3.0rc1 prerelease, which remains published and
 unchanged at <https://github.com/ancilis/heel/releases/tag/v1.3.0rc1>: its synthetic reference
 reports the HTTP 200 `error_envelope` case and the HTTP 403 `hardened` case, both error responses, as
-passed regressions; read those rc1 results as inconclusive. 1.3.0rc2, 1.3.0rc3 and 1.3.0rc4 report
+passed regressions; read those rc1 results as inconclusive. 1.3.0rc2, 1.3.0rc3, 1.3.0rc4 and 1.3.0rc5 report
 both cases as inconclusive with regression_passed=false (see the [export reference](EXPORT_DEMO.md)).
 
 A Heel Cloud build from this repository also bundles Agent files on its own origin:
 `heel_sim-1.3.0rc5-py3-none-any.whl`, `heel_sim-1.3.0rc5.tar.gz`, and
-`heel-open-core-manifest.json`. They are that build's artifacts, not a separate verified public
-release: in this repository they are the 1.3.0rc5 candidate, which is not yet published as a public
-release, and public customer access to them still depends on the approved deployment. The public
-command above is the recommended install. If you did download the wheel from a deployment's `/agent`
+`heel-open-core-manifest.json`. They are that build's bundled 1.3.0rc5 artifacts; the bundled
+manifest's wheel digest equals the digest pinned in the public command above, which is the
+recommended install. Public customer access to the same-origin files still depends on the approved
+deployment. If you did download the wheel from a deployment's `/agent`
 page (`/downloads/heel_sim-1.3.0rc5-py3-none-any.whl`), run this in the directory where you saved it
-and use `.venv` in place of `heel-rc4` below:
+and use `.venv` in place of `heel-rc5` below:
 
 ```bash
 python3 -m venv .venv
@@ -78,13 +78,13 @@ then review a sanitized OpenAPI JSON file. `pwd -P` prints the physical working 
 
 ```bash
 export HEEL_HOME="$(pwd -P)/.heel-local"
-./heel-rc4/bin/heel review openapi ./sanitized-openapi.json
+./heel-rc5/bin/heel review openapi ./sanitized-openapi.json
 ```
 
 The default output is validated Markdown. For a canonical machine-readable envelope:
 
 ```bash
-./heel-rc4/bin/heel review openapi ./sanitized-openapi.json --json
+./heel-rc5/bin/heel review openapi ./sanitized-openapi.json --json
 ```
 
 Both formats come from the same pure review service and validated exporters used by MCP.
@@ -111,7 +111,7 @@ server configuration shape:
 ```
 
 If the desktop client does not inherit your virtual environment's `PATH`, replace
-`heel-mcp` with the absolute path to `heel-rc4/bin/heel-mcp`. Restart the MCP client after
+`heel-mcp` with the absolute path to `heel-rc5/bin/heel-mcp`. Restart the MCP client after
 changing its configuration.
 
 The local review tool is `heel_review_openapi`. Its arguments contain the parsed OpenAPI

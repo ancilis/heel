@@ -33,13 +33,20 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc5]: unpublished candidate
+## [1.3.0rc5]: 2026-11-13
 
-Runner preview candidate for the customer scenario library and result-chain recovery. It is not a
-GitHub release, not on PyPI and not publicly deployed. Every customer install surface keeps the
-published, hash-pinned 1.3.0rc4 install until this candidate's own release passes an anonymous
-public verification. The same-origin `/downloads/` files are labeled as this not-yet-published
-candidate.
+Runner preview prerelease for the customer scenario library and result-chain recovery, published as
+a GitHub prerelease at <https://github.com/ancilis/heel/releases/tag/v1.3.0rc5> from source commit
+`6fcaaa43abddc56c79c525e83fb4c6bcd7fc35dc` after its anonymous public verification passed: the
+anonymously downloaded wheel is 2869122 bytes with SHA-256
+`a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226`, and a source-free install of it
+reported `heel 1.3.0rc5`. That verification proves packaging and the synthetic reference only. It is
+not a stable release, it is not published to PyPI and the hosted control plane is not deployed.
+Every customer install surface now uses the one hash-pinned 1.3.0rc5 install from that release,
+whose wheel digest equals the bundled `/downloads/` wheel; 1.3.0rc1 through 1.3.0rc4 stay published
+and are named only as history. The packaged `release/open-core/README.md` inside the source archive
+is its build-time snapshot and still describes 1.3.0rc5 as not yet published; this entry and the
+release page are the publication record.
 
 - Version identity 1.3.0rc5 (npm 1.3.0-rc.5) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc4 stays an accepted saved-review and

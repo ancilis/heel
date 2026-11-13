@@ -16,28 +16,22 @@ MANIFEST = "heel-open-core-manifest.json"
 # The public GitHub prerelease that every self-serve install surface names: README, the MCP quickstart,
 # the export demo, the plan-differential guide, /agent, /runner and the dashboard RunnerPairingCard.
 # This literal is copied from the "Customer install command" block of
-# docs/RUNNER_PREVIEW_RELEASE_RC4.md and pinned here rather than derived from the product source; the
-# test below also checks it against that runbook and the published rc4 manifest, kept byte for byte as
-# the historical rc4 publisher fixture now that the bundled files are the 1.3.0rc5 candidate. The
-# release owner's anonymous verify-public for v1.3.0rc4 passed.
-PUBLIC_VERSION = "1.3.0rc4"
+# docs/RUNNER_PREVIEW_RELEASE_RC5.md and pinned here rather than derived from the product source; the
+# test below also checks it against that runbook and the bundled manifest. The copy may be deployed
+# only after the release owner's anonymous verify-public for v1.3.0rc5 passes.
+PUBLIC_VERSION = "1.3.0rc5"
 PUBLIC_WHEEL = f"heel_sim-{PUBLIC_VERSION}-py3-none-any.whl"
-PUBLIC_WHEEL_SHA256 = "27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af"
+PUBLIC_WHEEL_SHA256 = "a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226"
 PUBLIC_INSTALL = (
-    "python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install "
-    "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/"
-    "heel_sim-1.3.0rc4-py3-none-any.whl"
+    "python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install "
+    "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/"
+    "heel_sim-1.3.0rc5-py3-none-any.whl"
     f"#sha256={PUBLIC_WHEEL_SHA256}'"
-    " && ./heel-rc4/bin/heel --version"
+    " && ./heel-rc5/bin/heel --version"
 )
-PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc4"
-PUBLIC_CLI = "./heel-rc4/bin/heel "
+PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc5"
+PUBLIC_CLI = "./heel-rc5/bin/heel "
 BUNDLED_MANIFEST = ROOT / "apps/heel-cloud/public/downloads" / MANIFEST
-PUBLISHED_RC4_MANIFEST = ROOT / "tests/fixtures/runner_preview_rc4/artifacts" / MANIFEST
-# The checked-in 1.3.0rc5 candidate is not yet published: copy may offer its same-origin files only
-# with that label, and never as a GitHub release.
-CANDIDATE_LABEL = r"1\.3\.0rc5 candidate[^.]*not yet published"
-CANDIDATE_RELEASE = r"releases/(?:tag|download)/v1\.3\.0rc5"
 INSTALL_DOCS = (
     "README.md",
     "docs/MCP_QUICKSTART.md",
@@ -48,8 +42,8 @@ PAIRED_RUNNER_SURFACES = (
     "apps/heel-cloud/app/runner/page.tsx",
     "apps/heel-cloud/components/canary/RunnerPairingCard.tsx",
 )
-# Once promoted, copy must not call the public rc4 release an unpublished candidate.
-STALE_RC4 = r"(?i)1\.3\.0rc4 candidate|unpublished 1\.3\.0rc4|1\.3\.0rc4[^.]*not yet published"
+# Once promoted, copy must not call the public rc5 release an unpublished candidate.
+STALE_RC5 = r"(?i)1\.3\.0rc5 candidate|unpublished 1\.3\.0rc5|1\.3\.0rc5[^.]*not yet published"
 RELEASE_REQUIREMENTS = ROOT / "release/requirements-release.txt"
 
 
@@ -175,11 +169,10 @@ class ReleaseAutomationContractTests(unittest.TestCase):
 
         self.assertIn(f"/downloads/{WHEEL}", combined)
         for path, source in documents.items():
-            # Same-origin downloads are the 1.3.0rc5 candidate and are named as not yet published.
+            # Same-origin downloads are named as the bundled 1.3.0rc5 artifacts, never as unpublished.
             if "/downloads/heel_sim-" in source:
-                self.assertRegex(" ".join(source.split()), CANDIDATE_LABEL, path)
-            self.assertNotRegex(" ".join(source.split()), STALE_RC4, path)
-            self.assertNotRegex(source, CANDIDATE_RELEASE, path)
+                self.assertRegex(" ".join(source.split()), r"bundled 1\.3\.0rc5 (?:files|artifacts|wheel)", path)
+            self.assertNotRegex(" ".join(source.split()), STALE_RC5, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc3", source, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc4", source, path)
@@ -199,34 +192,30 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertIn("python3.13 -m pip --isolated install", source)
             self.assertIn("--require-hashes --only-binary=:all:", source)
 
-    def test_every_install_surface_shows_the_one_rc4_runbook_command(self):
+    def test_every_install_surface_shows_the_one_rc5_runbook_command(self):
         import json
 
         command = PUBLIC_INSTALL
-        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC4.md").read_text(encoding="utf-8")
+        runbook = (ROOT / "docs/RUNNER_PREVIEW_RELEASE_RC5.md").read_text(encoding="utf-8")
         section = runbook[runbook.index("## Customer install command"):]
         self.assertEqual(re.search(r"```sh\n(.*)\n```", section).group(1), command)
-        published = json.loads(PUBLISHED_RC4_MANIFEST.read_text(encoding="utf-8"))
-        self.assertEqual(published["version"], PUBLIC_VERSION)
-        published_sha = next(a["sha256"] for a in published["artifacts"] if a["name"] == PUBLIC_WHEEL)
-        self.assertEqual(published_sha, PUBLIC_WHEEL_SHA256)
-        self.assertIn(f"releases/download/v{PUBLIC_VERSION}/{PUBLIC_WHEEL}#sha256={published_sha}'", command)
-        # The bundled files are the unpublished 1.3.0rc5 candidate, never the public command's wheel.
         bundled = json.loads(BUNDLED_MANIFEST.read_text(encoding="utf-8"))
-        self.assertEqual(bundled["version"], "1.3.0rc5")
-        self.assertNotIn(PUBLIC_WHEEL_SHA256, {a["sha256"] for a in bundled["artifacts"]})
-        self.assertNotIn("1.3.0rc5", command)
-        self.assertTrue(command.startswith("python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install "))
-        self.assertTrue(command.endswith(" && ./heel-rc4/bin/heel --version"))
+        self.assertEqual(bundled["version"], PUBLIC_VERSION)
+        bundled_sha = next(a["sha256"] for a in bundled["artifacts"] if a["name"] == PUBLIC_WHEEL)
+        # The public command and the same-origin download name the same wheel bytes.
+        self.assertEqual(bundled_sha, PUBLIC_WHEEL_SHA256)
+        self.assertIn(f"releases/download/v{PUBLIC_VERSION}/{PUBLIC_WHEEL}#sha256={bundled_sha}'", command)
+        self.assertTrue(command.startswith("python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install "))
+        self.assertTrue(command.endswith(" && ./heel-rc5/bin/heel --version"))
         for path in INSTALL_DOCS + PAIRED_RUNNER_SURFACES:
             source = (ROOT / path).read_text(encoding="utf-8")
             unwrapped = " ".join(source.split())
             self.assertIn(command, source, path)
             self.assertIn(PUBLIC_RELEASE, source, path)
-            self.assertIn("./heel-rc4/bin/", source, path)
-            self.assertNotRegex(unwrapped, STALE_RC4, path)
+            self.assertIn("./heel-rc5/bin/", source, path)
+            self.assertNotRegex(unwrapped, STALE_RC5, path)
             # No current surface installs an earlier preview or names more than one wheel digest.
-            self.assertNotRegex(source, r"releases/download/v1\.3\.0rc[123]/|heel-rc[123]/", path)
+            self.assertNotRegex(source, r"releases/download/v1\.3\.0rc[1234]/|heel-rc[1234]/", path)
             self.assertEqual(
                 set(re.findall(r"heel_sim-1\.3\.0rc\d-py3-none-any\.whl#sha256=([0-9a-f]{64})", source)),
                 {PUBLIC_WHEEL_SHA256},
@@ -235,15 +224,14 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc3", source, path)
             self.assertNotIn("/downloads/heel_sim-1.3.0rc4", source, path)
-            self.assertNotRegex(source, CANDIDATE_RELEASE, path)
             if "/downloads/heel_sim-" in source:
-                self.assertRegex(unwrapped, CANDIDATE_LABEL, path)
+                self.assertRegex(unwrapped, r"bundled 1\.3\.0rc5 (?:files|artifacts|wheel)", path)
         for path in INSTALL_DOCS + PAIRED_RUNNER_SURFACES[:1]:
             unwrapped = " ".join((ROOT / path).read_text(encoding="utf-8").split())
             self.assertIn("Intel macOS is unsupported", unwrapped, path)
             self.assertIn("Python 3.11 or newer", unwrapped, path)
             self.assertIn("Apple silicon macOS or Linux x86_64/aarch64", unwrapped, path)
-            # No clean-room result is claimed for the rc4 command before its evidence exists.
+            # No clean-room result is claimed for the rc5 command before its evidence exists.
             self.assertNotRegex(unwrapped, r"passed on Apple silicon macOS with Python", path)
         self.assertIn(PUBLIC_CLI, (ROOT / PAIRED_RUNNER_SURFACES[0]).read_text(encoding="utf-8"))
         # The plan-differential customer journey builds HEEL_HOME from the physical path, never a
@@ -257,7 +245,9 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         digest = re.search(r'const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";', page).group(1)
         template = re.search(r"const INSTALL_PUBLIC_AGENT = `([^`]*)`;", page).group(1)
         self.assertEqual(template.replace("${PUBLIC_WHEEL_SHA256}", digest), command)
-        self.assertNotRegex(page, r"releases/(?:tag|download)/v1\.3\.0rc[123]|heel-rc[123]\b")
+        # /agent refuses to build unless the public pin equals the bundled manifest's wheel digest.
+        self.assertIn("if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {", page)
+        self.assertNotRegex(page, r"releases/(?:tag|download)/v1\.3\.0rc[1234]|heel-rc[1234]\b")
         # The internal launch record keeps naming the earlier public rc2 history and stays undeployed.
         launch = " ".join((ROOT / "docs/saas/LAUNCH.md").read_text(encoding="utf-8").split())
         self.assertIn("https://github.com/ancilis/heel/releases/tag/v1.3.0rc2", launch)
