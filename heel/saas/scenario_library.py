@@ -75,6 +75,7 @@ _RUNNER_SETUP_STEPS = (
     "protected_canary marker fixture served to the positive-control role",
 )
 _DISPLAY_LIMIT = 500
+_DISPLAY_BYTE_LIMIT = 1024
 
 
 class ScenarioLibraryError(Exception):
@@ -250,9 +251,25 @@ BEGIN SELECT RAISE(ABORT, 'run scenario bindings are frozen'); END;
 """
 
 
+def _encoded_text_size(text: str) -> int:
+    """UTF-8 bytes the text occupies inside the stored display JSON, escapes included."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
 def _bounded_text(value: Any) -> str:
+    # Bounded by characters and by encoded bytes so the display snapshot always fits its column.
     text = str(value or "")
-    return text if len(text) <= _DISPLAY_LIMIT else text[: _DISPLAY_LIMIT - 1] + "…"
+    if len(text) <= _DISPLAY_LIMIT and _encoded_text_size(text) <= _DISPLAY_BYTE_LIMIT:
+        return text
+    budget = _DISPLAY_BYTE_LIMIT - _encoded_text_size("…")
+    kept: list[str] = []
+    for char in text[: _DISPLAY_LIMIT - 1]:
+        size = _encoded_text_size(char)
+        if size > budget:
+            break
+        kept.append(char)
+        budget -= size
+    return "".join(kept) + "…"
 
 
 def _json_shape_within_limits(value: Any) -> bool:
