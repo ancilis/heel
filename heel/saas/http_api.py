@@ -118,6 +118,7 @@ from .findings_sync import (
 )
 from .ops import KillSwitchTripped, Metrics, OpsStore
 from .projects import ProjectNotFound, ProjectStore
+from .scenario_library import ScenarioLibraryError, ScenarioLibraryService
 from .tenancy import (
     ControlPlaneStore, IntegrationLimitExceeded, Role, SeatLimitExceeded, hash_api_key, require,
 )
@@ -332,6 +333,7 @@ class ControlPlane:
         self.scope_minter = scope_minter
         self.ops = OpsStore(conn)
         self.projects = ProjectStore(conn)
+        self.scenario_library = ScenarioLibraryService(conn)
         self.findings = FindingsSyncService(
             conn,
             projects=self.projects,
@@ -1011,6 +1013,8 @@ class _Handler(BaseHTTPRequestHandler):
                 ("POST", ("targets", "check")): lambda: self._ws_target_check(wid),
                 ("POST", ("billing", "checkout")): lambda: self._ws_checkout(wid),
                 ("POST", ("runner-pairings",)): lambda: self._runner_pairing_invite(wid),
+                ("GET", ("scenario-library",)): lambda: self._ws_scenario_library(wid),
+                ("POST", ("scenario-library", "custom")): lambda: self._ws_custom_scenario_create(wid),
             }
             if (method, tail) in ws_routes:
                 return ws_routes[(method, tail)]
@@ -1137,6 +1141,8 @@ class _Handler(BaseHTTPRequestHandler):
                         return lambda: self._ws_canary_disclosure_read(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "findings" and method == "GET":
                         return lambda: self._ws_canary_findings(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "scenario-bindings" and method in {"GET", "POST"}:
+                        return lambda: self._ws_scenario_bindings(method, wid, project_ref, run_id)
         return None
 
     # --- isolated runner pairing and proof routes ---
@@ -2890,6 +2896,59 @@ class _Handler(BaseHTTPRequestHandler):
         self._authorize(wid, "view")
         _, disclosure = self._human_canary_services()
         self._json(200, disclosure.get(wid, project_ref, run_id))
+
+    # --- scenario library, private custom revisions, run-frozen bindings ---
+    def _scenario_library_member(self, wid: str, capability: str) -> str:
+        """Signed-in browser members only; any other workspace reads as not found."""
+        if "?" in self.path or "#" in self.path or "%" in self.path:
+            raise ScenarioLibraryError(404, "not_found")
+        kind, user_id, _ = self._principal()
+        if kind == "anon":
+            raise ApiError(401, "authentication required")
+        if kind != "session" or user_id is None:
+            raise ScenarioLibraryError(403, "browser_session_required")
+        role = self.cp.store.get_role(wid, user_id)
+        if role is None:
+            raise ScenarioLibraryError(404, "not_found")
+        from .tenancy import role_can
+        if not role_can(role, capability):
+            raise ScenarioLibraryError(403, "forbidden")
+        return user_id
+
+    def _scenario_library_same_origin(self) -> None:
+        if (self.cp.public_origin is None
+                or self.headers.get("Origin") != self.cp.public_origin
+                or self.headers.get("X-Heel-Internal-Origin") != "same-origin"):
+            raise ScenarioLibraryError(403, "same_origin_required")
+
+    def _ws_scenario_library(self, wid: str) -> None:
+        try:
+            self._scenario_library_member(wid, "view")
+            self._json(200, self.cp.scenario_library.listing(wid))
+        except ScenarioLibraryError as error:
+            self._json(error.status, error.body())
+
+    def _ws_custom_scenario_create(self, wid: str) -> None:
+        try:
+            actor = self._scenario_library_member(wid, "manage_targets")
+            self._scenario_library_same_origin()
+            body = self._body()
+            self._json(201, self.cp.scenario_library.create_custom(wid, actor, body))
+        except ScenarioLibraryError as error:
+            self._json(error.status, error.body())
+
+    def _ws_scenario_bindings(self, method: str, wid: str, project_ref: str, run_id: str) -> None:
+        try:
+            if method == "GET":
+                self._scenario_library_member(wid, "view")
+                self._json(200, self.cp.scenario_library.bindings_view(wid, project_ref, run_id))
+                return
+            self._scenario_library_member(wid, "view")
+            actor, _, _ = self._recent_owner_admin_context(wid)
+            body = self._body()
+            self._json(201, self.cp.scenario_library.freeze_bindings(wid, project_ref, run_id, actor, body))
+        except ScenarioLibraryError as error:
+            self._json(error.status, error.body())
 
     # --- discovery authorization and inventory (discovery contract §3) ---
     def _discovery_scope(self, wid: str, project_ref: str) -> str:
