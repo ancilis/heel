@@ -136,6 +136,7 @@ EXPECTED_CONTRACT = {
         "heel/bench.py",
         "heel/blind.py",
         "heel/blind_eval.py",
+        "heel/browser_assess.py",
         "heel/browser_review.py",
         "heel/business_rules.py",
         "heel/canary_contracts.py",

@@ -40,13 +40,14 @@ puts the CLI at `./heel-rc4/bin/heel`, and requires a physical, symlink-free `HE
 `"$(pwd -P)/.heel"`). The earlier 1.3.0rc1, 1.3.0rc2 and 1.3.0rc3 prereleases remain published and
 unchanged, and the pages keep the rc1 errata as history.
 
-The builder-verified Agent files advertised on `/agent` are the bundled 1.3.0rc4 artifacts of the
-deployed build. `/agent` refuses to build unless the bundled manifest's wheel digest equals the digest
-pinned in its public command. Deploying the Worker with these files remains a separate deployment
-decision. The same-origin files are:
+The builder-verified Agent files advertised on `/agent` are the bundled artifacts of the deployed
+build, not themselves a verified public release. In this repository they are the 1.3.0rc5 candidate,
+which is not yet published as a public release; a bundled version becomes a public release only
+through a separate publication and verification, and deploying the Worker with these files exposes
+the unpublished candidate only under an explicit exposure decision. The same-origin files are:
 
-- `/downloads/heel_sim-1.3.0rc4-py3-none-any.whl`
-- `/downloads/heel_sim-1.3.0rc4.tar.gz`
+- `/downloads/heel_sim-1.3.0rc5-py3-none-any.whl`
+- `/downloads/heel_sim-1.3.0rc5.tar.gz`
 - `/downloads/heel-open-core-manifest.json`
 
 ## Dashboard account onboarding

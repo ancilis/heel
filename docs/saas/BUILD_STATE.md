@@ -24,10 +24,11 @@ The implemented launch is **Heel free early access**:
   result on first use.
 - Pinned same-origin browser runtime and dedicated Python Web Worker.
 - Optional local browser save, delete, clear, JSON export, and Markdown export.
-- Checked-in Heel 1.3.0rc4 runner preview wheel/source/manifest under
-  `apps/heel-cloud/public/downloads/`, and local MCP setup. 1.3.0rc4 is published as a GitHub
-  prerelease (2026-11-11); it is not published to PyPI, and the website is not publicly deployed.
-  Customer copy uses the public hash-pinned 1.3.0rc4 install. It treats a
+- Checked-in Heel 1.3.0rc5 runner preview candidate wheel/source/manifest under
+  `apps/heel-cloud/public/downloads/`, and local MCP setup. The 1.3.0rc5 candidate is unreleased:
+  it is not published as a GitHub release or to PyPI, and the website is not publicly deployed.
+  1.3.0rc4 is published as a GitHub prerelease (2026-11-11) and customer copy uses its public
+  hash-pinned install. Both treat a
   recognized error envelope as inconclusive at every HTTP status, so the synthetic reference
   `error_envelope` (HTTP 200) and `hardened` (HTTP 403) cases are inconclusive and only the
   non-error `public` and `redacted` cases pass; no inconclusive plan-differential pair stores a
@@ -153,6 +154,8 @@ docker compose --env-file deploy/.env.production \
   is its hash-pinned wheel. Its anonymous verify-public proves packaging only; no independent
   clean-room customer run, pairing, serve, HTTPS target traffic or hosted findings result is
   recorded for it.
+- The 1.3.0rc5 candidate files are not yet published; the public one-command install remains the
+  hash-pinned 1.3.0rc4 GitHub prerelease.
 
 ## Exact next action
 

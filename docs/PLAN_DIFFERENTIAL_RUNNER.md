@@ -424,7 +424,7 @@ pair with a new invitation).
   before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
   installed it is unknown; this path is tested, not assumed unused. The current checked-in
-  artifact is the 1.3.0rc4 runner preview wheel. It reports `1.3.0rc4` and,
+  artifact is the unreleased 1.3.0rc5 runner preview candidate. It reports `1.3.0rc5` and,
   like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no

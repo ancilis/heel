@@ -24,7 +24,7 @@ import zlib
 
 ROOT = Path(os.path.abspath(__file__)).parents[1]
 CONTRACT_PATH = "release/open-core-v1.json"
-RELEASE_VERSION = "1.3.0rc4"
+RELEASE_VERSION = "1.3.0rc5"
 WHEEL_NAME = f"heel_sim-{RELEASE_VERSION}-py3-none-any.whl"
 SDIST_NAME = f"heel_sim-{RELEASE_VERSION}.tar.gz"
 MANIFEST_NAME = "heel-open-core-manifest.json"

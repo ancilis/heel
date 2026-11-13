@@ -3,8 +3,8 @@
 /** Dependency-free validation for the untrusted Python worker response. */
 
 export const REVIEW_SCHEMA_VERSION = "heel.review.v1" as const;
-export const REVIEW_ENGINE_VERSION = "1.3.0rc4" as const;
-export type ReviewEngineVersion = "1.1.0" | "1.1.1" | "1.2.0" | "1.3.0rc1" | "1.3.0rc2" | "1.3.0rc3" | typeof REVIEW_ENGINE_VERSION;
+export const REVIEW_ENGINE_VERSION = "1.3.0rc5" as const;
+export type ReviewEngineVersion = "1.1.0" | "1.1.1" | "1.2.0" | "1.3.0rc1" | "1.3.0rc2" | "1.3.0rc3" | "1.3.0rc4" | typeof REVIEW_ENGINE_VERSION;
 
 const SUPPORTED_REVIEW_ENGINE_VERSIONS = new Set<ReviewEngineVersion>([
   "1.1.0",
@@ -13,6 +13,7 @@ const SUPPORTED_REVIEW_ENGINE_VERSIONS = new Set<ReviewEngineVersion>([
   "1.3.0rc1",
   "1.3.0rc2",
   "1.3.0rc3",
+  "1.3.0rc4",
   REVIEW_ENGINE_VERSION,
 ]);
 

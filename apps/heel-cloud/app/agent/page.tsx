@@ -6,7 +6,7 @@ import releaseManifest from "../../public/downloads/heel-open-core-manifest.json
 
 
 const WHEEL_SHA256 = releaseManifest.artifacts.find(
-  ({ name }) => name === "heel_sim-1.3.0rc4-py3-none-any.whl",
+  ({ name }) => name === "heel_sim-1.3.0rc5-py3-none-any.whl",
 )?.sha256;
 
 if (WHEEL_SHA256 === undefined) {
@@ -14,16 +14,11 @@ if (WHEEL_SHA256 === undefined) {
 }
 
 const INSTALL_AGENT = `python3 -m venv heel-rc4
-./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl`;
+./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc5-py3-none-any.whl`;
 
-// The public v1.3.0rc4 release wheel digest, pinned literally from docs/RUNNER_PREVIEW_RELEASE_RC4.md. The build refuses
-// to render this page unless it equals the bundled manifest's wheel digest, so the public command and the same-origin
-// download name the same bytes.
+// The public v1.3.0rc4 release wheel digest, pinned literally from docs/RUNNER_PREVIEW_RELEASE_RC4.md. The bundled
+// same-origin files are the unpublished 1.3.0rc5 candidate, whose own digest is shown with its download below.
 const PUBLIC_WHEEL_SHA256 = "27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af";
-
-if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {
-  throw new Error("the public Heel Agent wheel digest does not match the bundled release manifest");
-}
 
 const INSTALL_PUBLIC_AGENT = `python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}' && ./heel-rc4/bin/heel --version`;
 
@@ -97,8 +92,8 @@ export default function AgentQuickstart() {
             <p>
               Heel&apos;s base MCP core is Apache-2.0 licensed and free to run locally. Install the
               public preview directly from the public release with one command and no manual wheel
-              download. The downloads further below are this build&apos;s bundled copies of the same
-              files; the source archive is provided alongside the wheel for inspection.
+              download. The downloads further below are this build&apos;s bundled files; the source
+              archive is provided alongside the wheel for inspection.
             </p>
             <p>
               Version 1.3.0rc4 is a public preview prerelease at{" "}
@@ -131,21 +126,22 @@ export default function AgentQuickstart() {
               inconclusive at any status; treat each result as inconclusive, not a pass.
             </p>
             <p>
-              The downloads below are this build&apos;s bundled 1.3.0rc4 files. Their wheel digest
-              equals the one pinned in the public command above, which is the recommended install.
+              The downloads below are this build&apos;s bundled files, not themselves a verified
+              public release: they are the 1.3.0rc5 candidate, which is not yet published as a
+              public release. The public command above is the recommended install.
             </p>
             <div className="hero-actions" aria-label="Heel Agent downloads">
               <a
                 className="button button-primary"
                 download
-                href="/downloads/heel_sim-1.3.0rc4-py3-none-any.whl"
+                href="/downloads/heel_sim-1.3.0rc5-py3-none-any.whl"
               >
-                Download Heel Agent 1.3.0rc4
+                Download Heel Agent 1.3.0rc5 candidate
               </a>
               <a
                 className="button button-secondary"
                 download
-                href="/downloads/heel_sim-1.3.0rc4.tar.gz"
+                href="/downloads/heel_sim-1.3.0rc5.tar.gz"
               >
                 Download source archive
               </a>

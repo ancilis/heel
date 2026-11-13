@@ -9,7 +9,7 @@ import type { RunnerPairingView } from "../../lib/canary-api";
 /**
  * The 1.3.0rc4 runner install line, verbatim from the rc4 release-owner runbook (docs/RUNNER_PREVIEW_RELEASE_RC4.md,
  * "Customer install command"). Deploy it only after the release owner's anonymous `verify-public` for v1.3.0rc4 has
- * passed; the wheel digest is the candidate rc4 wheel checked in under public/downloads.
+ * passed; the wheel digest is the published rc4 wheel, kept byte for byte under tests/fixtures/runner_preview_rc4/.
  */
 export const RUNNER_RC4_INSTALL = "python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc4/heel_sim-1.3.0rc4-py3-none-any.whl#sha256=27cc929b32d07c6fa3466dd6e8cb3079cb90b513d93bf65dc64cae05393ba2af' && ./heel-rc4/bin/heel --version";
 export const RUNNER_RC4_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc4";

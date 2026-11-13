@@ -39,10 +39,11 @@ refuses that `HEEL_HOME`. Do not disable or work around that check. Run the comm
 same shell so that `HEEL_HOME` stays set.
 
 A Heel Cloud deployment built from the current repository also serves its own bundled wheel on its
-`/agent` page. That file is the build's bundled 1.3.0rc4 wheel; the bundled manifest's wheel digest
-equals the digest pinned in the public command above, which is the recommended install. If you did download `heel_sim-1.3.0rc4-py3-none-any.whl`
+`/agent` page. That file is the build's artifact, not a separate verified public release: in this
+repository it is the 1.3.0rc5 candidate, which is not yet published as a public release. The public
+command above is the recommended install. If you did download `heel_sim-1.3.0rc5-py3-none-any.whl`
 there, you can install that file instead with
-`python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install './heel_sim-1.3.0rc4-py3-none-any.whl[runner]'`.
+`python3 -m venv heel-rc4 && ./heel-rc4/bin/python -m pip --isolated install './heel_sim-1.3.0rc5-py3-none-any.whl[runner]'`.
 
 Replace SCOPE_ID below with the returned ID. Each attempt ID is consumed once, including cancelled or interrupted attempts; choose fresh 32-character lowercase hexadecimal IDs on repetition.
 
