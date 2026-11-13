@@ -217,7 +217,7 @@ class ReportShapeTests(unittest.TestCase):
     def test_an_arbitrary_200_page_never_proves_heel_identity_or_readiness(self):
         imitation = http_response(
             "HTTP/1.1 200 OK",
-            ["Content-Type: application/json", "X-Heel-Release: 1.3.0rc4", "Server: heel"],
+            ["Content-Type: application/json", "X-Heel-Release: 1.3.0rc5", "Server: heel"],
             b'{"ready":true,"schema_version":31,"catalog_version":"heel"}',
         )
         report = preflight.run_preflight(ORIGIN, seams=synthetic_network(imitation))

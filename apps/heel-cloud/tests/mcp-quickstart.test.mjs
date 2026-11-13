@@ -42,13 +42,13 @@ test("the displayed install and verification perform a real handshake against th
   const displayedVerify = verifyMatch[1].replaceAll("\\\\", "\\");
   assert.equal(
     displayedInstall,
-    "python3 -m venv heel-rc4\n./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl",
+    "python3 -m venv heel-rc4\n./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc5-py3-none-any.whl",
   );
   assert.match(displayedVerify, /\| \.\/heel-rc4\/bin\/heel-mcp$/);
-  const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc4-py3-none-any.whl");
+  const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc5-py3-none-any.whl");
   const workingDirectory = await mkdtemp(join(await realpath(repoRoot), ".heel-mcp-quickstart-"));
   const currentInstall = displayedInstall.replace(
-    "./heel_sim-1.3.0rc4-py3-none-any.whl",
+    "./heel_sim-1.3.0rc5-py3-none-any.whl",
     shellQuote(wheel),
   );
 

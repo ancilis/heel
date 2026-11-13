@@ -157,12 +157,19 @@ const STALE_RC2_CLAIMS =
 // Once this copy is promoted, the 1.3.0rc4 release is public: copy must not still call it an unpublished candidate.
 const STALE_RC4_CLAIMS = /1\.3\.0rc4 candidate|unpublished 1\.3\.0rc4|1\.3\.0rc4[^.]*not yet published/i;
 const PREVIOUS_RELEASE_DOWNLOAD = /releases\/download\/v1\.3\.0rc1/i;
-const CURRENT_VERSION = "1.3.0rc4";
-// The bundled same-origin files are the 1.3.0rc4 artifacts; any copy that offers them says so.
-const BUNDLED_LABEL = /bundled 1\.3\.0rc4 (files|artifacts|wheel)/;
-// The bundled manifest of this build, whose wheel digest must equal the public command's pin.
+// The checked-in 1.3.0rc5 candidate is not yet published: copy may offer its same-origin files only
+// with that label, and never as a GitHub release.
+const CANDIDATE_VERSION = "1.3.0rc5";
+const CANDIDATE_LABEL = /1\.3\.0rc5 candidate[^.]*not yet published/;
+const CANDIDATE_RELEASE_CLAIMS = /releases\/(tag|download)\/v1\.3\.0rc5/;
+// The bundled manifest of this build: the unpublished candidate, never the public command's wheel.
 const BUNDLED_MANIFEST = JSON.parse(readFileSync(
   resolve(process.cwd(), "public/downloads/heel-open-core-manifest.json"),
+  "utf8",
+)) as { version: string; artifacts: Array<{ name: string; sha256: string }> };
+// The published rc4 manifest, kept byte for byte as the historical rc4 publisher fixture.
+const PUBLIC_MANIFEST = JSON.parse(readFileSync(
+  resolve(process.cwd(), "../../tests/fixtures/runner_preview_rc4/artifacts/heel-open-core-manifest.json"),
   "utf8",
 )) as { version: string; artifacts: Array<{ name: string; sha256: string }> };
 // Limits that stay true for the public prerelease.
@@ -250,29 +257,35 @@ describe("Heel anonymous launch review", () => {
   test("offers the verified Agent artifacts and exact local install command", () => {
     render(<McpQuickstart />);
 
-    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc4" });
-    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc4-py3-none-any.whl");
+    const wheel = screen.getByRole("link", { name: "Download Heel Agent 1.3.0rc5 candidate" });
+    expect(wheel.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc5-py3-none-any.whl");
     expect(wheel.hasAttribute("download")).toBe(true);
     const source = screen.getByRole("link", { name: /download source archive/i });
-    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc4.tar.gz");
+    expect(source.getAttribute("href")).toBe("/downloads/heel_sim-1.3.0rc5.tar.gz");
     expect(source.hasAttribute("download")).toBe(true);
 
     const manifest = BUNDLED_MANIFEST;
-    expect(manifest.version).toBe(CURRENT_VERSION);
+    expect(manifest.version).toBe(CANDIDATE_VERSION);
     const wheelArtifact = manifest.artifacts.find((artifact) => artifact.name.endsWith(".whl"));
     expect(wheelArtifact).toBeTruthy();
     expect(document.body.textContent).toContain(wheelArtifact?.sha256);
     expect(document.body.textContent).toContain("python3 -m venv heel-rc4\n");
     expect(document.body.textContent).toContain(
-      "./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc4-py3-none-any.whl",
+      "./heel-rc4/bin/python -m pip install ./heel_sim-1.3.0rc5-py3-none-any.whl",
     );
     expect(RUNBOOK_INSTALL).toBe(PUBLIC_INSTALL);
     expect(document.body.textContent).toContain(PUBLIC_INSTALL);
-    // The public command and the same-origin download name the same wheel bytes.
-    expect(PUBLIC_RELEASE.split("/v").pop()).toBe(manifest.version);
-    expect(PUBLIC_WHEEL_SHA256).toBe(wheelArtifact?.sha256);
-    expect(document.body.textContent?.replace(/\s+/g, " ")).toMatch(BUNDLED_LABEL);
-    expect(document.body.textContent).toMatch(/Their wheel digest equals the one pinned in the public command above/);
+    // The bundled wheel is the unpublished 1.3.0rc5 candidate, not the public release's wheel: the
+    // public command keeps the published rc4 digest and the bundled files carry the candidate label.
+    expect(PUBLIC_MANIFEST.version).toBe(PUBLIC_RELEASE.split("/v").pop());
+    expect(manifest.version).not.toBe(PUBLIC_MANIFEST.version);
+    expect(PUBLIC_WHEEL_SHA256).toBe(
+      PUBLIC_MANIFEST.artifacts.find((artifact) => artifact.name.endsWith(".whl"))?.sha256,
+    );
+    expect(PUBLIC_WHEEL_SHA256).not.toBe(wheelArtifact?.sha256);
+    expect(document.body.textContent?.replace(/\s+/g, " ")).toMatch(CANDIDATE_LABEL);
+    expect(document.body.textContent).not.toMatch(CANDIDATE_RELEASE_CLAIMS);
+    expect(document.body.textContent).toMatch(/bundled files, not themselves a verified public release/);
     expect(document.body.textContent).not.toMatch(STALE_RC4_CLAIMS);
     expect(document.body.textContent).not.toMatch(STALE_RC2_CLAIMS);
     expect(document.body.textContent).not.toMatch(PREVIOUS_RELEASE_DOWNLOAD);
@@ -412,8 +425,10 @@ describe("Heel anonymous launch review", () => {
       expect(unwrapped, path).not.toMatch(PREVIOUS_RELEASE_DOWNLOAD);
       expect(unwrapped, path).not.toMatch(STALE_RC4_CLAIMS);
       expect(source, path).not.toMatch(EARLIER_INSTALLS);
-      if (source.includes("/downloads/heel_sim-")) expect(unwrapped, path).toMatch(BUNDLED_LABEL);
+      expect(unwrapped, path).not.toMatch(CANDIDATE_RELEASE_CLAIMS);
+      if (source.includes("/downloads/heel_sim-")) expect(unwrapped, path).toMatch(CANDIDATE_LABEL);
       expect(unwrapped, path).not.toContain("/downloads/heel_sim-1.3.0rc2");
+      expect(unwrapped, path).not.toContain("/downloads/heel_sim-1.3.0rc4");
       expect(unwrapped, path).toMatch(/not yet published to PyPI|not published to PyPI/);
       for (const limit of RETAINED_LIMITS) expect(unwrapped, path).toMatch(limit);
       expect(source, path).not.toContain('"$PWD/.heel');
