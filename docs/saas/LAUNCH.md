@@ -25,9 +25,9 @@ include a Stripe or PostgreSQL integration.
   `apps/heel-cloud/public/downloads/`, and the local stdio MCP quickstart. The current public
   one-command install is the hash-pinned 1.3.0rc5 wheel from the GitHub prerelease
   <https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>, whose digest equals the bundled
-  wheel. That copy is deployed only after the release owner's anonymous verify-public for
-  v1.3.0rc5 passes, which proves packaging only. No independent clean-room customer run of that
-  command is recorded yet. 1.3.0rc4 (<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>,
+  wheel. It was published on 2026-11-13 after the release owner's anonymous verify-public
+  passed (see the CHANGELOG), which proves packaging only. No independent clean-room customer run
+  of that command is recorded yet. 1.3.0rc4 (<https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>,
   2026-11-11) and the earlier prerelease <https://github.com/ancilis/heel/releases/tag/v1.3.0rc2>
   stay published as history; the rc2 one-command install's independent anonymous run passed on
   Apple silicon macOS with Python 3.13.5. 1.3.0rc5 is not a stable release, its release record is not immutable, it is not

@@ -12,8 +12,8 @@ from heel.review_contract import ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 # The Python package, release contract, engine and server.json use the PEP 440 spelling.
-# The current version is 1.3.0rc5. Its customer install copy may be deployed only after the release
-# owner's anonymous verify-public for v1.3.0rc5 passes; the CHANGELOG records the publication itself.
+# The current version is 1.3.0rc5, published as a GitHub prerelease on 2026-11-13 after the release
+# owner's anonymous verify-public passed; the CHANGELOG records the publication itself.
 VERSION = "1.3.0rc5"
 # npm metadata needs SemVer; this is the single normalization mapping, not a second version.
 NPM_VERSION = "1.3.0-rc.5"
@@ -134,11 +134,11 @@ class ReleaseVersionContractTests(unittest.TestCase):
         for path in customer[:2] + customer[4:]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        # The CHANGELOG records the publication only after it happens: its date and release URL are
-        # added by the release owner after verify-public, not by this customer-copy change.
-        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
-        self.assertEqual(changelog.count("unpublished candidate"), 1)
-        self.assertNotIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
+        # The CHANGELOG is the publication record: the real date and release URL, recorded after the
+        # release owner's anonymous verify-public passed, with no remaining candidate wording.
+        self.assertIn(f"## [{VERSION}]: 2026-11-13", changelog)
+        self.assertIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
+        self.assertNotIn("unpublished candidate", changelog)
         # The rc5 entry no longer says customer copy stays on rc4.
         self.assertNotIn("keeps the published, hash-pinned 1.3.0rc4 install", " ".join(changelog.split()))
         self.assertIn(f"## [{RC4_VERSION}]: 2026-11-11", changelog)
