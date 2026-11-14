@@ -117,7 +117,8 @@ describe("canary activation dashboard", () => {
     cleanup();
     render(<Runner />);
     expect(screen.getByRole("heading", { name: /validate an export entitlement/i })).toBeTruthy();
-    expect(screen.getByText(/incomplete public workflows/i)).toBeTruthy();
+    expect(screen.getByText(/not general execution against arbitrary customer targets/i)).toBeTruthy();
+    expect(screen.getAllByRole("link", { name: /paired runner guide/i }).every((link) => link.getAttribute("href") === "/guide")).toBe(true);
     expect(screen.queryByText(/copper · field · seven|8C1F · 4E29 · A773/i)).toBeNull();
     expect(screen.getByRole("link", { name: /dashboard/i }).getAttribute("href"))
       .toBe("/dashboard");

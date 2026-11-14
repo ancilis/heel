@@ -59,7 +59,7 @@ export function TargetRegistrationCard({
       <section className="runner-recovery" id="verify-origin" aria-labelledby="target-title"><p className="canary-kicker">Registered target</p><h2 id="target-title">Your target</h2>
         <p><code>{verifiedOrigin}</code></p>
         <p role="status">{privateConnector ? TARGET_CONNECTOR_BOUNDARY : TARGET_UNAVAILABLE_BOUNDARY}</p>
-        {privateConnector ? null : <p>Optional: if you already operate a paired private connector, its access controls appear on this page. <Link href="/runner">About private connectors</Link></p>}
+        {privateConnector ? null : <p>Optional: if you already operate a paired private connector, its access controls appear on this page. <Link href="/guide">Paired runner guide</Link></p>}
       </section>
     );
   }
