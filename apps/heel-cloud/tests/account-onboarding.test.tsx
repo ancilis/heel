@@ -1793,6 +1793,51 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     expectNoRunnerDefault();
   });
 
+  test("signed out, the dashboard offers the no-account static sample separately from real target setup", async () => {
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+    const sample = screen.getByRole("link", { name: "Try the static sample — no account" });
+    expect(sample.getAttribute("href")).toBe("/#review");
+    expect(sample.closest("p")?.textContent).toMatch(/browser-only example that never contacts a target or changes this account/);
+    expect(screen.getByRole("link", { name: "paired runner guide" }).getAttribute("href")).toBe("/guide");
+  });
+
+  test("a pasted root slash and uppercase host start the proof with exactly the canonical origin", async () => {
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Customer staging");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await screen.findByRole("heading", { name: "Add target" });
+    await waitFor(() => expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/));
+    const { ws, prj } = selection();
+
+    fill(/target url/i, "  https://Staging.Customer.Example.test/  ");
+    expect(screen.getByText(TARGET).closest("p")?.textContent).toBe(`Heel will register ${TARGET}.`);
+    fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
+    await screen.findByText(/^Target verification pending\./);
+    const starts = server.calls.filter((call) => call.method === "POST" && call.path === `/api/control-plane/v1/workspaces/${ws}/projects/${prj}/environments`);
+    expect(starts).toHaveLength(1);
+    expect(JSON.parse(starts[0].body).origin).toBe(TARGET);
+  });
+
+  test("an origin with a path is explained at the field and sends no request", async () => {
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Customer staging");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await screen.findByRole("heading", { name: "Add target" });
+    const before = server.calls.length;
+
+    fill(/target url/i, `${TARGET}/login`);
+    const input = screen.getByLabelText(/target url/i);
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(document.getElementById(input.getAttribute("aria-describedby") ?? "")?.textContent).toMatch(/^Remove the path\./);
+    const button = screen.getByRole("button", { name: "Create ownership proof" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(server.calls.slice(before).filter((call) => call.method !== "GET")).toEqual([]);
+  });
+
   test("a proof start that settles after the session ended elsewhere restores nothing, even after signing in again", async () => {
     const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Customer staging"] }]);
     server.session = account;

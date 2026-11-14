@@ -5,8 +5,42 @@ import Link from "next/link";
 
 export type OwnershipProofMethod = "https-file" | "dns-txt";
 
-/** The dashboard's client-side shape gate; the control plane still decides what is acceptable. */
-const TARGET_ORIGIN_SHAPE = /^https:\/\/[a-z0-9.-]+$/;
+/** The canonical shape the browser client sends; the control plane still decides what is acceptable. */
+const TARGET_ORIGIN_SHAPE = /^https:\/\/[a-z0-9.-]{1,253}$/;
+
+export type TargetOriginCheck =
+  | { readonly ok: true; readonly origin: string }
+  | { readonly ok: false; readonly message: string | null };
+
+/**
+ * The dashboard's client-side origin gate. It makes only three safe, meaning-preserving changes to pasted input:
+ * outer whitespace is trimmed, one root `/` is dropped and the host name is lowercased. Anything else that is not
+ * exactly `https://host` (another scheme, credentials, a port, a path, a query or a fragment) is refused with what to
+ * fix, never silently discarded. It sends nothing; the control plane remains the authority.
+ */
+export function checkTargetOrigin(input: string): TargetOriginCheck {
+  const value = input.trim();
+  if (value === "") return { ok: false, message: null };
+  if (!value.startsWith("https://")) {
+    return { ok: false, message: /^http:\/\//i.test(value)
+      ? "Use https://. Heel registers only HTTPS targets."
+      : "Start with lowercase https:// followed by the host name, for example https://staging.yourcompany.com." };
+  }
+  const rest = value.slice("https://".length);
+  const authorityEnd = rest.search(/[/?#]/);
+  const authority = authorityEnd === -1 ? rest : rest.slice(0, authorityEnd);
+  const suffix = authorityEnd === -1 ? "" : rest.slice(authorityEnd);
+  if (authority.includes("@")) return { ok: false, message: "Remove the user name or password before @. Credentials are never entered here." };
+  if (authority.includes(":")) return { ok: false, message: "Remove the port. Only the default HTTPS port is supported." };
+  if (suffix !== "" && suffix !== "/") {
+    const part = /^\/[^?#]/.test(suffix) ? "path" : suffix.includes("?") && (!suffix.includes("#") || suffix.indexOf("?") < suffix.indexOf("#")) ? "query (?…)" : "fragment (#…)";
+    return { ok: false, message: `Remove the ${part}. Enter only the origin, for example https://staging.yourcompany.com.` };
+  }
+  if (authority === "") return { ok: false, message: "Add the host name after https://." };
+  const origin = `https://${authority.toLowerCase()}`;
+  if (!TARGET_ORIGIN_SHAPE.test(origin)) return { ok: false, message: "Use only letters, digits, dots and hyphens in the host name." };
+  return { ok: true, origin };
+}
 
 const PROOF_METHOD_LABELS: Readonly<Record<OwnershipProofMethod, string>> = Object.freeze({ "https-file": "HTTPS file", "dns-txt": "DNS TXT" });
 
@@ -33,7 +67,8 @@ export interface TargetRegistrationCardProps {
   busy: boolean;
   onOriginChange: (origin: string) => void;
   onProofMethodChange: (method: OwnershipProofMethod) => void;
-  onCreateProof: () => void;
+  /** Receives the exact canonical origin the button validated, so the submission never depends on later state. */
+  onCreateProof: (origin: string) => void;
   onCheckProof: () => void;
   /** Pending records from the server list, shown again after a reload. */
   pendingTargets: readonly PendingTarget[];
@@ -54,6 +89,9 @@ export function TargetRegistrationCard({
   pendingTargets, selectedPendingId, replacementPendingId, onSelectPendingTarget, onResumeProof, onReplaceProof,
 }: TargetRegistrationCardProps) {
   const selectedPending = pendingTargets.find((item) => item.environmentId === selectedPendingId);
+  const originCheck = checkTargetOrigin(origin);
+  const originError = !originCheck.ok && originCheck.message !== null ? originCheck.message : null;
+  const originNormalized = originCheck.ok && originCheck.origin !== origin ? originCheck.origin : null;
   if (verifiedOrigin !== null) {
     return (
       <section className="runner-recovery" id="verify-origin" aria-labelledby="target-title"><p className="canary-kicker">Registered target</p><h2 id="target-title">Your target</h2>
@@ -82,9 +120,13 @@ export function TargetRegistrationCard({
           <p>Or register a different target:</p>
         </div> : null}
         <p>The target must be one staging or sandbox HTTPS origin that is publicly reachable. Ownership proof is required before anything else; Heel does not contact the target from this browser.</p>
-        <label>Target URL<input autoComplete="url" onChange={(event) => onOriginChange(event.target.value)} placeholder="https://staging.yourcompany.com" value={origin} /></label>
+        <label>Target URL<input aria-describedby={originError !== null ? "target-origin-error" : originNormalized !== null ? "target-origin-canonical" : undefined}
+          aria-invalid={originError !== null ? true : undefined} autoComplete="url" onChange={(event) => onOriginChange(event.target.value)}
+          placeholder="https://staging.yourcompany.com" value={origin} /></label>
+        {originError !== null ? <p id="target-origin-error">{originError}</p> : null}
+        {originNormalized !== null ? <p id="target-origin-canonical">Heel will register <code>{originNormalized}</code>.</p> : null}
         <label>Ownership proof method<select onChange={(event) => onProofMethodChange(event.target.value as OwnershipProofMethod)} value={proofMethod}><option value="https-file">HTTPS file</option><option value="dns-txt">DNS TXT</option></select></label>
-        <button className="button button-primary" disabled={busy || !TARGET_ORIGIN_SHAPE.test(origin.trim())} onClick={onCreateProof} type="button">Create ownership proof</button>
+        <button className="button button-primary" disabled={busy || !originCheck.ok} onClick={() => { if (originCheck.ok) onCreateProof(originCheck.origin); }} type="button">Create ownership proof</button>
       </>}
     </section>
   );
