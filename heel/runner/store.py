@@ -26,12 +26,18 @@ from urllib.parse import urlsplit
 from heel.canary_contracts import (
     canonical_bytes,
     canonical_digest,
-    validate_approval_projection,
-    validate_canary_findings,
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_COMPILER_VERSION,
+    CONFIGURED_ENGINE_VERSION,
+    CONFIGURED_TEST_MANIFEST_SCHEMA,
+    configured_projection_instance,
+    findings_results,
     validate_execution_grant,
     validate_operational_run,
+    validate_runner_approval_projection,
+    validate_runner_findings,
     validate_runner_result_request,
-    validate_test_manifest,
+    validate_runner_test_manifest,
     validate_runner_context_binding,
 )
 from heel.crypto import ed25519_key_id, load_public_key_base64, verify_envelope
@@ -48,6 +54,7 @@ from heel.scope import heel_home
 
 from .catalog import CATALOG_BY_ID, NONANONYMOUS_AUTH_PROFILES, SEMANTIC_ROLES
 from .openapi_routes import normalize_route_template
+from .vault import VaultUnavailable
 
 
 class UnsupportedSecureStorageError(RuntimeError):
@@ -385,6 +392,67 @@ def _projection_submission_record(value: object) -> dict[str, Any]:
     except (KeyError, TypeError, ValueError):
         raise RunnerStoreError("invalid projection submission record") from None
     return record
+
+
+_LIVE_INPUTS_FILE = "live-inputs.json"
+_LIVE_INPUTS_SCHEMA = "heel.runner-live-inputs.v1"
+MAX_LIVE_INPUTS = 64
+_LIVE_INPUT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}", flags=re.ASCII)
+_LIVE_INPUT_FIELDS = frozenset({
+    "input_handle_id", "name", "backend", "state", "selection",
+    "workspace_id", "project_id", "environment_id", "runner_id",
+})
+
+
+class LiveInputUnavailable(RunnerStoreError):
+    """A frozen local input handle is missing, revoked or unreadable. Never carries a value."""
+
+
+def _live_input_record(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _LIVE_INPUT_FIELDS:
+        raise RunnerStoreError("invalid local live input")
+    if (
+        type(value["name"]) is not str or _LIVE_INPUT_NAME.fullmatch(value["name"]) is None
+        or value["backend"] not in {"macos_keychain", "linux_secret_service"}
+        or value["state"] not in {"pending", "active", "orphaned", "revoked"}
+        or value["selection"] not in {"current", "retained"}
+        or (value["selection"] == "current" and value["state"] != "active")
+    ):
+        raise RunnerStoreError("invalid local live input")
+    try:
+        record = {
+            "input_handle_id": _handle(value["input_handle_id"]),
+            **{key: value[key] for key in ("name", "backend", "state", "selection")},
+            **{key: _id(value[key], key) for key in (
+                "workspace_id", "project_id", "environment_id", "runner_id")},
+        }
+    except ValueError:
+        raise RunnerStoreError("invalid local live input") from None
+    return record
+
+
+def _live_input_bytes(value: Any) -> bytes:
+    from heel.runner.content_assertion import _MISSING, _fixture_value
+
+    if type(value) not in {type(None), bool, str, int, float} or _fixture_value(value) is _MISSING:
+        raise ValueError("local input must be one bounded JSON scalar")
+    return json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def _live_input_value(raw: bytes) -> Any:
+    from heel.runner.content_assertion import _MISSING, _fixture_value
+
+    try:
+        value = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ValueError("local input is invalid") from None
+    if type(value) not in {type(None), bool, str, int, float} or _fixture_value(value) is _MISSING:
+        raise ValueError("local input is invalid")
+    return value
+
+
+def _reject_constant(_: str) -> Any:
+    raise ValueError("non-finite number")
 
 
 def _label(value: object) -> str:
@@ -7296,6 +7364,12 @@ class RunnerStore:
                 self._set_credential_state(handle_id, None)
 
     def _assert_contract_context(self, manifest: Mapping[str, Any], projection: Mapping[str, Any]) -> None:
+        configured = manifest["schema_version"] == CONFIGURED_TEST_MANIFEST_SCHEMA
+        if configured != (projection["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA):
+            raise RunnerStoreError("compiled pair mixes configured and catalog versions")
+        if configured:
+            self._assert_configured_contract_context(manifest, projection)
+            return
         context = self.load_context()
         binding = self.load_binding()["identity"]
         expected_environment = {
@@ -7361,9 +7435,212 @@ class RunnerStore:
         except (TypeError, ValueError):
             raise RunnerStoreError("approval projection signature is invalid") from None
 
+    def _assert_configured_contract_context(
+        self, manifest: Mapping[str, Any], projection: Mapping[str, Any],
+    ) -> None:
+        """Configured (v2/v3) pair: same exact bindings as v1, plus instances derived exactly."""
+        context = self.load_context()
+        binding = self.load_binding()["identity"]
+        expected_environment = {
+            "environment_id": context.environment_id,
+            "verification_record_digest": context.verification_record_digest,
+            "origin": context.origin,
+            "environment_class": context.environment_class,
+        }
+        compiler = {
+            "compiler_version": CONFIGURED_COMPILER_VERSION,
+            "engine_version": CONFIGURED_ENGINE_VERSION,
+        }
+        if (
+            manifest["workspace_id"] != context.workspace_id
+            or manifest["project_id"] != context.project_id
+            or manifest["environment"] != expected_environment
+            or projection["workspace_id"] != context.workspace_id
+            or projection["project_id"] != context.project_id
+            or projection["environment"] != expected_environment
+            or manifest["runner"] != {
+                "runner_id": binding["runner_id"],
+                "runner_key_id": binding["runner_key_id"],
+                "minimum_runner_version": binding["runner_version"],
+            }
+            or projection["runner"]["runner_id"] != binding["runner_id"]
+            or projection["runner"]["runner_key_id"] != binding["runner_key_id"]
+            or projection["runner"]["runner_version"] != binding["runner_version"]
+            or manifest["compiler"] != compiler
+            or projection["compiler"] != compiler
+        ):
+            raise RunnerStoreError("compiled pair does not match bound runner context")
+        versions = set()
+        for instance in manifest["test_instances"]:
+            expected = binding["adapter_versions"].get(instance["scenario_id"])
+            if expected is None or instance["adapter_version"] != expected:
+                raise RunnerStoreError("compiled pair adapter version mismatch")
+            versions.add(expected)
+        if projection["runner"]["adapter_versions"] != sorted(versions):
+            raise RunnerStoreError("compiled pair adapter version mismatch")
+        expected_actions = [{
+            key: value for key, value in action.items()
+            if key not in {"fixture_bindings", "auth_profile"}
+        } for action in manifest["actions"]]
+        if (
+            projection["test_instances"] != [
+                configured_projection_instance(item) for item in manifest["test_instances"]
+            ]
+            or projection["actions"] != expected_actions
+            or projection["budgets"] != manifest["budgets"]
+            or projection["egress"] != manifest["egress"]
+            or projection["retry_policy"] != manifest["retry_policy"]
+            or projection["compiled_at_ms"] != manifest["compiled_at_ms"]
+        ):
+            raise RunnerStoreError("approval projection is not derived from full manifest")
+        unsigned = {
+            key: value for key, value in projection.items()
+            if key not in {"projection_digest", "signing_key_id", "signature_b64"}
+        }
+        try:
+            verify_envelope(
+                {binding["runner_key_id"]: load_public_key_base64(binding["public_key_b64"])},
+                {"signing_key_id": projection["signing_key_id"],
+                 "signature_b64": projection["signature_b64"]},
+                canonical_bytes(unsigned),
+            )
+        except (TypeError, ValueError):
+            raise RunnerStoreError("approval projection signature is invalid") from None
+
+    # Local expected values for configured live-read tests. The value lives only in the OS
+    # vault under a random immutable handle; this record holds the handle, a local name and
+    # the bound context, never the value or any digest of it.
+
+    def _live_input_context_locked(self, context_fd: int) -> dict[str, str]:
+        binding = self._binding_locked(context_fd)
+        context = _context_from_dict(binding["context"])
+        return {
+            "workspace_id": context.workspace_id,
+            "project_id": context.project_id,
+            "environment_id": context.environment_id,
+            "runner_id": binding["identity"]["runner_id"],
+        }
+
+    def _live_inputs_locked(self, context_fd: int) -> list[dict[str, Any]]:
+        raw = _read_json(context_fd, _LIVE_INPUTS_FILE, None)
+        if raw is None:
+            return []
+        records = self._validate_envelope(
+            context_fd, raw, schema=_LIVE_INPUTS_SCHEMA, payload_field="inputs",
+        )
+        if not isinstance(records, list) or len(records) > MAX_LIVE_INPUTS:
+            raise RunnerStoreError("invalid local live inputs")
+        result = [_live_input_record(item) for item in records]
+        expected = self._live_input_context_locked(context_fd)
+        if any(item[key] != value for item in result for key, value in expected.items()):
+            raise RunnerStoreError("local live input context mismatch")
+        handles = [item["input_handle_id"] for item in result]
+        current = [item["name"] for item in result if item["selection"] == "current"]
+        if len(set(handles)) != len(handles) or len(set(current)) != len(current):
+            raise RunnerStoreError("local live inputs are not canonical")
+        return result
+
+    def _write_live_inputs_locked(self, context_fd: int, records: list[dict[str, Any]]) -> None:
+        _write_json(context_fd, _LIVE_INPUTS_FILE, self._envelope(
+            context_fd, _LIVE_INPUTS_SCHEMA, "inputs", records,
+        ))
+
+    def list_live_inputs(self) -> list[dict[str, Any]]:
+        with self._transaction(exclusive=False) as context_fd:
+            return self._live_inputs_locked(context_fd)
+
+    def create_live_input(self, *, name: str, value: Any, vault: object) -> dict[str, Any]:
+        """Store one expected scalar under a NEW random handle; it becomes the name's current.
+
+        An earlier handle for the same name stays resolvable for approvals that froze it
+        until it is revoked explicitly; it is never rewritten.
+        """
+        if type(name) is not str or _LIVE_INPUT_NAME.fullmatch(name) is None:
+            raise ValueError("local input name is invalid")
+        secret = _live_input_bytes(value)
+        backend = getattr(vault, "backend_id", None)
+        if backend not in {"macos_keychain", "linux_secret_service"} or getattr(vault, "supported", False) is not True:
+            raise UnsupportedSecureStorageError("unsupported OS vault for local inputs")
+        with self._transaction(exclusive=True) as context_fd:
+            records = self._live_inputs_locked(context_fd)
+            if len(records) >= MAX_LIVE_INPUTS:
+                raise RunnerStoreError("local live input limit reached")
+            record = _live_input_record({
+                "input_handle_id": secrets.token_hex(16), "name": name, "backend": backend,
+                "state": "pending", "selection": "retained",
+                **self._live_input_context_locked(context_fd),
+            })
+            handle = record["input_handle_id"]
+            self._write_live_inputs_locked(context_fd, [*records, record])
+            try:
+                vault.store(handle, secret)
+            except BaseException:
+                try:
+                    vault.delete(handle)
+                    records_after = records
+                except BaseException:
+                    records_after = [*records, {**record, "state": "orphaned"}]
+                self._write_live_inputs_locked(context_fd, records_after)
+                raise VaultUnavailable("local input could not be stored") from None
+            finally:
+                secret = b""
+            active = {**record, "state": "active", "selection": "current"}
+            updated = [
+                {**item, "selection": "retained"} if item["name"] == name else item for item in records
+            ]
+            self._write_live_inputs_locked(context_fd, [*updated, active])
+        return active
+
+    def revoke_live_input(self, input_handle_id: str, *, vault: object) -> dict[str, Any]:
+        """Revoke first (never resolvable again), then delete the vault item."""
+        handle = _handle(input_handle_id)
+        with self._transaction(exclusive=True) as context_fd:
+            records = self._live_inputs_locked(context_fd)
+            found = next((item for item in records if item["input_handle_id"] == handle), None)
+            if found is None:
+                raise ValueError("local input handle is not registered")
+            revoked = {**found, "state": "revoked", "selection": "retained"}
+            self._write_live_inputs_locked(context_fd, [
+                revoked if item["input_handle_id"] == handle else item for item in records
+            ])
+        if getattr(vault, "backend_id", None) != found["backend"]:
+            raise VaultUnavailable("local input vault does not match the record")
+        vault.delete(handle)
+        return revoked
+
+    def current_live_input(self, name: str) -> dict[str, Any]:
+        records = [
+            item for item in self.list_live_inputs()
+            if item["name"] == name and item["selection"] == "current" and item["state"] == "active"
+        ]
+        if len(records) != 1:
+            raise ValueError("local input name has no current value")
+        return records[0]
+
+    def load_live_input_values(
+        self, handles: Mapping[str, str], *, vaults: Mapping[str, object],
+    ) -> dict[str, Any]:
+        """Resolve exact frozen handles (never names) to local scalars, or refuse closed."""
+        records = {item["input_handle_id"]: item for item in self.list_live_inputs()}
+        values: dict[str, Any] = {}
+        for ref, handle in handles.items():
+            record = records.get(handle)
+            vault = vaults.get(record["backend"]) if record is not None else None
+            if (
+                record is None or record["state"] != "active" or vault is None
+                or getattr(vault, "supported", False) is not True
+                or getattr(vault, "backend_id", None) != record["backend"]
+            ):
+                raise LiveInputUnavailable("local input is unavailable")
+            try:
+                values[ref] = _live_input_value(vault.load(handle))
+            except (ValueError, VaultUnavailable, TypeError):
+                raise LiveInputUnavailable("local input is unavailable") from None
+        return values
+
     def save_approved_pair(self, manifest: Mapping[str, Any], projection: Mapping[str, Any]) -> None:
-        manifest = validate_test_manifest(manifest)
-        projection = validate_approval_projection(projection)
+        manifest = validate_runner_test_manifest(manifest)
+        projection = validate_runner_approval_projection(projection)
         if projection["manifest_digest"] != manifest["manifest_digest"]:
             raise ValueError("approval projection does not bind the full manifest")
         self._assert_contract_context(manifest, projection)
@@ -7412,7 +7689,7 @@ class RunnerStore:
                 os.close(directory_fd)
         if wrapper is None:
             raise RunnerStoreError("manifest is not stored")
-        manifest = validate_test_manifest(manifest)
+        manifest = validate_runner_test_manifest(manifest)
         if manifest["manifest_digest"] != manifest_digest:
             raise RunnerStoreError("stored manifest digest mismatch")
         return manifest
@@ -7434,7 +7711,7 @@ class RunnerStore:
                 os.close(directory_fd)
         if wrapper is None:
             raise RunnerStoreError("projection is not stored")
-        projection = validate_approval_projection(projection)
+        projection = validate_runner_approval_projection(projection)
         if projection["projection_id"] != projection_id:
             raise RunnerStoreError("stored projection ID mismatch")
         return projection
@@ -9314,7 +9591,7 @@ class RunnerStore:
             or findings["containment_codes"] != operational["containment_codes"]
             or findings["redaction_count"] != operational["redaction_count"]
             or sum(
-                item["redaction_count"] for item in findings["scenario_results"]
+                item["redaction_count"] for item in findings_results(findings)
             ) != operational["redaction_count"]
         ):
             raise RunnerStoreError("stored containment chain projection mismatch")
@@ -9372,7 +9649,7 @@ class RunnerStore:
 
         identity, _signer = self._require_runtime_authority()
         operational = validate_operational_run(operational_projection)
-        findings = validate_canary_findings(findings_projection)
+        findings = validate_runner_findings(findings_projection)
         keys = self.load_run_trusted_keys(run_id)
         try:
             for record in (operational, findings):
@@ -9497,7 +9774,7 @@ class RunnerStore:
         result["operational_projection"] = validate_operational_run(
             result["operational_projection"]
         )
-        result["findings_projection"] = validate_canary_findings(result["findings_projection"])
+        result["findings_projection"] = validate_runner_findings(result["findings_projection"])
         from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
         keys = self.load_run_trusted_keys(run_id)
         try:
@@ -9581,7 +9858,8 @@ class RunnerStore:
             return self._saved_regressions_locked(context_fd)
 
     def add_saved_regression(
-        self, *, run_id: str, scenario_id: str, name: str, now_ms: int,
+        self, *, run_id: str, scenario_id: str | None = None, name: str, now_ms: int,
+        test_instance_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Persist one definition derived only from this context's verified terminal finals.
 
@@ -9590,12 +9868,20 @@ class RunnerStore:
         verification failure raises and leaves ``regressions.json`` untouched.
         """
         from heel.runner.regressions import (
-            MAX_SAVED_REGRESSIONS, SAVED_REGRESSIONS_SCHEMA, derive_saved_regression, same_source,
+            MAX_SAVED_REGRESSIONS, SAVED_REGRESSIONS_SCHEMA, derive_configured_saved_regression,
+            derive_saved_regression, same_source,
         )
 
-        record = derive_saved_regression(
-            self, run_id=run_id, scenario_id=scenario_id, name=name, now_ms=now_ms,
-        )
+        if (scenario_id is None) == (test_instance_id is None):
+            raise ValueError("name exactly one catalog scenario or configured test instance")
+        if test_instance_id is not None:
+            record = derive_configured_saved_regression(
+                self, run_id=run_id, test_instance_id=test_instance_id, name=name, now_ms=now_ms,
+            )
+        else:
+            record = derive_saved_regression(
+                self, run_id=run_id, scenario_id=scenario_id, name=name, now_ms=now_ms,
+            )
         with self._transaction(exclusive=True) as context_fd:
             records = self._saved_regressions_locked(context_fd)
             existing = next(

@@ -1,6 +1,6 @@
 # Configurable live read tests: E1 assertion semantics
 
-Status: E1 source only. Pure functions in `heel/runner/content_assertion.py`, tested by
+Status: E1 semantics plus E2 runner integration (source only; see "E2" below). Pure functions in `heel/runner/content_assertion.py`, tested by
 `tests/test_runner_live_assertions.py`. **Not wired** into the canary contracts, compiler,
 executor, API, UI or packaging. This is a leaf of the execution-extensibility workstream,
 not its completion: no customer-authored live test can run until E2–E4 are done and accepted.
@@ -101,3 +101,56 @@ response (anonymous / lower plan) of the same route. The module sends no traffic
 - E4: a new runner release. The released rc5 artifacts are immutable and are not rebuilt or
   relabelled. This module is in the open-core release source set, so frozen-release parity
   checks are expected to differ until E4 produces new-version artifacts.
+
+## E2: signed configured instances in the paired runner (source only)
+
+E2 binds the E1 definition into distinct closed versions; every v1 record and validator is
+unchanged and refuses them (`validate_test_manifest`, `validate_approval_projection`,
+`validate_canary_findings` reject the new schemas and any new field).
+
+| Record | Schema | Change from v1 |
+|---|---|---|
+| Manifest | `heel.test-manifest.v2` | `scenarios` → `test_instances`; each action adds `test_instance_id`; compiler/engine `2`/`2` exactly |
+| Approval projection | `heel.approval-manifest-projection.v3` | as manifest, instances show `local_input_refs` + `local_input_binding_digest` (digest of random handles), never handles or values |
+| Findings | `heel.canary-findings-projection.v2` | `scenario_results` → `test_results`, engine `2` |
+
+A test instance (1–4 per plan) freezes: `test_instance_id` (`lti_` + 32 hex, caller/E3 supplied,
+stable across replays), catalog primitive `scenario_id` (`anonymous_authenticated_read` or
+`plan_entitlement_read`, which is also the E1 role policy), `source` (`source_scenario_id`,
+`source_revision`), inventoried `method`/`route_template` (no placeholders in E2), the canonical
+E1 `assertion` and its `assertion_digest`, and `local_inputs` = exactly one
+`{fixture_ref, input_handle_id}` per referenced fixture. Actions are exactly two per instance in
+catalog role order (restricted, then control), ordinals contiguous; the contract checks each
+action against its instance. Two instances may share primitive and route and are evaluated
+independently on their own signed action ordinals. Runner-local code dispatches by schema
+(`validate_runner_*`); cloud transport validators remain v1-only until E3.
+
+Local values: `RunnerStore.create_live_input(name, value, vault)` stores one JSON scalar in the
+OS vault (Keychain/Secret Service backends only) under a new random handle and makes it the
+name's `current`; earlier handles stay `retained` until `revoke_live_input` (record revoked
+first, then vault delete). Records hold handle, name, backend, state, selection and the bound
+workspace/project/environment/runner; never a value or digest. Compilation resolves a name to
+its current handle once; approvals and replays carry handles only. CLI: `heel runner input
+add --name N --backend keychain|secret-service [--secret-fd FD]` (else TTY prompt), `revoke
+--handle H`, `list`.
+
+Execution reuses `LocalCanaryExecutor` (same grant, gate, attempts, budgets, transport,
+containment, redaction). After activation and credentials, each instance's frozen handles are
+loaded once; a missing/revoked/unreadable handle sends no request for that instance (containment
+`action_rejected`, detail `local_input_unavailable`) and its result is inconclusive
+`local_input_unavailable`. Responses of configured actions are held in memory only for
+`evaluate_live_read_pair`; no catalog predicate or plan comparator is consulted. Each result
+reports outcome, one closed `reason`, `positive_control` (`established`/`not_established`),
+`restricted_condition` (`true`/`false`/`not_observed`), per-action observations and redacted
+evidence refs; the contract enforces outcome/reason/finding consistency.
+
+Regression: `add_saved_regression(run_id=..., test_instance_id=...)` stores a closed
+`heel.runner-configured-regression.v1` record holding the exact instance (definition, revision,
+handles). `CanaryCompiler.compile_configured_replay` recompiles it with the frozen handles
+(never names); a revoked handle refuses. Replay still requires queueing, fresh approval and a
+new one-shot grant; `record_regression_result` yields pass/fail/inconclusive as for v1.
+
+Not in E2: browser authoring and authenticated delivery of definitions and v3 projection
+submission/claim/upload through the control plane (E3); disclosure of v2 findings (E3); new
+release artifacts (E4). Containment events keep schema v1: an event's signed action ordinal maps
+to exactly one instance in the signed manifest.

@@ -12,7 +12,13 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from heel.canary_contracts import canonical_digest
+from heel.canary_contracts import (
+    CONFIGURED_ROLE_ORDER,
+    CONFIGURED_TEST_MANIFEST_SCHEMA,
+    canonical_digest,
+    configured_projection_instance,
+    findings_results,
+)
 from heel.runner.catalog import CATALOG_BY_ID
 from heel.runner.openapi_routes import normalize_route_template
 
@@ -44,6 +50,27 @@ RECORD_FIELDS = (
 # Every field except the creation instant is a deterministic function of the source run.
 _SOURCE_FIELDS = tuple(field for field in RECORD_FIELDS if field != "created_at_ms")
 
+# A configured saved regression is a distinct closed record (``record_schema``) in the same
+# list. It retains the exact frozen instance: identity, source scenario/revision, assertion
+# and digest, route and the immutable local input HANDLES (never values). v1 records keep
+# their exact field set and meaning.
+CONFIGURED_REGRESSION_SCHEMA = "heel.runner-configured-regression.v1"
+_CONFIGURED_INSTANCE_FIELDS = (
+    "test_instance_id", "scenario_id", "adapter_version", "source", "method",
+    "route_template", "assertion", "assertion_digest", "local_inputs",
+)
+CONFIGURED_RECORD_FIELDS = (
+    "record_schema", "regression_id", "name", "source_run_id", *_CONFIGURED_INSTANCE_FIELDS,
+    "findings_projection_digest", "approval_projection_digest", "manifest_digest",
+    "grant_id", "grant_digest", "workspace_id", "project_id", "environment_id", "origin",
+    "runner_id", "runner_key_id", "expected_outcome", "created_at_ms",
+)
+_CONFIGURED_SOURCE_FIELDS = tuple(f for f in CONFIGURED_RECORD_FIELDS if f != "created_at_ms")
+
+
+def is_configured(record: Mapping[str, Any]) -> bool:
+    return isinstance(record, Mapping) and "record_schema" in record
+
 
 class SavedRegressionError(ValueError):
     """A fixed, non-reflecting refusal; never carries caller input."""
@@ -51,6 +78,57 @@ class SavedRegressionError(ValueError):
 
 def _refuse() -> SavedRegressionError:
     return SavedRegressionError("saved regression source is not eligible")
+
+
+def configured_regression_id_for(source_run_id: str, test_instance_id: str) -> str:
+    if (
+        type(source_run_id) is not str or _RUN_ID.fullmatch(source_run_id) is None
+        or type(test_instance_id) is not str
+        or re.fullmatch(r"lti_[0-9a-f]{32}", test_instance_id) is None
+    ):
+        raise _refuse()
+    digest = hashlib.sha256(f"{source_run_id}:{test_instance_id}".encode("ascii")).hexdigest()
+    return "rreg_" + digest[:24]
+
+
+def _frozen_instance(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-validate one stored instance through the signed manifest instance contract."""
+    from heel.canary_contracts import ContractError, _configured_instance
+
+    instance = {"ordinal": 0, **{field: value[field] for field in _CONFIGURED_INSTANCE_FIELDS}}
+    try:
+        _configured_instance(instance, 0, projection=False)
+    except ContractError:
+        raise _refuse() from None
+    return instance
+
+
+def validate_configured_regression(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != set(CONFIGURED_RECORD_FIELDS):
+        raise _refuse()
+    record = {field: value[field] for field in CONFIGURED_RECORD_FIELDS}
+    _frozen_instance(record)
+    if (
+        record["record_schema"] != CONFIGURED_REGRESSION_SCHEMA
+        or type(record["name"]) is not str or _NAME.fullmatch(record["name"]) is None
+        or record["regression_id"]
+        != configured_regression_id_for(record["source_run_id"], record["test_instance_id"])
+        or record["expected_outcome"] != EXPECTED_OUTCOME
+        or type(record["origin"]) is not str or not record["origin"].startswith("https://")
+        or any(
+            type(record[field]) is not str or _DIGEST.fullmatch(record[field]) is None
+            for field in ("findings_projection_digest", "approval_projection_digest",
+                          "manifest_digest", "grant_digest")
+        )
+        or any(
+            type(record[field]) is not str or _IDENTIFIER.fullmatch(record[field]) is None
+            for field in ("grant_id", "workspace_id", "project_id", "environment_id",
+                          "runner_id", "runner_key_id")
+        )
+    ):
+        raise _refuse()
+    _instant(record["created_at_ms"])
+    return record
 
 
 def regression_id_for(source_run_id: str, scenario_id: str) -> str:
@@ -81,6 +159,8 @@ def fixture_bindings_sha256(bindings: Any) -> str:
 
 def validate_saved_regression(value: Any) -> dict[str, Any]:
     """Structurally validate one persisted definition; context binding is checked by the store."""
+    if is_configured(value):
+        return validate_configured_regression(value)
     if not isinstance(value, Mapping) or set(value) != set(RECORD_FIELDS):
         raise _refuse()
     record = {field: value[field] for field in RECORD_FIELDS}
@@ -127,7 +207,10 @@ def validate_saved_regression(value: Any) -> dict[str, Any]:
 
 
 def same_source(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return all(left[field] == right[field] for field in _SOURCE_FIELDS)
+    if is_configured(left) != is_configured(right):
+        return False
+    fields = _CONFIGURED_SOURCE_FIELDS if is_configured(left) else _SOURCE_FIELDS
+    return all(left[field] == right[field] for field in fields)
 
 
 def load_terminal_local_view(store: "RunnerStore", run_id: str) -> dict[str, Any]:
@@ -151,7 +234,7 @@ def evidence_states_for(view: Mapping[str, Any]) -> list[dict[str, Any]]:
     ``held`` = blocked, anything else ``inconclusive``.
     """
     states = []
-    for item in view["findings_projection"]["scenario_results"]:
+    for item in findings_results(view["findings_projection"]):
         outcome = item["assessment_outcome"]
         finding = item["finding"]
         confidence = finding["confidence"] if isinstance(finding, Mapping) else None
@@ -163,10 +246,13 @@ def evidence_states_for(view: Mapping[str, Any]) -> list[dict[str, Any]]:
             state = "held"
         else:
             state = "inconclusive"
-        states.append({
+        entry = {
             "ordinal": item["ordinal"], "scenario_id": item["scenario_id"],
             "evidence_state": state,
-        })
+        }
+        if "test_instance_id" in item:
+            entry["test_instance_id"] = item["test_instance_id"]
+        states.append(entry)
     return states
 
 
@@ -293,6 +379,58 @@ def derive_saved_regression(
         "created_at_ms": now_ms,
     })
 
+def derive_configured_saved_regression(
+    store: "RunnerStore", *, run_id: str, test_instance_id: str, name: str, now_ms: int,
+) -> dict[str, Any]:
+    """Derive one configured definition from a verified terminal observed instance result."""
+    _instant(now_ms)
+    regression_id = configured_regression_id_for(run_id, test_instance_id)
+    verified = _verified_terminal_run(store, run_id)
+    manifest, projection = verified["manifest"], verified["projection"]
+    grant, findings = verified["grant"], verified["findings"]
+    context, identity = verified["context"], verified["identity"]
+    if manifest["schema_version"] != CONFIGURED_TEST_MANIFEST_SCHEMA:
+        raise _refuse()
+    instances = [i for i in manifest["test_instances"] if i["test_instance_id"] == test_instance_id]
+    results = [r for r in findings["test_results"] if r["test_instance_id"] == test_instance_id]
+    if len(instances) != 1 or len(results) != 1:
+        raise _refuse()
+    instance, result = instances[0], results[0]
+    if (
+        result["assessment_outcome"] != "observed" or result["finding"] is None
+        or result["assertion_digest"] != instance["assertion_digest"]
+        or result["source"] != instance["source"]
+        or result["route"] != {"method": instance["method"], "route_template": instance["route_template"]}
+    ):
+        raise _refuse()
+    return validate_configured_regression({
+        "record_schema": CONFIGURED_REGRESSION_SCHEMA,
+        "regression_id": regression_id,
+        "name": name,
+        "source_run_id": run_id,
+        **{field: instance[field] for field in _CONFIGURED_INSTANCE_FIELDS},
+        "findings_projection_digest": findings["projection_digest"],
+        "approval_projection_digest": projection["projection_digest"],
+        "manifest_digest": manifest["manifest_digest"],
+        "grant_id": grant["grant_id"],
+        "grant_digest": grant["grant_digest"],
+        "workspace_id": context.workspace_id,
+        "project_id": context.project_id,
+        "environment_id": context.environment_id,
+        "origin": context.origin,
+        "runner_id": identity["runner_id"],
+        "runner_key_id": identity["runner_key_id"],
+        "expected_outcome": EXPECTED_OUTCOME,
+        "created_at_ms": now_ms,
+    })
+
+
+def configured_replay_instance(regression: Mapping[str, Any]) -> dict[str, Any]:
+    """The exact frozen instance a configured replay must recompile: handles, not names."""
+    regression = validate_configured_regression(regression)
+    return {field: regression[field] for field in _CONFIGURED_INSTANCE_FIELDS}
+
+
 # --- Replay: a fresh single-scenario plan and its verified result -------------------------
 #
 # A replay association is local provenance, never authority: it ties one saved definition (by
@@ -412,6 +550,14 @@ def check_replay_inputs(store: "RunnerStore", regression: Mapping[str, Any]) -> 
     coordinate = (regression["method"], regression["route_template"])
     if coordinate not in {(item["method"], item["route_template"]) for item in store.list_routes()}:
         raise _refuse()
+    if is_configured(regression):
+        # The frozen handles must still be active; a rotated name never substitutes.
+        active = {
+            item["input_handle_id"] for item in store.list_live_inputs() if item["state"] == "active"
+        }
+        if any(item["input_handle_id"] not in active for item in regression["local_inputs"]):
+            raise _refuse()
+        return
     mappings = [item for item in store.list_mappings() if item["scenario_id"] == regression["scenario_id"]]
     if (
         len(mappings) != 1
@@ -432,6 +578,9 @@ def check_replay_pair(
     """
     regression = validate_saved_regression(regression)
     _require_bound_context(regression, context, identity)
+    if is_configured(regression):
+        _check_configured_replay_pair(regression, manifest, projection, context=context, identity=identity)
+        return
     scenario_id = regression["scenario_id"]
     expected_scenarios = [{
         "ordinal": 0, "scenario_id": scenario_id, "adapter_version": regression["adapter_version"],
@@ -470,6 +619,36 @@ def check_replay_pair(
                 "scenario_id", "adapter_version", "method", "route_template", "semantic_auth_role"))
         ):
             raise _refuse()
+
+
+def _check_configured_replay_pair(
+    regression: Mapping[str, Any], manifest: Mapping[str, Any], projection: Mapping[str, Any],
+    *, context: Any, identity: Mapping[str, Any],
+) -> None:
+    """A fresh v2 pair holding exactly the definition's one frozen instance."""
+    expected = {"ordinal": 0, **configured_replay_instance(regression)}
+    if (
+        manifest.get("schema_version") != CONFIGURED_TEST_MANIFEST_SCHEMA
+        or manifest["test_instances"] != [expected]
+        or projection.get("test_instances") != [configured_projection_instance(expected)]
+        or [a["semantic_auth_role"] for a in manifest["actions"]]
+        != list(CONFIGURED_ROLE_ORDER[regression["scenario_id"]])
+        or projection["manifest_digest"] != manifest["manifest_digest"]
+        or manifest["workspace_id"] != context.workspace_id
+        or manifest["project_id"] != context.project_id
+        or projection["workspace_id"] != context.workspace_id
+        or projection["project_id"] != context.project_id
+        or manifest["environment"] != projection["environment"]
+        or manifest["environment"]["origin"] != context.origin
+        or manifest["environment"]["environment_id"] != context.environment_id
+        or manifest["runner"]["runner_id"] != identity["runner_id"]
+        or manifest["runner"]["runner_key_id"] != identity["runner_key_id"]
+        or projection["runner"]["runner_id"] != identity["runner_id"]
+        or projection["runner"]["runner_key_id"] != identity["runner_key_id"]
+        or projection["projection_digest"] == regression["approval_projection_digest"]
+        or manifest["manifest_digest"] == regression["manifest_digest"]
+    ):
+        raise _refuse()
 
 
 def new_regression_replay(
@@ -518,9 +697,10 @@ def derive_regression_result(
     check_replay_pair(
         regression, manifest, projection, context=verified["context"], identity=verified["identity"],
     )
-    results = findings["scenario_results"]
+    results = findings_results(findings)
     if (
         len(results) != 1
+        or results[0].get("test_instance_id") != regression.get("test_instance_id")
         or results[0]["scenario_id"] != regression["scenario_id"]
         or results[0]["adapter_version"] != regression["adapter_version"]
         or results[0]["route"] != {
@@ -549,6 +729,9 @@ def derive_regression_result(
 
 __all__ = [
     "EXPECTED_OUTCOME", "MAX_REGRESSION_REPLAYS", "MAX_REGRESSION_RESULTS", "MAX_SAVED_REGRESSIONS",
+    "CONFIGURED_RECORD_FIELDS", "CONFIGURED_REGRESSION_SCHEMA", "configured_regression_id_for",
+    "configured_replay_instance", "derive_configured_saved_regression", "is_configured",
+    "validate_configured_regression",
     "RECORD_FIELDS", "REPLAYS_SCHEMA", "REPLAY_FIELDS", "RESULTS_SCHEMA", "RESULT_FIELDS",
     "RESULT_OUTCOMES", "SAVED_REGRESSIONS_SCHEMA", "SavedRegressionError", "check_replay_inputs",
     "check_replay_pair", "definition_digest", "derive_regression_result", "derive_saved_regression",

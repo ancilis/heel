@@ -13,6 +13,13 @@ from typing import Any
 
 from heel.canary_contracts import (
     CANARY_FINDINGS_SCHEMA,
+    CONFIGURED_FINDINGS_SCHEMA,
+    CONFIGURED_ROLE_ORDER,
+    CONFIGURED_TEST_MANIFEST_SCHEMA,
+    configured_projection_instance,
+    validate_configured_findings,
+    validate_runner_approval_projection,
+    validate_runner_test_manifest,
     OPERATIONAL_RUN_SCHEMA,
     canonical_bytes,
     canonical_digest,
@@ -24,7 +31,13 @@ from heel.canary_contracts import (
 )
 from heel.crypto import verify_envelope
 from heel.runner.adapters import evaluate_pair, prepare_action
-from heel.runner.content_assertion import protected_content
+from heel.runner.content_assertion import (
+    LiveReadResponse,
+    evaluate_live_read_pair,
+    protected_content,
+    resolve_local_fixtures,
+    validate_live_read_assertion,
+)
 from heel.runner.companion import validate_disclosure_preview, validate_local_result_view
 from heel.runner.containment import ContainmentLog, operational_containment_codes
 from heel.runner.http_transport import (
@@ -37,11 +50,47 @@ from heel.runner.http_transport import (
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.redaction import Redactor
-from heel.runner.store import RunnerStore, RunnerStoreError
+from heel.runner.store import LiveInputUnavailable, RunnerStore, RunnerStoreError
 from heel.runner.vault import EphemeralVault, VaultUnavailable, validate_credential_secret
 
 
 _PLAN_SCENARIO = "plan_entitlement_read"
+
+
+_UNRESOLVED = object()
+
+
+def _configured(manifest: Mapping[str, Any]) -> bool:
+    return manifest["schema_version"] == CONFIGURED_TEST_MANIFEST_SCHEMA
+
+
+def _units(manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Result units: configured test instances, or catalog scenarios for v1."""
+    return manifest["test_instances"] if _configured(manifest) else manifest["scenarios"]
+
+
+def _unit_key(record: Mapping[str, Any]) -> str:
+    return record.get("test_instance_id", record["scenario_id"])
+
+
+def _catalog_action(action: Mapping[str, Any]) -> dict[str, Any]:
+    """The exact closed v1 action the launch adapter prepares; instance identity stays signed."""
+    return {key: value for key, value in action.items() if key != "test_instance_id"}
+
+
+def _configured_finding() -> dict[str, str]:
+    return {
+        "title": "Configured live condition held for the restricted role",
+        "reachability_rationale": (
+            "On this approved read, the restricted role's response satisfied the frozen "
+            "configured condition, and the control role's response satisfied the success "
+            "witness and the same condition. Only the configured field was evaluated; no "
+            "value is reported. Only this read was tested."
+        ),
+        "confidence": "medium",
+        "recommended_control": "Enforce the selected authorization boundary on this read.",
+        "regression_suggestion": "Replay this exact configured instance with a new one-shot grant.",
+    }
 
 
 def _plan_differential_finding() -> dict[str, str]:
@@ -271,8 +320,8 @@ def validate_execution_bundle(
         raise ValueError("bound runner store and identity are required")
     if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
         raise ValueError("execution time must be a non-negative integer")
-    manifest = validate_test_manifest(bundle.manifest)
-    projection = validate_approval_projection(bundle.projection)
+    manifest = validate_runner_test_manifest(bundle.manifest)
+    projection = validate_runner_approval_projection(bundle.projection)
     grant = validate_execution_grant(bundle.grant)
     stored_manifest, stored_projection = store.load_approved_pair(projection["projection_id"])
     if stored_manifest != manifest or stored_projection != projection:
@@ -336,13 +385,18 @@ def validate_execution_bundle(
             raise ValueError("execution grant cannot use different or lower approved limits")
     if manifest["compiler"] != projection["compiler"]:
         raise ValueError("execution compiler versions differ")
-    expected_adapters = sorted({item["adapter_version"] for item in manifest["scenarios"]})
+    expected_adapters = sorted({item["adapter_version"] for item in _units(manifest)})
+    shown_units = (
+        [configured_projection_instance(item) for item in manifest["test_instances"]]
+        if _configured(manifest) else manifest["scenarios"]
+    )
     if (
-        projection["scenarios"] != manifest["scenarios"]
+        _configured(manifest) != ("test_instances" in projection)
+        or projection.get("test_instances", projection.get("scenarios")) != shown_units
         or projection["runner"]["adapter_versions"] != expected_adapters
         or any(
             identity.adapter_versions.get(item["scenario_id"]) != item["adapter_version"]
-            for item in manifest["scenarios"]
+            for item in _units(manifest)
         )
     ):
         raise ValueError("execution adapter versions differ")
@@ -549,7 +603,7 @@ class LocalCanaryExecutor:
                 "runner_version": self.identity.runner_version,
                 "engine_version": manifest["compiler"]["engine_version"],
                 "adapter_versions": sorted({
-                    item["adapter_version"] for item in manifest["scenarios"]
+                    item["adapter_version"] for item in _units(manifest)
                 }),
             },
             "error_category": "none", "stop_reason": stop_reason,
@@ -617,7 +671,8 @@ class LocalCanaryExecutor:
             grant=grant, initial_gate=initial_gate, now=initial_gate_monotonic,
         )
         # Compile every closed action before consuming the grant or allowing a target socket.
-        prepared = [prepare_action(action) for action in manifest["actions"]]
+        prepared = [prepare_action(_catalog_action(action)) for action in manifest["actions"]]
+        configured = _configured(manifest)
         retention_expires = (
             self.clock_ms() + manifest["local_evidence_policy"]["retention_seconds"] * 1000
         )
@@ -630,17 +685,15 @@ class LocalCanaryExecutor:
             "retries_used": 0,
         }
         observations: dict[str, list[dict[str, Any]]] = {
-            item["scenario_id"]: [] for item in manifest["scenarios"]
+            _unit_key(item): [] for item in _units(manifest)
         }
-        scenario_codes: dict[str, set[str]] = {
-            item["scenario_id"]: set() for item in manifest["scenarios"]
-        }
-        scenario_evidence: dict[str, list[str]] = {
-            item["scenario_id"]: [] for item in manifest["scenarios"]
-        }
-        scenario_redactions: dict[str, int] = {
-            item["scenario_id"]: 0 for item in manifest["scenarios"]
-        }
+        scenario_codes: dict[str, set[str]] = {_unit_key(item): set() for item in _units(manifest)}
+        scenario_evidence: dict[str, list[str]] = {_unit_key(item): [] for item in _units(manifest)}
+        scenario_redactions: dict[str, int] = {_unit_key(item): 0 for item in _units(manifest)}
+        # Configured only: frozen E1 expectations per instance and the raw responses by
+        # action ordinal, both in memory for this run; nothing here is persisted or logged.
+        live_inputs: dict[str, Any] = {}
+        live_responses: dict[int, LiveReadResponse] = {}
         redaction_state = {"count": 0}
         budget_lock = threading.Lock()
         disposition = "completed"
@@ -695,6 +748,8 @@ class LocalCanaryExecutor:
                 cancellation.raise_if_cancelled()
             credentials, configured_secrets = self._resolve_credentials(manifest)
             redactor = Redactor(configured_secrets)
+            if configured:
+                live_inputs.update(self._resolve_live_inputs(manifest))
             retry_policy = RetryPolicy.from_mapping(manifest["retry_policy"])
             authority.check(
                 gate_source, generation=grant["kill_switch_generation"],
@@ -702,12 +757,21 @@ class LocalCanaryExecutor:
             )
             for source, action in zip(manifest["actions"], prepared, strict=True):
                 cancellation.raise_if_cancelled()
+                unit = _unit_key(source)
                 action_binding = {
                     "action_ordinal": source["ordinal"],
                     "scenario_id": source["scenario_id"],
                     "semantic_role": source["semantic_auth_role"],
                     "attempt": 1,
                 }
+                if configured and live_inputs[unit] is None:
+                    # A frozen local input is missing or revoked: this instance sends nothing.
+                    scenario_codes[unit].add("action_rejected")
+                    log.append(
+                        "action_rejected", detail_code="local_input_unavailable",
+                        counters=counters, **action_binding,
+                    )
+                    continue
                 log.append("admitted", detail_code="exact_action", counters=counters, **action_binding)
                 credential = None if action.auth_profile == "anonymous" else credentials[action.semantic_auth_role]
                 action_attempts = [0]
@@ -788,10 +852,15 @@ class LocalCanaryExecutor:
                         or evidence.attempt != action_attempts[0]
                     ):
                         raise ValueError("response evidence differs from the frozen action")
-                    content_observation[0] = protected_content(
-                        evidence.raw_body, marker=markers[0] if len(markers) == 1 else None,
-                        status=evidence.status_code, method=evidence.method,
-                    )
+                    if configured:
+                        live_responses[source["ordinal"]] = LiveReadResponse(
+                            evidence.status_code, bytes(evidence.raw_body),
+                        )
+                    else:
+                        content_observation[0] = protected_content(
+                            evidence.raw_body, marker=markers[0] if len(markers) == 1 else None,
+                            status=evidence.status_code, method=evidence.method,
+                        )
                     return self.store.store_response_evidence(
                         grant["run_id"], action_ordinal=evidence.action_ordinal,
                         attempt=evidence.attempt, status_code=evidence.status_code,
@@ -819,7 +888,7 @@ class LocalCanaryExecutor:
                     )
                 except TransportFailure as exc:
                     code = "dns_changed" if exc.code == "dns_changed" else "action_rejected"
-                    scenario_codes[source["scenario_id"]].add(code)
+                    scenario_codes[unit].add(code)
                     log.append(
                         code, detail_code=exc.code, counters=counters,
                         **{**action_binding, "attempt": max(1, action_attempts[0])},
@@ -842,25 +911,26 @@ class LocalCanaryExecutor:
                     or not response.evidence_ref.startswith("ev1_")
                 ):
                     raise TransportFailure("response_rejected")
-                scenario_evidence[source["scenario_id"]].append(response.evidence_ref)
-                scenario_redactions[source["scenario_id"]] += response.redaction_count
+                scenario_evidence[unit].append(response.evidence_ref)
+                scenario_redactions[unit] += response.redaction_count
                 redaction_state["count"] += response.redaction_count
                 if response.redaction_count:
-                    scenario_codes[source["scenario_id"]].add("redacted")
+                    scenario_codes[unit].add("redacted")
                     log.append(
                         "redacted", action_ordinal=source["ordinal"],
                         scenario_id=source["scenario_id"],
                         semantic_role=source["semantic_auth_role"], attempt=attempts,
                         detail_code="response_secret", counters=counters,
                     )
-                observations[source["scenario_id"]].append({
+                observations[unit].append({
+                    **({"action_ordinal": source["ordinal"]} if configured else {}),
                     "semantic_role": source["semantic_auth_role"],
                     "status_code": response.status_code,
                     "body_shape": response.body_shape,
                     "truncation_state": "complete",
-                    "_protected": content_observation[0],
+                    **({} if configured else {"_protected": content_observation[0]}),
                 })
-                scenario_codes[source["scenario_id"]].update({"admitted", "action_started", "action_completed"})
+                scenario_codes[unit].update({"admitted", "action_started", "action_completed"})
                 log.append(
                     "action_completed", detail_code="bounded_response", counters=counters,
                     **{**action_binding, "attempt": attempts},
@@ -925,6 +995,7 @@ class LocalCanaryExecutor:
             return self._finalize(
                 manifest, projection, grant, log, observations, scenario_codes,
                 scenario_evidence, scenario_redactions, counters,
+                live_inputs=live_inputs, live_responses=live_responses,
                 redaction_count=redaction_state["count"], started_at=started_at,
                 disposition=disposition, error_category=error_category,
                 stop_reason=stop_reason, systemic_failure=systemic_failure,
@@ -965,7 +1036,7 @@ class LocalCanaryExecutor:
             "versions": {
                 "runner_version": self.identity.runner_version,
                 "engine_version": manifest["compiler"]["engine_version"],
-                "adapter_versions": sorted({item["adapter_version"] for item in manifest["scenarios"]}),
+                "adapter_versions": sorted({item["adapter_version"] for item in _units(manifest)}),
             },
             "error_category": "none", "stop_reason": "none",
             "containment_codes": operational_containment_codes(events),
@@ -1059,6 +1130,8 @@ class LocalCanaryExecutor:
         scenario_redactions,
         counters,
         *,
+        live_inputs=None,
+        live_responses=None,
         redaction_count,
         started_at,
         disposition,
@@ -1076,6 +1149,107 @@ class LocalCanaryExecutor:
         existing_events = log.load()
         if not existing_events or existing_events[-1]["event_code"] != "run_finalized":
             log.append("run_finalized", detail_code=disposition, counters=counters)
+        if _configured(manifest):
+            scenario_results, outcomes = self._configured_results(
+                manifest, observations, scenario_codes, scenario_evidence, scenario_redactions,
+                live_inputs or {}, live_responses or {}, systemic_failure=systemic_failure,
+            )
+        else:
+            scenario_results, outcomes = self._catalog_results(
+                manifest, grant, observations, scenario_codes, scenario_evidence,
+                scenario_redactions, systemic_failure=systemic_failure,
+            )
+        return self._finish(
+            manifest, projection, grant, log, counters, scenario_results, outcomes,
+            redaction_count=redaction_count, started_at=started_at, state=state,
+            disposition=disposition, error_category=error_category, stop_reason=stop_reason,
+            systemic_failure=systemic_failure, stop_requested_at_ms=stop_requested_at_ms,
+            stop_acknowledged_at_ms=stop_acknowledged_at_ms,
+        )
+
+    def _resolve_live_inputs(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        """Snapshot every instance's frozen local inputs once, before any target request.
+
+        Only the exact approved handles are read, never a mutable name. A missing, revoked or
+        unreadable handle makes that instance ``None`` (refused, inconclusive), never false.
+        """
+        resolved: dict[str, Any] = {}
+        for instance in manifest["test_instances"]:
+            assertion = validate_live_read_assertion(instance["assertion"])
+            handles = {item["fixture_ref"]: item["input_handle_id"] for item in instance["local_inputs"]}
+            try:
+                values = self.store.load_live_input_values(handles, vaults=self.vaults)
+            except LiveInputUnavailable:
+                resolved[instance["test_instance_id"]] = None
+                continue
+            resolved[instance["test_instance_id"]] = (
+                assertion, resolve_local_fixtures(assertion, values),
+            )
+            values = {}
+        return resolved
+
+    def _configured_results(
+        self, manifest, observations, scenario_codes, scenario_evidence, scenario_redactions,
+        live_inputs, live_responses, *, systemic_failure,
+    ):
+        """E1 verdict per configured instance on its own two signed action ordinals.
+
+        No catalog predicate or plan comparator is ever consulted for a configured instance.
+        """
+        results, outcomes = [], []
+        for ordinal, instance in enumerate(manifest["test_instances"]):
+            key = instance["test_instance_id"]
+            restricted_ordinal, control_ordinal = 2 * ordinal, 2 * ordinal + 1
+            # Absent: inputs were never resolved (failure before resolution, or recovery) ->
+            # run_incomplete. Present but None: the frozen handle was refused.
+            frozen = live_inputs.get(key, _UNRESOLVED)
+            outcome, reason, control, restricted = "inconclusive", "run_incomplete", "not_established", "not_observed"
+            if frozen is _UNRESOLVED:
+                pass
+            elif frozen is None:
+                reason = "local_input_unavailable"
+            elif (
+                not systemic_failure
+                and len(observations[key]) == 2
+                and restricted_ordinal in live_responses
+                and control_ordinal in live_responses
+            ):
+                assertion, expectations = frozen
+                verdict = evaluate_live_read_pair(
+                    role_policy=instance["scenario_id"], method=instance["method"],
+                    assertion=assertion, expectations=expectations,
+                    control=live_responses[control_ordinal],
+                    restricted=live_responses[restricted_ordinal],
+                )
+                outcome, reason = verdict.outcome, verdict.reason
+                control = "established" if verdict.positive_control else "not_established"
+                restricted = {True: "true", False: "false"}.get(verdict.restricted_condition, "not_observed")
+            outcomes.append(outcome)
+            results.append({
+                "ordinal": ordinal,
+                "test_instance_id": key,
+                "scenario_id": instance["scenario_id"],
+                "adapter_version": instance["adapter_version"],
+                "source": dict(instance["source"]),
+                "assertion_digest": instance["assertion_digest"],
+                "condition_kind": instance["assertion"]["condition"]["kind"],
+                "route": {"method": instance["method"], "route_template": instance["route_template"]},
+                "assessment_outcome": outcome,
+                "reason": reason,
+                "positive_control": control,
+                "restricted_condition": restricted,
+                "observations": sorted(observations[key], key=lambda item: item["action_ordinal"]),
+                "finding": _configured_finding() if outcome == "observed" else None,
+                "containment_codes": sorted(scenario_codes[key]),
+                "redaction_count": scenario_redactions[key],
+                "local_evidence_refs": sorted(scenario_evidence[key]),
+            })
+        return results, outcomes
+
+    def _catalog_results(
+        self, manifest, grant, observations, scenario_codes, scenario_evidence,
+        scenario_redactions, *, systemic_failure,
+    ):
         scenario_results = []
         outcomes = []
         actions_by_scenario: dict[str, list[Mapping[str, Any]]] = {}
@@ -1142,6 +1316,14 @@ class LocalCanaryExecutor:
                 "redaction_count": scenario_redactions[scenario_id],
                 "local_evidence_refs": sorted(scenario_evidence[scenario_id]),
             })
+        return scenario_results, outcomes
+
+    def _finish(
+        self, manifest, projection, grant, log, counters, scenario_results, outcomes, *,
+        redaction_count, started_at, state, disposition, error_category, stop_reason,
+        systemic_failure, stop_requested_at_ms, stop_acknowledged_at_ms,
+    ) -> ExecutionResult:
+        configured = _configured(manifest)
         aggregate = (
             "inconclusive" if systemic_failure
             else "observed" if "observed" in outcomes
@@ -1156,7 +1338,7 @@ class LocalCanaryExecutor:
             stop_requested_at_ms or 0, stop_acknowledged_at_ms or 0,
         )
         findings_unsigned = {
-            "schema_version": CANARY_FINDINGS_SCHEMA,
+            "schema_version": CONFIGURED_FINDINGS_SCHEMA if configured else CANARY_FINDINGS_SCHEMA,
             "projection_id": "findings_" + hashlib.sha256(grant["run_id"].encode()).hexdigest()[:24],
             "run_id": grant["run_id"], "grant_id": grant["grant_id"],
             "workspace_id": grant["workspace_id"], "project_id": grant["project_id"],
@@ -1165,13 +1347,14 @@ class LocalCanaryExecutor:
             "approval_projection_digest": projection["projection_digest"],
             "grant_digest": grant["grant_digest"],
             "engine_version": manifest["compiler"]["engine_version"],
-            "adapter_versions": sorted({item["adapter_version"] for item in manifest["scenarios"]}),
+            "adapter_versions": sorted({item["adapter_version"] for item in _units(manifest)}),
             "started_at_ms": started_at, "finished_at_ms": finished_at,
-            "assessment_outcome": aggregate, "scenario_results": scenario_results,
+            "assessment_outcome": aggregate,
+            ("test_results" if configured else "scenario_results"): scenario_results,
             "containment_codes": operational_containment_codes(log.load()),
             "redaction_count": redaction_count,
         }
-        findings = validate_canary_findings(
+        findings = (validate_configured_findings if configured else validate_canary_findings)(
             _sign_projection(findings_unsigned, self.signer, "projection_digest")
         )
         operational_unsigned = {
@@ -1198,7 +1381,7 @@ class LocalCanaryExecutor:
             "versions": {
                 "runner_version": self.identity.runner_version,
                 "engine_version": manifest["compiler"]["engine_version"],
-                "adapter_versions": sorted({item["adapter_version"] for item in manifest["scenarios"]}),
+                "adapter_versions": sorted({item["adapter_version"] for item in _units(manifest)}),
             },
             "error_category": error_category, "stop_reason": stop_reason,
             "containment_codes": operational_containment_codes(log.load()),
@@ -1234,8 +1417,8 @@ class LocalCanaryExecutor:
             "projection": findings,
             "projection_digest": findings["projection_digest"],
             "projection_bytes": len(canonical_bytes(findings)),
-            "scenario_count": len(findings["scenario_results"]),
-            "finding_count": sum(item["finding"] is not None for item in findings["scenario_results"]),
+            "scenario_count": len(scenario_results),
+            "finding_count": sum(item["finding"] is not None for item in scenario_results),
         })
         self.store.save_final_projections(
             grant["run_id"], operational, findings, local_view, disclosure,
@@ -1309,10 +1492,10 @@ class LocalCanaryExecutor:
             log.append("grant_verified", detail_code="recovery_verified")
             events = log.load()
         counters = copy.deepcopy(events[-1]["counters"])
-        observations = {item["scenario_id"]: [] for item in manifest["scenarios"]}
-        codes = {item["scenario_id"]: set() for item in manifest["scenarios"]}
-        evidence = {item["scenario_id"]: [] for item in manifest["scenarios"]}
-        redactions = {item["scenario_id"]: 0 for item in manifest["scenarios"]}
+        observations = {_unit_key(item): [] for item in _units(manifest)}
+        codes = {_unit_key(item): set() for item in _units(manifest)}
+        evidence = {_unit_key(item): [] for item in _units(manifest)}
+        redactions = {_unit_key(item): 0 for item in _units(manifest)}
         return self._finalize(
             manifest, projection, grant, log, observations, codes, evidence, redactions, counters,
             redaction_count=0,
