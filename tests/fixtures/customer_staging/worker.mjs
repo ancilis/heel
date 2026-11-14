@@ -2,8 +2,9 @@
 //
 // A standalone Cloudflare Worker with no bindings, storage, outbound fetch, redirect or
 // dependency. It serves one ownership-proof file, two plan-gated export routes (an ordinary
-// markerless one and a canary-bound one), one authentication-gated canary read route, one
-// health route and its own static OpenAPI inventory. All data is static and fake. Nothing
+// markerless one and a canary-bound one), one authentication-gated canary read route, two
+// ordinary markerless read routes (an authenticated record and a profile with one pro-only
+// leaf), one health route and its own static OpenAPI inventory. All data is static and fake. Nothing
 // here is Heel product code.
 //
 // Operator configuration (never request-controlled):
@@ -40,8 +41,30 @@ const AUTH_RECORD = Object.freeze({
   protected_canary: AUTH_CANARY_ID,
 });
 const AUTH_ROUTE = "/api/auth-records/{id}";
+// Ordinary markerless read routes. No protected_canary field and no Heel label: these are
+// plain customer-shaped records. Root account_id is an ordinary property a customer may
+// configure as its own success witness; the fixture itself never decides anything.
+const PRIVATE_ROUTE = "/api/private-record";
+const PRIVATE_RECORD = Object.freeze({
+  account_id: "acct_canary",
+  record_id: "rec_0001",
+  title: "Example record",
+  status: "active",
+});
+const PROFILE_ROUTE = "/api/profile";
+// Pro sees the whole profile. Patched free sees the same object with only billing_contact
+// withheld; the parent profile object stays so the leaf's absence is decidable.
+const PROFILE_FULL = Object.freeze({
+  account_id: "acct_canary",
+  profile: Object.freeze({ display_name: "Example account", billing_contact: "billing@example.test" }),
+});
+const PROFILE_REDACTED = Object.freeze({
+  account_id: "acct_canary",
+  profile: Object.freeze({ display_name: "Example account" }),
+});
 // Served verbatim at /openapi.json; byte-for-byte equal to openapi.json beside this file.
-// Two export paths and one record path; each id route has an ordinary path parameter only.
+// Two export paths, one record id path and two plain read paths; each id route has an
+// ordinary path parameter only.
 // No marker value, example, plan, finding, privilege or extension annotation.
 const OPENAPI = JSON.stringify({
   openapi: "3.1.0",
@@ -61,6 +84,14 @@ const OPENAPI = JSON.stringify({
       get: { operationId: "getAuthRecord", responses: { 200: { description: "ok" } } },
       head: { operationId: "headAuthRecord", responses: { 200: { description: "ok" } } },
     },
+    "/api/private-record": {
+      get: { operationId: "getPrivateRecord", responses: { 200: { description: "ok" } } },
+      head: { operationId: "headPrivateRecord", responses: { 200: { description: "ok" } } },
+    },
+    "/api/profile": {
+      get: { operationId: "getProfile", responses: { 200: { description: "ok" } } },
+      head: { operationId: "headProfile", responses: { 200: { description: "ok" } } },
+    },
   },
 }, null, 2) + "\n";
 // The same recognized denial envelope as tests/plan_differential_support.py DENIAL_ENVELOPE.
@@ -73,6 +104,8 @@ export const ROUTES = Object.freeze({
   "/api/export": "/api/export",
   [`/api/exports/${CANARY_ID}`]: "/api/exports/{id}",
   [`/api/auth-records/${AUTH_CANARY_ID}`]: AUTH_ROUTE,
+  [PRIVATE_ROUTE]: PRIVATE_ROUTE,
+  [PROFILE_ROUTE]: PROFILE_ROUTE,
   "/healthz": "/healthz",
   "/openapi.json": "/openapi.json",
 });
@@ -152,13 +185,23 @@ function exportResponse(route, mode, plan) {
 // Authentication read: any configured identity (free or pro) is the positive control and
 // always gets the record. Only a request with NO Authorization header depends on the mode.
 // A malformed or unknown credential is refused with the 401 envelope in every mode.
-function authRecordResponse(mode, caller) {
-  if (caller === "free" || caller === "pro") return json(200, AUTH_RECORD);
-  if (caller === "none" && mode === "vulnerable") return json(200, AUTH_RECORD);
+// The ordinary /api/private-record route uses the same rule with its markerless record.
+function authRecordResponse(mode, caller, record = AUTH_RECORD) {
+  if (caller === "free" || caller === "pro") return json(200, record);
+  if (caller === "none" && mode === "vulnerable") return json(200, record);
   if (caller === "none" && mode === "patched") {
     return { status: 401, type: null, body: new Uint8Array(0), authenticate: true };
   }
   return { ...json(401, { error: "unauthenticated" }), authenticate: true };
+}
+
+// Profile read: both identities may read; billing_contact is pro-only. Pro always gets the
+// full profile. Free: vulnerable leaks the leaf, patched withholds only the leaf (still 200),
+// error_envelope is the bounded 403 denial envelope with no profile data.
+function profileResponse(mode, plan) {
+  if (plan === "pro" || mode === "vulnerable") return json(200, PROFILE_FULL);
+  if (mode === "patched") return json(200, PROFILE_REDACTED);
+  return json(403, DENIAL_ENVELOPE);
 }
 
 async function decide(request, env, method, route) {
@@ -187,9 +230,11 @@ async function decide(request, env, method, route) {
   if (config === null) return { role: "-", ...json(503, { error: "target not configured" }) };
   const plan = await role(request, config);
   if (route === AUTH_ROUTE) return { role: plan, ...authRecordResponse(config.mode, plan) };
+  if (route === PRIVATE_ROUTE) return { role: plan, ...authRecordResponse(config.mode, plan, PRIVATE_RECORD) };
   if (plan !== "free" && plan !== "pro") {
     return { role: plan, ...json(401, { error: "unauthenticated" }), authenticate: true };
   }
+  if (route === PROFILE_ROUTE) return { role: plan, ...profileResponse(config.mode, plan) };
   return { role: plan, ...exportResponse(route, config.mode, plan) };
 }
 

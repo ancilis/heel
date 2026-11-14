@@ -78,6 +78,42 @@
           }
         }
       }
+    },
+    "/api/private-record": {
+      "get": {
+        "operationId": "getPrivateRecord",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "head": {
+        "operationId": "headPrivateRecord",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
+    },
+    "/api/profile": {
+      "get": {
+        "operationId": "getProfile",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      },
+      "head": {
+        "operationId": "headProfile",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
     }
   }
 }

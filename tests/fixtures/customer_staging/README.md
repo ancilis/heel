@@ -45,9 +45,15 @@ and uses the same operator mode and the same two configured digests (no new secr
 130 bytes, sha256 `e05f9db1b4cde34ee1a00b4077f2e541ade727d9208c8ba58427ec809a9489d2`:
 `{"record_id":"rec_canary","account_id":"acct_canary","display_name":"Synthetic Record","protected_canary":"heel-canary-auth-0001"}`.
 
+**Read-boundary routes: `GET`/`HEAD /api/private-record` and `GET`/`HEAD /api/profile`**
+(ordinary markerless reads; **added after the last deployment, not deployed**). See
+[Ordinary read-boundary routes](#ordinary-read-boundary-routes-not-deployed) below.
+
 None of the routes is a coverage claim. Each one exercises a single synthetic read on this fixture.
 
-`openapi.json`: 1575 bytes, sha256 `38eeb21edaf16cefeff573c97aca50e1be56cafeb11c78736a2b04848e8ec132`.
+`openapi.json`: 2282 bytes, sha256 `520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19`.
+(Historical: the deployed three-path inventory was 1575 bytes, sha256
+`38eeb21edaf16cefeff573c97aca50e1be56cafeb11c78736a2b04848e8ec132`.)
 
 ## Contract
 
@@ -57,17 +63,20 @@ None of the routes is a coverage claim. Each one exercises a single synthetic re
 | `/api/export` | GET, HEAD | Ordinary export (97 bytes, no marker). `Authorization: Bearer <token>`; the SHA-256 of the token must equal exactly one configured digest. Missing/malformed/unknown → `401 {"error":"unauthenticated"}`. |
 | `/api/exports/heel-canary-export-0001` | GET, HEAD | Canary export (142 bytes, `protected_canary`). Same auth and modes as `/api/export`. |
 | `/api/auth-records/heel-canary-auth-0001` | GET, HEAD | Auth record (130 bytes, `protected_canary`). Either configured identity → `200` record in every mode. Malformed/unknown credential → `401 {"error":"unauthenticated"}` in every mode. **No** `Authorization` header → depends on mode (table below). |
+| `/api/private-record` | GET, HEAD | Ordinary record (94 bytes, no marker). Either configured identity → `200` in every mode. Malformed/unknown credential → `401 {"error":"unauthenticated"}` in every mode. **No** `Authorization` header → depends on mode (read-boundary table). |
+| `/api/profile` | GET, HEAD | Ordinary profile with one pro-only leaf (no marker). Pro → `200` full (114 bytes) in every mode. Free → depends on mode (read-boundary table). Missing/malformed/unknown → `401 {"error":"unauthenticated"}` in every mode. |
 | `/healthz` | GET, HEAD | `{"status","mode","revision","ownership_configured","export_configured"}` only. |
 | `/openapi.json` | GET, HEAD | `200 application/json`, byte-identical to `openapi.json` here, so a clean-room user can download the inventory without repository access. |
 | any other path (including any other export or record id) | any | `404 {"error":"not found"}`; the path is never reflected. |
 | known path | other methods | `405`, `Allow: GET, HEAD` |
 
-The served inventory (`info.version` `1.3.0`) lists only `GET`/`HEAD /api/export` (no
-parameter), `GET`/`HEAD /api/exports/{id}` and `GET`/`HEAD /api/auth-records/{id}` (each an
+The served inventory (`info.version` `1.3.0`) lists only `GET`/`HEAD /api/export`,
+`GET`/`HEAD /api/private-record` and `GET`/`HEAD /api/profile` (no parameter),
+`GET`/`HEAD /api/exports/{id}` and `GET`/`HEAD /api/auth-records/{id}` (each an
 ordinary required `string` path parameter): no ownership, health or spec endpoint, no marker
 value, no example value, and no plan, privilege, criterion, finding, security or `x-` annotation.
 
-All three routes fail closed with `503` unless `HEEL_TARGET_MODE` is a known mode and
+All five gated read routes fail closed with `503` unless `HEEL_TARGET_MODE` is a known mode and
 `HEEL_FREE_TOKEN_SHA256` / `HEEL_PRO_TOKEN_SHA256` are two different 64-character lowercase hex
 digests. The mode is set only by the operator at deploy time; no header, query or cookie
 changes it. On the two export routes the pro identity always receives that route's export
@@ -100,6 +109,67 @@ authenticated side (failed positive control), or any other record id (`404`), is
 `patched` and `error_envelope`, where free gets `403` and pro `200`. The paired canary evaluator is
 `inconclusive` for `HEAD` in every mode. It is also `inconclusive` when the positive control
 fails (pro identity denied or unauthenticated) or when no `heel-canary-` id is bound.
+
+### Ordinary read-boundary routes (not deployed)
+
+These two routes, with the unchanged `/api/export`, give three distinct ordinary, markerless
+expected rules on allowed reads:
+
+| Route | Expected rule |
+|---|---|
+| `/api/private-record` | authentication: the record requires a configured identity |
+| `/api/export` | whole-feature entitlement: the whole export requires pro (unchanged) |
+| `/api/profile` | field-level redaction: both plans read the profile, `profile.billing_contact` requires pro |
+
+They do **not** demonstrate tenant escape, object lifecycle, quotas, writes or broad business-abuse
+coverage. Neither body has a `protected_canary` field, a `heel-canary-` id or any Heel label. Root
+`account_id` `"acct_canary"` is an ordinary property that a customer may configure as its own
+success witness; it is not a built-in detector marker. The fixture never emits a finding, verdict
+or score, and no header, query or cookie (including one claiming a finding, marker, plan or mode)
+changes a response. Same digests, same operator mode, same no-store/nosniff framing, same
+`HEAD` semantics (status and `Content-Length` of the `GET`, empty body) and same bounded receipts
+(`route` is `/api/private-record` or `/api/profile`) as the other routes. No new mode, secret or
+public mutation endpoint: any other method is `405`, any near-miss path `404`.
+
+Bodies:
+
+- record, 94 bytes, sha256 `bef7297c0db3a782d68e477482da4a858809d18563558fed1cd5e834cff39a27`:
+  `{"account_id":"acct_canary","record_id":"rec_0001","title":"Example record","status":"active"}`
+- full profile, 114 bytes, sha256 `f42fd1ddbcacce2d71ba55956a6cd33b7cd9fcb7ed692db5be467befb8685326`:
+  `{"account_id":"acct_canary","profile":{"display_name":"Example account","billing_contact":"billing@example.test"}}`
+- redacted profile, 73 bytes, sha256 `d29afc7c736617342b0a9a5c6cb58879d00a32873065e36c230eb7213c6a9a71`:
+  `{"account_id":"acct_canary","profile":{"display_name":"Example account"}}` (parent `profile`
+  object kept, so the leaf's absence is decidable)
+
+All values are fake; `billing@example.test` is a reserved-domain placeholder.
+
+`/api/private-record`:
+
+| `HEEL_TARGET_MODE` | no `Authorization` header | free or pro identity | malformed or unknown credential |
+|---|---|---|---|
+| `vulnerable` | `200` + record | `200` + record | `401 {"error":"unauthenticated"}` |
+| `patched` | `401`, empty body, `WWW-Authenticate: Bearer` | `200` + record | `401 {"error":"unauthenticated"}` |
+| `error_envelope` | `401 {"error":"unauthenticated"}` | `200` + record | `401 {"error":"unauthenticated"}` |
+
+`/api/profile`:
+
+| `HEEL_TARGET_MODE` | free identity | pro identity | missing, malformed or unknown credential |
+|---|---|---|---|
+| `vulnerable` | `200` + full profile (leaf leaked) | `200` + full profile | `401 {"error":"unauthenticated"}` |
+| `patched` | `200` + redacted profile (leaf withheld) | `200` + full profile | `401 {"error":"unauthenticated"}` |
+| `error_envelope` | `403 {"error":"upgrade required"}` (no profile data) | `200` + full profile | `401 {"error":"unauthenticated"}` |
+
+`target.test.mjs` covers these matrices in-process only (component proof). It does not run any
+Heel evaluator on these two routes; which Heel path decides them, and how, belongs to the
+upcoming configurable-read acceptance, not to this fixture.
+
+**Prepared prerequisites for the upcoming public-only reviewer (declared, not yet provided).** A
+reviewer working only from public surfaces will need, from the operator: an already-running
+controlled deployment of this target that includes these routes (the current deployment does
+not); staging-only free and pro credentials supplied out of band through the existing Keychain
+and secret-fd flow (never in docs, argv or chat); the target's HTTPS origin and its served
+`/openapi.json`; and publishing access for the ownership-proof token. The operator setup and
+rollback below are unchanged by this addition.
 
 ### Runner mapping
 
@@ -146,6 +216,10 @@ framing, the released runner or the browser journey; those need the deployed run
 For `/api/auth-records/{id}` it runs the same unchanged composition for
 `anonymous_authenticated_read` (anonymous profile for the anonymous role, bearer for the
 authenticated role).
+For `/api/private-record` and `/api/profile` it proves the credential/mode matrices, the `200`
+redaction control, markerless bodies, `HEAD` framing, method and unknown-path rejection, fail-closed
+configuration, receipt privacy and served/static inventory parity (including `RouteInventory`
+reading all five routes); it runs no Heel evaluator on them.
 For `/api/export` it also proves the inventory → empty-binding mapping → `prepare_action` steps
 and the comparator rows; it does not run the runner's ordinary plan-differential executor bridge,
 which is implemented and reviewed separately.
@@ -269,4 +343,6 @@ HTTPS and each runner request appears as one receipt.
   This is expected only. The fixture tests above are in-process component proof. No deployed
   run of this route has happened, and the deployed target has not been redeployed with it.
 
-All three are checks of this one synthetic target, not a product coverage claim.
+All three are checks of this one synthetic target, not a product coverage claim. The
+`/api/private-record` and `/api/profile` routes are not deployed and have no expected deployed
+result recorded here; that belongs to E4.
