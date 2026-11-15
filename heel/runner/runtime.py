@@ -5134,8 +5134,10 @@ class RunnerRuntimeState:
         now_ms = _safe_int(now_ms, "runtime retirement time")
         if not isinstance(reservation_probe, str) or reservation_probe not in {"absent", "reserved"}:
             raise RunnerRuntimeConflict(
-                "runtime retirement requires an absent or never-activated local reservation"
+                "runtime retirement requires an absent local reservation or a never-activated reserved one"
             )
+        # Archive the canonical literal, never the caller's object (a str-valued probe enum).
+        reservation = "absent" if reservation_probe == "absent" else "reserved"
         attestation = self._retirement_attestation(evidence)
         keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
         with self._connection() as conn:
@@ -5222,7 +5224,7 @@ class RunnerRuntimeState:
                         "delivery": "uncertain",
                         "sealed_blob_b64": self._canonical_b64(row["sealed_blob"]),
                     } for row in pending_rows],
-                    attestation=attestation, reservation=reservation_probe,
+                    attestation=attestation, reservation=reservation,
                 )
                 try:
                     metadata = _retired_metadata_size(core)

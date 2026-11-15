@@ -340,6 +340,7 @@ class RunnerCoordinator:
         live, or a closed refusal): that row is kept unchanged and construction continues, as it
         did before it was eligible.
         """
+        self._finish_inactive_reservation_retirements()
         pending = self.control.runtime.load_pending_calls(limit=74)
         now_ms = self._now_ms()
         for active in self.control.runtime.load_active_run_controls(limit=64):
@@ -360,12 +361,34 @@ class RunnerCoordinator:
             self.control._retire_inactive_claim(
                 verified, reservation_probe=probe.value, now_ms=self._now_ms(),
             )
+            if probe is RunReservationProbe.RESERVED:
+                # Release the never-activated reservation's nonterminal slot under the same
+                # attested evidence; a crash before this completes is finished on the next start.
+                self._retire_inactive_reservation(active.run_id)
             with self._lock:
                 if (
                     active.run_id in self._gates or active.run_id in self._gate_receipts
                     or active.run_id in self._bindings
                 ):
                     raise RunnerStoreError("runtime retired claim authority is invalid")
+
+    def _retire_inactive_reservation(self, run_id: str) -> None:
+        self.store.retire_inactive_reservation(
+            run_id, runtime=self.control.runtime, trusted_cloud_keys=self.trusted_grant_keys,
+            now_ms=self._now_ms(),
+        )
+
+    def _finish_inactive_reservation_retirements(self) -> None:
+        """Complete a Store release whose runtime claim was already retired (crash in between).
+
+        Only a run the runtime has sealed as a retired claim is considered; the Store re-verifies its
+        archived attestation and the never-activated reservation before releasing anything.
+        """
+        if not self.store.is_context_bound:
+            return
+        for run_id in self.store.nonterminal_run_ids(runtime=self.control.runtime):
+            if self.control.runtime.load_retired_claim(run_id) is not None:
+                self._retire_inactive_reservation(run_id)
 
     def _recover_active_runtime_state(self) -> None:
         """Rebuild live coordinator authority from sealed runtime controls.

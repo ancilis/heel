@@ -3523,13 +3523,21 @@ def test_serve_cycle_composition_reconciles_before_hydration_then_polls(r2_cloud
 # --- Recovered RESERVED claims (lost claim answer replayed at restart): Stop -> restart recovery ---
 
 
-def _r2_recovered_reserved(cloud):
+def _r2_new_projection(cloud, now_ms):
+    from tests.test_runner_compiler import CanaryCompiler
+
+    return CanaryCompiler(
+        store=cloud.store, identity=cloud.identity, signer=cloud.signer, now_ms=now_ms,
+    ).compile(["anonymous_authenticated_read", "object_ownership_read"]).projection
+
+
+def _r2_recovered_reserved(cloud, projection=None):
     """A claim whose answer was lost after the Cloud committed it, replayed by the next start.
 
     Restart recovery reserves it locally: ``RESERVED``, ``verified``, no containment event, and a
     claim-only (revision 1) runtime row; the Cloud row is ``claimed``.
     """
-    cloud.approve()
+    cloud.approve(projection=projection)
     cloud.start()
     cloud.http.lose.append("claim")
     with pytest.raises(ControlTransportError):
@@ -3548,15 +3556,11 @@ def _r2_recovered_reserved(cloud):
     return run_id
 
 
-def _r2_fresh_approved_run_executes(cloud, retired_run_id):
+def _r2_fresh_approved_run_executes(cloud, retired_run_id, *, now_ms=2_000):
     """The same runner claims and honestly executes a newly approved run after the recovery."""
-    from tests.test_runner_compiler import CanaryCompiler
-
-    compiled = CanaryCompiler(
-        store=cloud.store, identity=cloud.identity, signer=cloud.signer, now_ms=2_000,
-    ).compile(["anonymous_authenticated_read", "object_ownership_read"])
-    assert compiled.projection["projection_digest"] != cloud.projection["projection_digest"]
-    cloud.approve(projection=compiled.projection)
+    projection = _r2_new_projection(cloud, now_ms)
+    assert projection["projection_digest"] != cloud.projection["projection_digest"]
+    cloud.approve(projection=projection)
     lease = cloud.coordinator.claim()
     assert lease is not None and lease.run_id != retired_run_id
     target = _r2_honest_execution(cloud, lease, observed=True)
@@ -3564,15 +3568,52 @@ def _r2_fresh_approved_run_executes(cloud, retired_run_id):
     return lease
 
 
+def _r2_store_index(cloud):
+    from tests.test_runner_store_probe import _context_path
+
+    return json.loads((_context_path(cloud.store) / "runs" / "run-authority-index.json").read_text())
+
+
+def _r2_assert_store_released(cloud, run_id, tree):
+    """The Store delta of one inactive retirement: only the signed index changes and one signed
+    ``retired-`` record is added; the reservation, grant marker and run files are unchanged."""
+    from heel.runner import store as store_module
+    from tests.test_runner_store_probe import _context_path
+
+    run_hash = hashlib.sha256(run_id.encode()).hexdigest()
+    retired_name = f"runs/retired-{run_hash}.json"
+    before, after = {item[0]: item for item in tree}, {item[0]: item for item in cloud.store_tree()}
+    assert set(after) == set(before) | {retired_name}
+    assert {name for name in before if before[name] != after[name]} == {"runs/run-authority-index.json"}
+    index = _r2_store_index(cloud)
+    assert all(item["run_hash"] != run_hash for item in index["nonterminal_runs"] + index["terminal_queue"])
+    retired = cloud.store._verify_signed_run_authority_value(
+        json.loads((_context_path(cloud.store) / retired_name).read_text()),
+        identity=cloud.identity, schema=store_module._RUN_INACTIVE_RETIRED_RECORD_SCHEMA,
+        record_digest=True, max_bytes=store_module._RUN_AUTHORITY_MAX_RECORD_BYTES,
+    )
+    assert index["head_digest"] == retired["record_digest"]
+    assert retired["runtime_retired_state_digest"] == cloud.runtime.load_retired_claim(run_id).state_digest
+    # Historical authority stays: the reservation still probes, and its consumed grant is never re-reserved.
+    assert cloud.store.probe_run_reservation(run_id).value == "reserved"
+    assert cloud.store.load_run(run_id)["state"] == "verified" and cloud.store.load_run_events(run_id) == []
+    grant = cloud.store.load_run_grant(run_id)
+    with pytest.raises(RunnerStoreError, match="reservation is unavailable"):
+        cloud.store.reserve_run(grant, retention_expires_at_ms=cloud.store.load_run(run_id)["retention_expires_at_ms"])
+    with pytest.raises(RunnerStoreError):
+        cloud.store.recover_run_reservation(run_id)
+    # The released slot no longer blocks a cloud-context rollover's precondition.
+    with cloud.store._transaction(exclusive=True) as context_fd:
+        assert cloud.store._has_nonterminal_local_run(context_fd) is False
+    return retired
+
+
 def _r2_assert_reserved_retirement(cloud, run_id, group, tree, *, pending_uncertain=0):
     record, response = _r2_assert_retired_verbatim(
         cloud, run_id, group, pending_uncertain=pending_uncertain, reservation="reserved",
     )
     assert response["cloud"]["status"] == "stop_requested" and response["cloud"]["started_at_ms"] is None
-    # Signed local authority is preserved byte for byte: the never-activated reservation stays.
-    assert cloud.store_tree() == tree
-    assert cloud.store.probe_run_reservation(run_id).value == "reserved"
-    assert cloud.store.load_run(run_id)["state"] == "verified" and cloud.store.load_run_events(run_id) == []
+    _r2_assert_store_released(cloud, run_id, tree)
     assert cloud.runtime.load_active_run_controls() == () and cloud.runtime.load_pending_calls() == ()
     assert run_id not in cloud.coordinator._gates and run_id not in cloud.client._tracked_runs
     return record
@@ -3658,7 +3699,8 @@ def test_serve_cycle_restart_after_stop_retires_a_denied_recovered_reservation_t
     cloud.runtime = RunnerRuntimeState(cloud.runtime_path, cloud.identity, cloud.signer)
     record_ = cloud.runtime.load_retired_claim(run_id, authenticate_components=True)
     assert record_.local_observations == {"reservation": "reserved", "terminal": "absent"}
-    assert cloud.runtime.load_active_run_controls() == () and cloud.store_tree() == tree
+    assert cloud.runtime.load_active_run_controls() == ()
+    _r2_assert_store_released(cloud, run_id, tree)
     assert [bytes(item) for item in group[0]] == [base64.b64decode(record_.active["sealed_blob_b64"])]
 
 
@@ -3739,6 +3781,171 @@ def test_stopped_reserved_claim_that_may_have_activated_is_never_retired(r2_clou
     assert cloud.http.operations(sent) == []  # no attestation was requested
     assert cloud.runtime.load_retired_claim(run_id) is None
     assert cloud.runtime_rows() == rows and cloud.store_tree() == tree
+
+
+def _r2_denied_recovered(cloud, projection=None):
+    run_id = _r2_recovered_reserved(cloud, projection)
+    cloud.request_stop(run_id)
+    assert cloud.coordinator.claim() is None  # denied recovery heartbeat
+    return run_id
+
+
+def test_crash_between_runtime_retirement_and_store_release_is_finished_on_the_next_start(r2_cloud, monkeypatch):
+    """Interrupted retirement: the runtime group is sealed and removed, the process dies before the
+    Store release; the next start sends nothing and releases the slot from the archived evidence."""
+    cloud = r2_cloud
+    run_id = _r2_denied_recovered(cloud)
+    tree = cloud.store_tree()
+    real = RunnerStore.retire_inactive_reservation
+
+    def die(self, *args, **kwargs):
+        raise KeyboardInterrupt("synthetic process death before the Store release")
+
+    monkeypatch.setattr(RunnerStore, "retire_inactive_reservation", die)
+    with pytest.raises(KeyboardInterrupt):
+        cloud.start()
+    assert cloud.runtime.load_retired_claim(run_id) is not None
+    assert cloud.runtime.load_active_run_controls() == ()
+    assert cloud.store_tree() == tree  # nothing released yet
+    monkeypatch.setattr(RunnerStore, "retire_inactive_reservation", real)
+    sent = len(cloud.http.sent)
+    cloud.start()
+    assert cloud.http.operations(sent) == []  # the release needs no new Cloud exchange
+    _r2_assert_store_released(cloud, run_id, tree)
+    _r2_fresh_approved_run_executes(cloud, run_id)
+
+
+def test_crash_after_the_store_retirement_journal_rolls_forward_on_the_next_start(r2_cloud, monkeypatch):
+    """Interrupted Store transition: the signed journal and record are durable, the index is not; any
+    next Store authority access completes exactly that transition."""
+    from heel.runner import store as store_module
+
+    cloud = r2_cloud
+    run_id = _r2_denied_recovered(cloud)
+    tree = cloud.store_tree()
+    real_write = store_module._write_json
+
+    def die_before_index(directory_fd, name, value):
+        if name == store_module._RUN_AUTHORITY_INDEX_FILENAME and value.get("nonterminal_count") == 0:
+            raise KeyboardInterrupt("synthetic process death before the index write")
+        return real_write(directory_fd, name, value)
+
+    monkeypatch.setattr(store_module, "_write_json", die_before_index)
+    with pytest.raises(KeyboardInterrupt):
+        cloud.start()
+    monkeypatch.setattr(store_module, "_write_json", real_write)
+    from tests.test_runner_store_probe import _context_path
+
+    runs = _context_path(cloud.store) / "runs"
+    assert (runs / "run-authority-journal.json").exists()
+    assert _r2_store_index(cloud)["nonterminal_count"] == 1
+    sent = len(cloud.http.sent)
+    cloud.start()
+    assert cloud.http.operations(sent) == []
+    assert not (runs / "run-authority-journal.json").exists()
+    _r2_assert_store_released(cloud, run_id, tree)
+
+
+@pytest.mark.parametrize("local", ["running", "logged"])
+def test_store_release_refuses_a_possibly_activated_reservation_even_with_retired_claim_evidence(
+    r2_cloud, monkeypatch, local,
+):
+    """Runtime-retired, but the local reservation then shows activation: the Store never releases it,
+    and the next start fails closed with the slot, record and files unchanged."""
+    cloud = r2_cloud
+    run_id = _r2_denied_recovered(cloud)
+    monkeypatch.setattr(RunnerStore, "retire_inactive_reservation", lambda *_a, **_k: (_ for _ in ()).throw(
+        KeyboardInterrupt("synthetic process death before the Store release")))
+    with pytest.raises(KeyboardInterrupt):
+        cloud.start()
+    monkeypatch.undo()
+    if local == "running":
+        cloud.store.transition_run(run_id, "running", now_ms=cloud.now_ms())
+    else:
+        from heel.runner.containment import ContainmentLog
+
+        ContainmentLog(
+            store=cloud.store, signer=cloud.signer, run_id=run_id,
+            grant_id=cloud.store.load_run_grant(run_id)["grant_id"],
+            manifest_digest=cloud.manifest["manifest_digest"], clock_ms=cloud.now_ms,
+        ).append("grant_verified", detail_code="grant_exact")
+    tree = cloud.store_tree()
+    with pytest.raises(RunnerStoreError, match="never-activated"):
+        cloud.start()
+    assert cloud.store_tree() == tree and _r2_store_index(cloud)["nonterminal_count"] == 1
+
+
+def test_store_release_refuses_unattested_untrusted_or_mismatched_evidence(r2_cloud, monkeypatch):
+    """Only the runtime's authenticated retired claim for this exact run, verified under the pinned
+    grant authority, releases a reservation."""
+    cloud = r2_cloud
+    run_id = _r2_denied_recovered(cloud)
+    monkeypatch.setattr(RunnerStore, "retire_inactive_reservation", lambda *_a, **_k: (_ for _ in ()).throw(
+        KeyboardInterrupt("synthetic process death before the Store release")))
+    with pytest.raises(KeyboardInterrupt):
+        cloud.start()
+    monkeypatch.undo()
+    tree, now = cloud.store_tree(), cloud.now_ms()
+    other = SigningAuthority.generate()
+    with pytest.raises(RunnerStoreError, match="untrusted"):
+        cloud.store.retire_inactive_reservation(
+            run_id, runtime=cloud.runtime, trusted_cloud_keys={other.key_id: other.public_key}, now_ms=now,
+        )
+    with pytest.raises(RunnerStoreError, match="requires a retired claim"):
+        cloud.store.retire_inactive_reservation(
+            "crun_" + "f" * 32, runtime=cloud.runtime, trusted_cloud_keys=cloud.trusted, now_ms=now,
+        )
+    record = cloud.runtime.load_retired_claim(run_id, authenticate_components=True)
+    absent = SimpleNamespace(**{
+        **{name: getattr(record, name) for name in record.__slots__},
+        "local_observations": {"reservation": "absent", "terminal": "absent"},
+    })
+
+    class Runtime:
+        identity, signer = cloud.runtime.identity, cloud.runtime.signer
+
+        @staticmethod
+        def load_retired_claim(_run_id, **_kwargs):
+            return absent
+
+    with pytest.raises(RunnerStoreError, match="evidence is invalid"):
+        cloud.store.retire_inactive_reservation(
+            run_id, runtime=Runtime(), trusted_cloud_keys=cloud.trusted, now_ms=now,
+        )
+    # A verified attestation for this run but a different grant never releases this reservation.
+    real_verify = RunnerStore._inactive_retirement_attestation
+
+    def other_grant(*args, **kwargs):
+        attestation, digest = real_verify(*args, **kwargs)
+        return {**attestation, "grant_digest": "f" * 64}, digest
+
+    monkeypatch.setattr(RunnerStore, "_inactive_retirement_attestation", staticmethod(other_grant))
+    with pytest.raises(RunnerStoreError, match="evidence is invalid"):
+        cloud.store.retire_inactive_reservation(
+            run_id, runtime=cloud.runtime, trusted_cloud_keys=cloud.trusted, now_ms=now,
+        )
+    monkeypatch.undo()
+    assert cloud.store_tree() == tree and _r2_store_index(cloud)["nonterminal_count"] == 1
+    cloud.start()  # the honest evidence then releases it
+    _r2_assert_store_released(cloud, run_id, tree)
+
+
+def test_repeated_recoveries_at_capacity_one_never_accumulate_unreleasable_slots(r2_cloud, monkeypatch):
+    """At a forced capacity of one nonterminal reservation, two full lost-claim -> Stop -> restart
+    cycles each retire their reservation and a fresh approved run still reserves and executes."""
+    from heel.runner import store as store_module
+
+    monkeypatch.setattr(store_module, "_RUN_AUTHORITY_MAX_NONTERMINAL", 1)
+    cloud = r2_cloud
+    projection = None
+    for cycle in range(2):
+        run_id = _r2_denied_recovered(cloud, projection)
+        tree = cloud.store_tree()
+        cloud.start()
+        _r2_assert_store_released(cloud, run_id, tree)
+        assert _r2_store_index(cloud)["nonterminal_count"] == 0
+        _r2_fresh_approved_run_executes(cloud, run_id, now_ms=3_000 + 10 * cycle)
+        projection = _r2_new_projection(cloud, 4_000 + 10 * cycle)
 
 
 def test_attestation_without_a_bounded_transport_fails_closed_and_keeps_the_claim(r2_cloud):

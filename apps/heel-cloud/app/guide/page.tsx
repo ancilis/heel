@@ -383,16 +383,20 @@ export default function Guide() {
               it is in flight has not been demonstrated.
             </p>
             <p>
-              If an approved dry run never started because the runner was interrupted, start{" "}
-              <code>serve</code> again with the same command and the same <code>HEEL_HOME</code>; keep
-              its credentials and local files. The runner then runs it, or, if Heel Cloud has
-              already stopped it, retires it without contacting the target. If the run still shows{" "}
-              <strong>Rehearsal running</strong> with no progress, choose <strong>Stop rehearsal</strong>,
-              then start <code>serve</code> once more: Heel Cloud confirms the run never started and the
-              runner retires it. The stopped run is not resumed. Request and approve a new dry run (steps
-              11 and 12). If <strong>Stop rehearsal</strong> is not shown, wait until the approval has
-              expired (at most 10 minutes after you approved it) and start <code>serve</code> once more.
-              Until Heel Cloud has ended the run, <code>serve</code> reports <code>offline</code> with{" "}
+              If an approved dry run never started because the runner was interrupted, restart{" "}
+              <code>serve</code> and keep its credentials and local files: if <code>serve</code> is
+              still running, press Ctrl+C once in its terminal and wait for it to exit, then run the step
+              05 command again with the same <code>HEEL_HOME</code>. Stop on the dashboard does not stop{" "}
+              <code>serve</code>. The runner then runs that dry run. If Heel Cloud had already stopped it,
+              that start only records the stop and the dashboard shows <strong>Stop requested</strong>;
+              restart <code>serve</code> the same way once more and the runner retires the run without
+              contacting the target. If the run still shows <strong>Rehearsal running</strong> with no
+              progress, choose <strong>Stop rehearsal</strong>, then restart <code>serve</code> the same
+              way: Heel Cloud confirms the run never started and the runner retires it. The stopped run is
+              not resumed. Request and approve a new dry run (steps 11 and 12). If{" "}
+              <strong>Stop rehearsal</strong> is not shown, wait until the approval has expired (at most
+              10 minutes after you approved it), then restart <code>serve</code> the same way. Until Heel
+              Cloud has ended the run, <code>serve</code> reports <code>offline</code> with{" "}
               <code>inactive_claim_waiting_for_cloud</code> and retries by itself; it then retires the
               run. A run that already started is never resumed this way, and a
               revoked runner or context stays revoked. If <code>serve</code> stops again, report it (see

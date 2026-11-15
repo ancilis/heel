@@ -28,6 +28,12 @@ from urllib.parse import urlsplit
 from heel.canary_contracts import (
     canonical_bytes,
     canonical_digest,
+    inactive_claim_attestation_signing_payload,
+    INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES,
+    parse_json,
+    RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES,
+    validate_inactive_claim_attestation,
+    validate_runner_inactive_claim_attestation_request,
     CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
     CONFIGURED_COMPILER_VERSION,
     CONFIGURED_ENGINE_VERSION,
@@ -195,6 +201,9 @@ _RUN_TERMINAL_DETACHED_RECORD_SCHEMA = "heel.local-run-terminal-detached.v1"
 _RUN_PRUNED_RECORD_SCHEMA = "heel.local-run-pruned.v1"
 _RUN_RUNTIME_PRUNED_RECORD_SCHEMA = "heel.local-run-pruned.v2"
 _RUN_RUNTIME_PRUNED_RECORD_DOMAIN = b"heel.local-run-pruned.v2\0"
+# A never-activated reservation released from nonterminal capacity by a Cloud-attested, runtime
+# retired inactive claim.  The reservation record, grant marker and run files stay in place.
+_RUN_INACTIVE_RETIRED_RECORD_SCHEMA = "heel.local-run-inactive-retired.v1"
 _RUN_AUTHORITY_MUTATION_SCHEMA = "heel.local-run-authority-mutation.v1"
 _RUN_AUTHORITY_CHECKPOINT_SCHEMA = "heel.local-run-authority-checkpoint.v1"
 _RUN_AUTHORITY_COMPACTION_JOURNAL_SCHEMA = "heel.local-run-authority-compaction-journal.v1"
@@ -219,6 +228,7 @@ _RUN_AUTHORITY_DOMAINS = {
     _RUN_TERMINAL_DETACHED_RECORD_SCHEMA: b"heel.local-run-terminal-detached.v1\0",
     _RUN_PRUNED_RECORD_SCHEMA: b"heel.local-run-pruned.v1\0",
     _RUN_RUNTIME_PRUNED_RECORD_SCHEMA: _RUN_RUNTIME_PRUNED_RECORD_DOMAIN,
+    _RUN_INACTIVE_RETIRED_RECORD_SCHEMA: b"heel.local-run-inactive-retired.v1\0",
     _RUN_AUTHORITY_MUTATION_SCHEMA: b"heel.local-run-authority-mutation.v1\0",
     _RUN_AUTHORITY_CHECKPOINT_SCHEMA: b"heel.local-run-authority-checkpoint.v1\0",
     _RUN_AUTHORITY_COMPACTION_JOURNAL_SCHEMA: b"heel.local-run-authority-compaction-journal.v1\0",
@@ -5017,7 +5027,7 @@ class RunnerStore:
             raise RunnerStoreError("invalid local run authority hash")
         prefix = {
             "reserve": "reservation-", "terminal": "terminal-", "detach_terminal": "detached-",
-            "prune": "pruned-",
+            "prune": "pruned-", "retire_inactive": "retired-",
         }.get(kind)
         if prefix is None:
             raise RunnerStoreError("invalid local run authority operation")
@@ -5028,6 +5038,7 @@ class RunnerStore:
         signer: SecureSigner, run_hash: str, grant: Mapping[str, Any], state: Mapping[str, Any],
         index: Mapping[str, Any], terminal: Mapping[str, Any] | None = None,
         pruned_at_ms: int | None = None, detached_at_ms: int | None = None,
+        retired: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         header = {
             "namespace": context.namespace, "workspace_id": context.workspace_id,
@@ -5096,6 +5107,24 @@ class RunnerStore:
                 ),
                 "terminal_at_ms": terminal["terminal_at_ms"], "pruned_at_ms": pruned_at_ms,
             }
+        elif operation == "retire_inactive":
+            if retired is None:
+                raise RunnerStoreError("local inactive retirement requires retired claim evidence")
+            core = {
+                "schema_version": _RUN_INACTIVE_RETIRED_RECORD_SCHEMA, **header,
+                "reservation_record_digest": _digest(
+                    retired["reservation_record_digest"], "local reservation record digest",
+                ),
+                "verified_state_digest": canonical_digest(dict(state)),
+                "runtime_retired_state_digest": _digest(
+                    retired["runtime_retired_state_digest"], "runtime retired claim digest",
+                ),
+                "attestation_response_sha256": _digest(
+                    retired["attestation_response_sha256"], "inactive claim attestation digest",
+                ),
+                "cloud_status": retired["cloud_status"],
+                "retired_at_ms": retired["retired_at_ms"],
+            }
         else:
             raise RunnerStoreError("invalid local run authority operation")
         return self._signed_run_authority_value(core, signer=signer, record_digest=True)
@@ -5105,7 +5134,7 @@ class RunnerStore:
         operation: str, run_hash: str, index: Mapping[str, Any], next_index: Mapping[str, Any],
         record: Mapping[str, Any], recovery: Mapping[str, Any], created_at_ms: int,
     ) -> dict[str, Any]:
-        if operation not in {"reserve", "terminal", "detach_terminal", "prune"}:
+        if operation not in {"reserve", "terminal", "detach_terminal", "prune", "retire_inactive"}:
             raise RunnerStoreError("invalid local run authority operation")
         core = {
             "schema_version": _RUN_AUTHORITY_MUTATION_SCHEMA, "namespace": context.namespace,
@@ -5135,7 +5164,7 @@ class RunnerStore:
         if (
             set(checked) != fields or checked["namespace"] != self.namespace
             or checked["workspace_id"] != identity.workspace_id or checked["runner_id"] != identity.runner_id
-            or checked["runner_key_id"] != identity.key_id or checked["operation"] not in {"reserve", "terminal", "detach_terminal", "prune"}
+            or checked["runner_key_id"] != identity.key_id or checked["operation"] not in {"reserve", "terminal", "detach_terminal", "prune", "retire_inactive"}
             or _RUN_FILENAME.fullmatch(checked["run_hash"]) is None
             or _DIGEST.fullmatch(checked["old_index_digest"]) is None
             or type(checked["created_at_ms"]) is not int or checked["created_at_ms"] < 0
@@ -5178,6 +5207,7 @@ class RunnerStore:
             "terminal": _RUN_TERMINAL_RECORD_SCHEMA,
             "detach_terminal": _RUN_TERMINAL_DETACHED_RECORD_SCHEMA,
             "prune": _RUN_PRUNED_RECORD_SCHEMA,
+            "retire_inactive": _RUN_INACTIVE_RETIRED_RECORD_SCHEMA,
         }[operation]
         if operation == "prune" and journal["record"].get("schema_version") == _RUN_RUNTIME_PRUNED_RECORD_SCHEMA:
             record = self._verify_runtime_pruned_record(journal["record"], identity=identity)
@@ -5272,6 +5302,30 @@ class RunnerStore:
                 os.close(run_fd)
             self._ensure_json_exact(
                 runs_fd, self._run_authority_record_filename("terminal", run_hash), record,
+            )
+        elif operation == "retire_inactive":
+            # Roll the signed decision forward only while its exact never-activated reservation is
+            # still in place; the run files, marker and reservation record are never touched.
+            if set(recovery) != {"reservation_record_digest", "verified_state"}:
+                raise RunnerStoreError("local inactive retirement recovery is invalid")
+            if self._run_authority_index_digest(current) == journal["old_index_digest"]:
+                tracked = [item for item in current["nonterminal_runs"] if item["run_hash"] == run_hash]
+                if len(tracked) != 1 or tracked[0]["reservation_record_digest"] != record.get(
+                    "reservation_record_digest",
+                ):
+                    raise RunnerStoreError("local run authority journal index changed")
+            self._verify_inactive_reservation_locked(
+                runs_fd, run_hash, identity=identity,
+                reservation_record_digest=recovery["reservation_record_digest"],
+                verified_state=recovery["verified_state"],
+            )
+            if (
+                record.get("reservation_record_digest") != recovery["reservation_record_digest"]
+                or record.get("verified_state_digest") != canonical_digest(dict(recovery["verified_state"]))
+            ):
+                raise RunnerStoreError("local inactive retirement recovery is invalid")
+            self._ensure_json_exact(
+                runs_fd, self._run_authority_record_filename("retire_inactive", run_hash), record,
             )
         elif operation == "detach_terminal":
             if runtime is None:
@@ -8031,6 +8085,273 @@ class RunnerStore:
             finally:
                 os.close(runs_fd)
         return state
+
+    def _verify_inactive_reservation_locked(
+        self, runs_fd: int, run_hash: str, *, identity: RunnerIdentity,
+        reservation_record_digest: str, verified_state: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Prove one exact reservation never activated: signed record, marker, ``verified``, no event.
+
+        Returns ``(grant, reservation)``.  Any other shape (a terminal/detached/pruned record, a
+        moved state, a containment event or temporary, a finals file) is refused, never repaired.
+        """
+        reservation_value = _read_json(
+            runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+        )
+        if reservation_value is None:
+            raise RunnerStoreError("local inactive retirement requires a reservation")
+        reservation = self._verify_signed_run_authority_value(
+            reservation_value, identity=identity, schema=_RUN_RESERVATION_RECORD_SCHEMA,
+            record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+        )
+        if (
+            reservation["record_digest"] != reservation_record_digest
+            or reservation.get("run_hash") != run_hash
+            or not isinstance(verified_state, Mapping)
+            or verified_state.get("state") != "verified"
+            or reservation.get("initial_state_digest") != canonical_digest(dict(verified_state))
+        ):
+            raise RunnerStoreError("local inactive retirement reservation is invalid")
+        for kind in ("terminal", "detach_terminal", "prune"):
+            if _read_json(runs_fd, self._run_authority_record_filename(kind, run_hash), None) is not None:
+                raise RunnerStoreError("local inactive retirement requires a never-activated run")
+        marker = _read_json(runs_fd, f"grant-{reservation.get('grant_digest')}.json", None)
+        try:
+            if (
+                not isinstance(marker, Mapping)
+                or set(marker) != {"schema_version", "grant", "initial_state"}
+                or marker["schema_version"] != _RESERVATION_SCHEMA
+                or marker["initial_state"] != dict(verified_state)
+            ):
+                raise ValueError
+            grant = validate_execution_grant(marker["grant"])
+        except (TypeError, ValueError):
+            raise RunnerStoreError("local inactive retirement reservation is invalid") from None
+        if (
+            self._run_hash(grant["run_id"]) != run_hash
+            or grant["grant_id"] != reservation.get("grant_id")
+            or grant["grant_digest"] != reservation.get("grant_digest")
+            or verified_state.get("run_id") != grant["run_id"]
+        ):
+            raise RunnerStoreError("local inactive retirement reservation is invalid")
+        run_fd = _open_child(runs_fd, run_hash, create=False)
+        if run_fd is None:
+            raise RunnerStoreError("local inactive retirement reservation is invalid")
+        try:
+            _secure_directory(run_fd, "Heel local run directory")
+            if (
+                _read_json(run_fd, "grant.json", None) != grant
+                or _read_json(run_fd, "state.json", None) != dict(verified_state)
+                or _read_json(run_fd, "finals.json", None) is not None
+            ):
+                raise RunnerStoreError("local inactive retirement requires a never-activated run")
+            events_fd = _open_child(run_fd, "events", create=False)
+            if events_fd is not None:
+                try:
+                    _secure_directory(events_fd, "Heel containment events directory")
+                    if os.listdir(events_fd):
+                        raise RunnerStoreError("local inactive retirement requires a never-activated run")
+                finally:
+                    os.close(events_fd)
+        finally:
+            os.close(run_fd)
+        return grant, reservation
+
+    @staticmethod
+    def _inactive_retirement_attestation(
+        retired: object, *, run_id: str, identity: RunnerIdentity,
+        trusted_cloud_keys: Mapping[str, object],
+    ) -> tuple[dict[str, Any], str]:
+        """Independently re-verify the archived Cloud answer of one runtime-retired claim.
+
+        Returns ``(attestation, response_sha256)``.  The exact archived response must verify under
+        the pinned grant authority, echo the archived request's challenge and bindings, and attest a
+        Cloud stop before any start or acknowledgement.
+        """
+        try:
+            if (
+                getattr(retired, "run_id", None) != run_id
+                or getattr(retired, "reason", None) != "cloud_inactive_attested"
+                or dict(getattr(retired, "local_observations", {})) != {
+                    "reservation": "reserved", "terminal": "absent",
+                }
+            ):
+                raise ValueError
+            archived = getattr(retired, "attestation")
+            request_body = base64.b64decode(archived["request"]["body_b64"], validate=True)
+            response_body = base64.b64decode(archived["response"]["body_b64"], validate=True)
+            if archived["response"]["status"] != 200 or archived["request"]["method"] != "POST":
+                raise ValueError
+            request = validate_runner_inactive_claim_attestation_request(
+                parse_json(request_body, max_bytes=RUNNER_INACTIVE_CLAIM_ATTESTATION_REQUEST_MAX_BYTES),
+            )
+            value = parse_json(response_body, max_bytes=INACTIVE_CLAIM_ATTESTATION_RESPONSE_MAX_BYTES)
+            if not isinstance(value, dict):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise RunnerStoreError("local inactive retirement evidence is invalid") from None
+        try:
+            verify_envelope(
+                dict(trusted_cloud_keys),
+                {"signing_key_id": value.get("signing_key_id"), "signature_b64": value.get("signature_b64")},
+                inactive_claim_attestation_signing_payload(value),
+            )
+            attestation = validate_inactive_claim_attestation(value)
+        except (TypeError, ValueError):
+            raise RunnerStoreError("local inactive retirement evidence is untrusted") from None
+        cloud = attestation["cloud"]
+        if (
+            attestation != value
+            or attestation["workspace_id"] != identity.workspace_id
+            or attestation["runner_id"] != identity.runner_id
+            or attestation["bound_runner_key_id"] != identity.key_id
+            or attestation["run_id"] != run_id
+            or any(attestation[key] != request[key] for key in (
+                "run_id", "project_id", "grant_id", "grant_digest", "approval_id",
+                "approval_projection_digest", "bound_runner_key_id",
+            ))
+            or attestation["client_challenge_b64"] != request["client_challenge_b64"]
+            or cloud["status"] not in {"stop_requested", "finalizing", "terminal"}
+            or cloud["stop_reason"] == "none"
+            or cloud["started_at_ms"] is not None or cloud["stop_acknowledged_at_ms"] is not None
+        ):
+            raise RunnerStoreError("local inactive retirement evidence is invalid")
+        return attestation, hashlib.sha256(response_body).hexdigest()
+
+    def retire_inactive_reservation(
+        self, run_id: str, *, runtime: object, trusted_cloud_keys: Mapping[str, object], now_ms: int,
+    ) -> dict[str, Any]:
+        """Release one never-activated reservation whose runtime claim was retired by Cloud attestation.
+
+        The signed run-authority journal removes exactly its nonterminal index entry and adds a
+        signed ``retired-`` record bound to the reservation, its ``verified`` state, the runtime
+        retired-claim digest and the re-verified attestation.  The grant marker, reservation record
+        and run files are kept, so the consumed grant can never be reserved again.  Idempotent.
+        """
+        run_id = _id(run_id, "run ID")
+        identity, signer = self._require_runtime_authority()
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+            raise ValueError("invalid local inactive retirement time")
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local inactive retirement requires the bound runtime")
+        try:
+            retired = runtime.load_retired_claim(run_id, authenticate_components=True)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RunnerStoreError("local inactive retirement evidence is unavailable") from exc
+        if retired is None:
+            raise RunnerStoreError("local inactive retirement requires a retired claim")
+        attestation, response_sha256 = self._inactive_retirement_attestation(
+            retired, run_id=run_id, identity=identity, trusted_cloud_keys=trusted_cloud_keys,
+        )
+        context = self.load_context()
+        run_hash = self._run_hash(run_id)
+        record_name = self._run_authority_record_filename("retire_inactive", run_hash)
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                raise RunnerStoreError("local run authority index is unavailable")
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                tracked = [item for item in index["nonterminal_runs"] if item["run_hash"] == run_hash]
+                existing = _read_json(runs_fd, record_name, None)
+                if existing is not None:
+                    record = self._verify_signed_run_authority_value(
+                        existing, identity=identity, schema=_RUN_INACTIVE_RETIRED_RECORD_SCHEMA,
+                        record_digest=True, max_bytes=_RUN_AUTHORITY_MAX_RECORD_BYTES,
+                    )
+                    if (
+                        tracked or record.get("run_hash") != run_hash
+                        or record.get("runtime_retired_state_digest") != retired.state_digest
+                        or record.get("attestation_response_sha256") != response_sha256
+                    ):
+                        raise RunnerStoreError("local inactive retirement record is invalid")
+                    return record
+                if len(tracked) != 1 or any(
+                    item["run_hash"] == run_hash for item in index["terminal_queue"]
+                ):
+                    raise RunnerStoreError("local inactive retirement requires a tracked reservation")
+                reservation_value = _read_json(
+                    runs_fd, self._run_authority_record_filename("reserve", run_hash), None,
+                )
+                marker = _read_json(
+                    runs_fd, f"grant-{(reservation_value or {}).get('grant_digest')}.json", None,
+                )
+                verified_state = marker.get("initial_state") if isinstance(marker, Mapping) else None
+                grant, _reservation = self._verify_inactive_reservation_locked(
+                    runs_fd, run_hash, identity=identity,
+                    reservation_record_digest=tracked[0]["reservation_record_digest"],
+                    verified_state=verified_state if isinstance(verified_state, Mapping) else {},
+                )
+                if (
+                    attestation["grant_id"] != grant["grant_id"]
+                    or attestation["grant_digest"] != grant["grant_digest"]
+                    or attestation["project_id"] != grant["project_id"]
+                    or attestation["approval_id"] != grant["approval"]["projection_id"]
+                    or attestation["approval_projection_digest"] != grant["approval"]["projection_digest"]
+                ):
+                    raise RunnerStoreError("local inactive retirement evidence is invalid")
+                record = self._run_authority_record(
+                    operation="retire_inactive", context=context, identity=identity, signer=signer,
+                    run_hash=run_hash, grant=grant, state=dict(verified_state), index=index,
+                    retired={
+                        "reservation_record_digest": tracked[0]["reservation_record_digest"],
+                        "runtime_retired_state_digest": retired.state_digest,
+                        "attestation_response_sha256": response_sha256,
+                        "cloud_status": attestation["cloud"]["status"],
+                        "retired_at_ms": now_ms,
+                    },
+                )
+                next_index = self._next_run_authority_index(
+                    index, signer=signer, delta=-1, head_digest=record["record_digest"],
+                    nonterminal_runs=[
+                        item for item in index["nonterminal_runs"] if item["run_hash"] != run_hash
+                    ],
+                )
+                journal = self._run_authority_journal(
+                    context=context, identity=identity, signer=signer, operation="retire_inactive",
+                    run_hash=run_hash, index=index, next_index=next_index, record=record,
+                    recovery={
+                        "reservation_record_digest": tracked[0]["reservation_record_digest"],
+                        "verified_state": dict(verified_state),
+                    },
+                    created_at_ms=now_ms,
+                )
+                _write_json(runs_fd, _RUN_AUTHORITY_JOURNAL_FILENAME, journal)
+                self._ensure_json_exact(runs_fd, record_name, record)
+                _write_json(runs_fd, _RUN_AUTHORITY_INDEX_FILENAME, next_index)
+                os.unlink(_RUN_AUTHORITY_JOURNAL_FILENAME, dir_fd=runs_fd)
+                os.fsync(runs_fd)
+                return record
+            finally:
+                os.close(runs_fd)
+
+    def nonterminal_run_ids(self, *, runtime: object) -> tuple[str, ...]:
+        """The run IDs the signed index tracks as nonterminal (at most 64), after journal recovery."""
+        identity, signer = self._require_runtime_authority()
+        if not self.is_context_bound:
+            return ()
+        if not self._runtime_matches_identity(runtime, identity=identity, signer=signer):
+            raise RunnerStoreError("local run authority recovery requires the bound runtime")
+        with self._transaction(exclusive=True) as context_fd:
+            runs_fd = _open_child(context_fd, "runs", create=False)
+            if runs_fd is None:
+                return ()
+            try:
+                _secure_directory(runs_fd, "Heel runner runs directory")
+                self._complete_run_authority_journal_locked(
+                    context_fd, runs_fd, identity=identity, runtime=runtime,
+                )
+                index = self._run_authority_index_locked(runs_fd, identity=identity)
+                return tuple(
+                    self._run_id_from_hash_locked(runs_fd, item["run_hash"])
+                    for item in index["nonterminal_runs"]
+                )
+            finally:
+                os.close(runs_fd)
 
     def probe_run_reservation(self, run_id: str) -> RunReservationProbe:
         """Classify one run's local reservation without writing run authority.

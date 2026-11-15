@@ -2510,8 +2510,27 @@ def test_retire_inactive_claim_seals_active_chains_and_every_pending_core_then_r
     assert reopened.load_retired_claim(fixture.run_id, authenticate_components=True) == record
 
 
+@pytest.mark.parametrize("probe", ["reserved", "RESERVED-enum", "ABSENT-enum"])
+def test_retire_inactive_claim_archives_the_canonical_reservation_observation(tmp_path, probe):
+    """F1(b): the caller may retire a never-activated reserved claim; the sealed archive records the
+    observation as the canonical literal, whatever str-valued object the caller passed."""
+    from heel.runner.store import RunReservationProbe
+
+    value = {
+        "reserved": "reserved", "RESERVED-enum": RunReservationProbe.RESERVED,
+        "ABSENT-enum": RunReservationProbe.ABSENT,
+    }[probe]
+    fixture = _retirable(tmp_path)
+    record = _retire(fixture, probe=value)
+    expected = "absent" if probe == "ABSENT-enum" else "reserved"
+    assert dict(record.local_observations) == {"reservation": expected, "terminal": "absent"}
+    reopened = fixture.runtime.load_retired_claim(fixture.run_id, authenticate_components=True)
+    assert dict(reopened.local_observations) == {"reservation": expected, "terminal": "absent"}
+    assert fixture.runtime.load_active_run_controls() == ()
+
+
 @pytest.mark.parametrize("case", (
-    "changed-snapshot", "unknown-run", "local-terminal", "progress-pending", "reservation-reserved",
+    "changed-snapshot", "unknown-run", "local-terminal", "progress-pending",
     "reservation-journal-pending", "reservation-unresolved", "reservation-not-a-string",
     "chain-recovery-row",
 ))
@@ -2541,7 +2560,7 @@ def test_retire_inactive_claim_rejects_changed_snapshot_terminal_or_non_heartbea
         _stage_run_call(runtime, fixture.signer, fixture.identity, fixture.run_id, "progress", body)
     elif case.startswith("reservation-"):
         kwargs["probe"] = {
-            "reservation-reserved": "reserved", "reservation-journal-pending": "journal_pending",
+            "reservation-journal-pending": "journal_pending",
             "reservation-unresolved": "unresolved", "reservation-not-a-string": object(),
         }[case]
     if case == "chain-recovery-row":

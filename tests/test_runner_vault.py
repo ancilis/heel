@@ -664,6 +664,104 @@ def test_proof_generation_rollover_refuses_a_nonterminal_reserved_local_run(tmp_
         store.transition_run(grant["run_id"], "terminal", now_ms=2_001)
 
 
+def test_proof_generation_rollover_succeeds_after_a_never_activated_reservation_is_retired(tmp_path):
+    """STORE-CLOSURE: the same reserved, never-activated run as above is released by the signed
+    inactive-retirement transition from a grant-authority attestation; the cloud-context rollover
+    then installs and the consumed grant stays unreservable."""
+    from types import SimpleNamespace
+
+    from heel.canary_contracts import INACTIVE_CLAIM_ATTESTATION_DOMAIN
+
+    store, identity, signer, manifest, projection = compiled_pair(tmp_path)
+    authority = SigningAuthority.generate()
+    trusted = {authority.key_id: authority.public_key}
+    context = store.load_context()
+
+    def artifact(binding_id, verification_digest, issued_at, expires_at):
+        unsigned = {
+            "schema_version": "heel.runner-context-binding.v1", "binding_id": binding_id,
+            "workspace_id": identity.workspace_id, "project_id": context.project_id,
+            "environment": {
+                "environment_id": context.environment_id, "origin": context.origin,
+                "environment_class": context.environment_class,
+                "verification_record_digest": verification_digest,
+            },
+            "runner_binding": {
+                "runner_id": identity.runner_id, "runner_key_id": identity.key_id,
+                "public_key_digest": identity.fingerprint,
+            },
+            "authorization": {"user_id": "owner", "role": "owner"},
+            "issued_at_ms": issued_at, "expires_at_ms": expires_at,
+        }
+        return {
+            **unsigned, "binding_digest": canonical_digest(unsigned),
+            **authority.sign(b"heel.runner-context-binding.v1\0" + canonical_bytes(unsigned)),
+        }
+
+    old = artifact("rcb_" + "5" * 32, context.verification_record_digest, 1, 60_001)
+    store.install_cloud_context_binding(
+        old, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys=trusted, now_ms=1,
+    )
+    grant = signed_grant(manifest, projection, identity, authority, issued=1_000, expires=10_000)
+    store.reserve_run(grant, retention_expires_at_ms=86_400_000)
+    challenge = base64.b64encode(b"q" * 32).decode("ascii")
+    request = {
+        "schema_version": "heel.runner-inactive-claim-attestation-request.v1", "run_id": grant["run_id"],
+        "project_id": grant["project_id"], "grant_id": grant["grant_id"], "grant_digest": grant["grant_digest"],
+        "approval_id": grant["approval"]["projection_id"],
+        "approval_projection_digest": grant["approval"]["projection_digest"],
+        "bound_runner_key_id": identity.key_id, "client_challenge_b64": challenge,
+    }
+    unsigned = {
+        "schema_version": "heel.inactive-claim-attestation.v1", "attestation_id": "ica_" + "0123456789abcdef" * 2,
+        "workspace_id": identity.workspace_id, "runner_id": identity.runner_id,
+        **{key: request[key] for key in (
+            "project_id", "run_id", "grant_id", "grant_digest", "approval_id", "approval_projection_digest",
+        )},
+        "bound_runner_key_id": identity.key_id, "authenticated_runner_key_id": identity.key_id,
+        "client_challenge_b64": challenge,
+        "cloud": {
+            "status": "stop_requested", "stop_reason": "cloud_stop", "stop_generation": 1,
+            "stop_requested_at_ms": 2_000, "stop_deadline_ms": 7_000, "terminal_at_ms": None,
+            "execution_disposition": None, "grant_status": "claimed", "started_at_ms": None,
+            "stop_acknowledged_at_ms": None, "observation": "no_start_no_ack_no_execution_projection",
+        },
+        "attested_at_ms": 3_000,
+    }
+    response = {
+        **unsigned, "attestation_digest": canonical_digest(unsigned),
+        **authority.sign(INACTIVE_CLAIM_ATTESTATION_DOMAIN + canonical_bytes(unsigned)),
+    }
+    retired = SimpleNamespace(
+        run_id=grant["run_id"], reason="cloud_inactive_attested",
+        local_observations={"reservation": "reserved", "terminal": "absent"}, state_digest="a" * 64,
+        attestation={
+            "request": {"method": "POST", "body_b64": base64.b64encode(canonical_bytes(request)).decode("ascii")},
+            "response": {"status": 200, "body_b64": base64.b64encode(canonical_bytes(response)).decode("ascii")},
+        },
+    )
+    runtime = SimpleNamespace(
+        identity=identity, signer=signer,
+        load_retired_claim=lambda run_id, **_kwargs: retired if run_id == grant["run_id"] else None,
+    )
+    assert store.nonterminal_run_ids(runtime=runtime) == (grant["run_id"],)
+    store.retire_inactive_reservation(grant["run_id"], runtime=runtime, trusted_cloud_keys=trusted, now_ms=3_500)
+    assert store.nonterminal_run_ids(runtime=runtime) == ()
+    assert store.load_run(grant["run_id"])["state"] == "verified"  # historical files are kept
+    with pytest.raises(RunnerStoreError, match="reservation is unavailable"):
+        store.reserve_run(grant, retention_expires_at_ms=86_400_000)  # never replayed
+
+    new = artifact("rcb_" + "6" * 32, "6" * 64, 60_002, 120_003)
+    evidence = RunnerContextRolloverEvidence(
+        old["binding_id"], old["binding_digest"], new["binding_id"], new["binding_digest"], 60_002,
+    )
+    installed = store.install_cloud_context_binding(
+        new, identity=identity, signer=signer, signer_label="test-signer", trusted_cloud_keys=trusted,
+        now_ms=60_002, rollover_evidence=evidence,
+    )
+    assert installed.verification_record_digest == "6" * 64
+
+
 def test_rollover_journal_blocks_normal_load_then_recovers_exact_crash_state(tmp_path, monkeypatch):
     store, identity, signer = store_and_identity(tmp_path)
     authority = SigningAuthority.generate()
