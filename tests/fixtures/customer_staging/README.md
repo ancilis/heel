@@ -1,10 +1,12 @@
 # Controlled staging target (synthetic acceptance fixture)
 
 A tiny standalone Cloudflare Worker that stands in for a customer's staging SaaS during the
-real customer-local Heel journey. It is a test fixture: not Heel product code, not Heel's
-control plane, and not shipped in any release artifact (`tests/` is excluded by
-`scripts/build_open_core_release.py`). It has no bindings, storage, outbound fetch, redirect,
-dependency or paid feature, and serves only static fake data.
+real customer-local Heel journey. It is a test fixture: not Heel product code and not Heel's
+control plane. It is not inside the Heel runner package: the wheel and source archive exclude
+`tests/` (`scripts/build_open_core_release.py`). Its four files are distributed separately, as
+the `heel-staging-fixture-*` assets of the Heel 1.3.0rc6 runner preview prerelease, next to a
+manifest of their sizes and SHA-256 digests. It has no bindings, storage, outbound fetch,
+redirect, dependency or paid feature, and serves only static fake data.
 
 ## Standalone files
 
@@ -18,12 +20,35 @@ repository checkout, git metadata, Heel source or `node_modules` is needed:
 | `openapi.json` | 2282 | `520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19` |
 | `README.md` | this file | |
 
-Check them before deploying (`shasum -a 256 worker.mjs wrangler.jsonc openapi.json`). The
-publisher of these files states one explicit source version with them: the 40-character
+Check them before deploying (`shasum -a 256 worker.mjs wrangler.jsonc openapi.json README.md`).
+The publisher of these files states one explicit source version with them: the 40-character
 lowercase hex commit they were taken from. The steps below call it `SOURCE_REVISION`; the
 target reports it at `/healthz`. Do not guess it, and do not use `git rev-parse` in an
 extracted copy. `target.test.mjs` and the repository paths named below (`heel/runner/...`,
 `tests/...`) are repository-only background; deployment does not need them.
+
+### Download without a checkout
+
+The files are published as assets of the GitHub prerelease
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, each under the prefix
+`heel-staging-fixture-`, with `heel-staging-fixture-manifest.json` listing every file's asset name,
+original name, byte count and SHA-256. The release notes state `SOURCE_REVISION` and repeat the
+same table, including this README's digest. Download them anonymously into one new directory under
+their original names:
+
+```sh
+mkdir heel-staging-target && cd heel-staging-target
+B=https://github.com/ancilis/heel/releases/download/v1.3.0rc6
+for F in README.md openapi.json worker.mjs wrangler.jsonc; do
+  curl -fsSL --proto '=https' --proto-redir '=https' -o "$F" "$B/heel-staging-fixture-$F"
+done
+curl -fsSL --proto '=https' --proto-redir '=https' -o heel-staging-fixture-manifest.json "$B/heel-staging-fixture-manifest.json"
+shasum -a 256 README.md openapi.json worker.mjs wrangler.jsonc   # compare with the manifest and release notes
+```
+
+Stop if any digest differs. No git, repository checkout, Heel source, private configuration or
+helper is needed, and nothing here grants access to a target: the prerequisites below remain the
+operator's.
 
 It closes three target prerequisites of the older loopback harness
 (`tests/plan_differential_support.py`): it is reachable over ordinary public HTTPS once
@@ -65,8 +90,8 @@ and uses the same operator mode and the same two configured digests (no new secr
 `{"record_id":"rec_canary","account_id":"acct_canary","display_name":"Synthetic Record","protected_canary":"heel-canary-auth-0001"}`.
 
 **Read-boundary routes: `GET`/`HEAD /api/private-record` and `GET`/`HEAD /api/profile`**
-(ordinary markerless reads; **added after the last deployment, not deployed**). See
-[Ordinary read-boundary routes](#ordinary-read-boundary-routes-not-deployed) below.
+(ordinary markerless reads; **added after the deployment recorded before these files were
+published**). See [Ordinary read-boundary routes](#ordinary-read-boundary-routes) below.
 
 None of the routes is a coverage claim. Each one exercises a single synthetic read on this fixture.
 
@@ -129,7 +154,7 @@ authenticated side (failed positive control), or any other record id (`404`), is
 `inconclusive` for `HEAD` in every mode. It is also `inconclusive` when the positive control
 fails (pro identity denied or unauthenticated) or when no `heel-canary-` id is bound.
 
-### Ordinary read-boundary routes (not deployed)
+### Ordinary read-boundary routes
 
 These two routes, with the unchanged `/api/export`, give three distinct ordinary, markerless
 expected rules on allowed reads:
@@ -207,14 +232,20 @@ Expected outcome per mode, derived from the response tables above and the config
 | `patched` | `blocked` (empty `401`) | `blocked` (free `200` profile, leaf withheld) | `blocked` (empty `403`) |
 | `error_envelope` | `inconclusive` (JSON `401`) | `inconclusive` (JSON `403`) | `inconclusive` (JSON `403`) |
 
-Runner side, with the released runner's installed path (shown here as `./heel-rc5/bin/heel`,
-which follows the release the guide names) and `--backend secret-service` instead of
-`keychain` on Linux. Credentials come from the operator's Keychain items (step 1 below) over a
+Runner side, with the released runner's installed path `./heel-rc6/bin/heel`, which the
+guide's one hash-pinned install command creates in an empty private directory (Python 3.11 or
+newer; Apple silicon macOS or Linux x86_64/aarch64):
+
+```sh
+python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e' && ./heel-rc6/bin/heel --version
+```
+
+Use `--backend secret-service` instead of `keychain` on Linux. Credentials come from the operator's Keychain items (step 1 below) over a
 file descriptor, never argv; the value `acct_canary` is typed at the hidden prompt. `HOST` and
 `SVC` are set in [Operator setup](#operator-setup-after-independent-review-only):
 
 ```sh
-H=./heel-rc5/bin/heel                       # used as "$H" below; quoted, so zsh and bash agree
+H=./heel-rc6/bin/heel                       # used as "$H" below; quoted, so zsh and bash agree
 curl -sS -o openapi.json "https://HOST/openapi.json"     # or this directory's openapi.json
 "$H" runner import-openapi openapi.json
 "$H" runner credential add --role lower_plan  --profile bearer --label "staging free" --backend keychain --secret-fd 3 \
@@ -305,10 +336,11 @@ must hold, and must state that they hold:
 5. **Target control**: the operator alone changes `HEEL_TARGET_MODE`, by redeploying. The target
    has no public control endpoint; a reviewer who needs a mode change asks the operator who
    declared control of the target.
-6. **The source version**: the `SOURCE_REVISION` stated by the publisher of these files.
+6. **The source version**: the `SOURCE_REVISION` stated by the publisher of these files (the
+   release notes of the prerelease that carries them).
 
-The current deployment does not include `/api/private-record` or `/api/profile`; a deployment
-from these files does.
+The deployment recorded before these files were published does not include `/api/private-record`
+or `/api/profile`; a deployment from these files does.
 
 ## Operator setup (after independent review only)
 
@@ -418,8 +450,8 @@ in step 2, and its runner credentials.
 ## Expected deployed acceptance (not yet run)
 
 From a clean machine with the released runner, ownership verifies over HTTPS and each runner
-request appears as one receipt. None of the following has been run against a deployment of these
-files.
+request appears as one receipt. When these files were published, none of the following had been
+run against a deployment of them; a later run is evidence only where its own record says so.
 
 - **Configured tests**, the three tests in
   [Configured tests on this fixture](#configured-tests-on-this-fixture): `observed` in

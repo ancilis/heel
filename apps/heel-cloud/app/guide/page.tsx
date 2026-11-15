@@ -148,14 +148,14 @@ export default function Guide() {
               You need Python 3.11 or newer as <code>python3</code> with its <code>venv</code> module, on
               Apple silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview.
               In an empty private directory, the command below installs the public{" "}
-              <a href={RUNNER_RC5_RELEASE_URL}>{RELEASE} release</a> wheel and prints its version. pip
+              <a href={RUNNER_RC6_RELEASE_URL}>{RELEASE} release</a> wheel and prints its version. pip
               refuses the wheel unless its SHA-256 matches. The pinned <code>cryptography</code>{" "}
               dependency comes from your package index and is not hash-pinned by this command. No source
               checkout is needed. Every command below starts with the installed path{" "}
               <code>{CLI}</code>, not a bare <code>heel</code>. Where the dashboard shows a command
               starting with <code>heel</code>, run it with that same path.
             </p>
-            <pre><code>{RUNNER_RC5_INSTALL}</code></pre>
+            <pre><code>{RUNNER_RC6_INSTALL}</code></pre>
             <p>
               The runner keeps its signing key, credentials and expected values only in the operating
               system vault. On macOS that is the Keychain: use <code>--backend keychain</code>. On Linux
@@ -404,6 +404,14 @@ export default function Guide() {
               responses carry <code>&quot;account_id&quot;: &quot;acct_canary&quot;</code>. Each uses
               the success check <code>account_id</code> equals the local value{" "}
               <code>expected_account</code>, entered as text <code>acct_canary</code>.
+            </p>
+            <p>
+              The fixture is a small Cloudflare Worker, distributed separately from the runner package:
+              its four files are the <code>heel-staging-fixture-</code> assets of the{" "}
+              <a href={RUNNER_RC6_RELEASE_URL}>{RELEASE} release</a>, with a manifest of their digests.
+              Its README explains how to download, check and deploy them with no repository checkout.
+              Deploying and changing its mode needs your own authorized Cloudflare account; Heel does
+              not provide one.
             </p>
             <ul>
               <li>
