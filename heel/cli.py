@@ -236,6 +236,7 @@ def _runner_input(args) -> int:
     The value is one JSON scalar (for example ``"abc"``, ``42``, ``true``). It is never
     accepted from argv or the environment and is never printed; output is handles only.
     """
+    from .runner.store import decode_live_input_scalar
     from .runner.vault import select_vault
 
     try:
@@ -256,7 +257,9 @@ def _runner_input(args) -> int:
                     raise ValueError("interactive input requires a TTY")
                 raw = getpass.getpass("Expected value (JSON scalar): ").encode("utf-8")
             try:
-                value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+                # Strict: an inexact, non-finite or out-of-bound token is refused here,
+                # before any handle or metadata record exists.
+                value = decode_live_input_scalar(raw)
             finally:
                 raw = b""
             record = store.create_live_input(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 try:
     import fcntl
@@ -12,6 +13,7 @@ except ImportError:  # pragma: no cover - POSIX capability gate rejects first
 import hashlib
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -54,7 +56,7 @@ from heel.scope import heel_home
 
 from .catalog import CATALOG_BY_ID, NONANONYMOUS_AUTH_PROFILES, SEMANTIC_ROLES
 from .openapi_routes import normalize_route_template
-from .vault import VaultUnavailable
+from .vault import MAX_SECRET_BYTES, VaultUnavailable
 
 
 class UnsupportedSecureStorageError(RuntimeError):
@@ -439,16 +441,53 @@ def _live_input_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def _live_input_value(raw: bytes) -> Any:
+_LIVE_INPUT_MAX_INT_TOKEN_CHARS = 20  # "-9223372036854775807"
+
+
+def _exact_live_input_float(token: str) -> float:
+    """A decimal/exponent token only when the finite float is exactly the written number.
+
+    Refuses any token that a float would round (``1.0000000000000000001``, ``1e-10000``,
+    ``9007199254740993.0``), overflow or underflow; never converts a number to text.
+    """
+    value = float(token)
+    if not math.isfinite(value) or Decimal(token) != Decimal(repr(value)):
+        raise ValueError("inexact number")
+    return value
+
+
+def _bounded_live_input_int(token: str) -> int:
+    if len(token) > _LIVE_INPUT_MAX_INT_TOKEN_CHARS:
+        raise ValueError("integer out of bounds")
+    return int(token)
+
+
+def decode_live_input_scalar(raw: bytes) -> Any:
+    """The one strict decoder for local expected scalars: CLI prompt/fd input and vault bytes.
+
+    Bounded by the inherited-secret cap, scalar-only (no container is parsed, so depth is
+    never reached), and every failure is the same fixed, non-reflecting error.
+    """
     from heel.runner.content_assertion import _MISSING, _fixture_value
 
     try:
-        value = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
-    except (UnicodeDecodeError, ValueError, RecursionError):
+        if type(raw) is not bytes or len(raw) > MAX_SECRET_BYTES:
+            raise ValueError
+        text = raw.decode("utf-8")
+        if text.lstrip(" \t\r\n")[:1] in {"[", "{"}:
+            raise ValueError
+        value = json.loads(
+            text, parse_constant=_reject_constant,
+            parse_float=_exact_live_input_float, parse_int=_bounded_live_input_int,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError, ArithmeticError):
         raise ValueError("local input is invalid") from None
     if type(value) not in {type(None), bool, str, int, float} or _fixture_value(value) is _MISSING:
-        raise ValueError("local input is invalid")
+        raise ValueError("local input is invalid") from None
     return value
+
+
+_live_input_value = decode_live_input_scalar
 
 
 def _reject_constant(_: str) -> Any:
