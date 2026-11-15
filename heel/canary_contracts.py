@@ -742,7 +742,7 @@ def validate_canary_findings(value: Any) -> dict[str, Any]:
 
 def validate_disclosure_permit(value: Any) -> dict[str, Any]:
     obj = _contract(value, 16 * 1024); obj = _object(obj, {"schema_version", "permit_id", "workspace_id", "project_id", "run_id", "grant_id", "runner_binding", "projection", "approved_by", "approved_at_ms", "issued_at_ms", "expires_at_ms", "permit_nonce", "permit_digest", "signing_key_id", "signature_b64"})
-    _enum(obj["schema_version"], {DISCLOSURE_PERMIT_SCHEMA}); _id_fields(obj, ("permit_id", "workspace_id", "project_id", "run_id", "grant_id", "approved_by", "permit_nonce")); binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id"}); _id_fields(binding, ("runner_id", "runner_key_id")); projection = _object(obj["projection"], {"schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"}); _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA}); _hash(projection["projection_digest"]); _integer(projection["maximum_bytes"], lower=1, upper=262144); _integer(projection["scenario_count"], lower=0, upper=4); _integer(projection["finding_count"], lower=0, upper=4); _integer(obj["approved_at_ms"], lower=0); issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
+    _enum(obj["schema_version"], {DISCLOSURE_PERMIT_SCHEMA}); _id_fields(obj, ("permit_id", "workspace_id", "project_id", "run_id", "grant_id", "approved_by", "permit_nonce")); binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id"}); _id_fields(binding, ("runner_id", "runner_key_id")); projection = _object(obj["projection"], {"schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"}); _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA, CONFIGURED_FINDINGS_SCHEMA}); _hash(projection["projection_digest"]); _integer(projection["maximum_bytes"], lower=1, upper=262144); _integer(projection["scenario_count"], lower=0, upper=4); _integer(projection["finding_count"], lower=0, upper=4); _integer(obj["approved_at_ms"], lower=0); issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
     if not issued < expires <= issued + 600000: _fail("invalid permit expiry")
     _signature(obj, "permit_digest"); return copy.deepcopy(obj)
 
@@ -761,7 +761,7 @@ def validate_runner_disclosure_poll_request(value: Any) -> dict[str, Any]:
     obj = _object(obj, {"schema_version", "run_id", "projection"})
     _enum(obj["schema_version"], {RUNNER_DISCLOSURE_POLL_SCHEMA}); _id_fields(obj, ("run_id",))
     projection = _object(obj["projection"], {"schema_version", "projection_digest", "byte_count", "scenario_count", "finding_count"})
-    _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA}); _hash(projection["projection_digest"])
+    _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA, CONFIGURED_FINDINGS_SCHEMA}); _hash(projection["projection_digest"])
     _integer(projection["byte_count"], lower=1, upper=262144)
     scenarios = _integer(projection["scenario_count"], lower=0, upper=4)
     if _integer(projection["finding_count"], lower=0, upper=4) > scenarios: _fail("invalid disclosure counts")
@@ -1384,3 +1384,267 @@ def validate_runner_findings(value: Any) -> dict[str, Any]:
 def findings_results(findings: Mapping[str, Any]) -> list[Any]:
     """The per-test result list of a validated v1 or configured findings projection."""
     return findings["test_results"] if findings["schema_version"] == CONFIGURED_FINDINGS_SCHEMA else findings["scenario_results"]
+
+
+# --- E3: authenticated delivery of configured live-read plans ---------------------------------
+# The browser names workspace-private custom revisions; the control plane freezes their live
+# configuration into a context-bound plan request; the paired runner receives it over its
+# PoP-authenticated claim chain (``configured-plan-sync``), reports bounded readiness for exactly
+# the selected instances, and submits a signed v3 projection bound to the request nonce. These
+# are new closed versions; the v1 plan request/claim/submit records are unchanged.
+CONFIGURED_PLAN_REQUEST_SCHEMA = "heel.configured-plan-request.v1"
+CONFIGURED_PLAN_REQUEST_TTL_MS = 86_400_000
+RUNNER_CONFIGURED_PLAN_SYNC_SCHEMA = "heel.runner-configured-plan-sync.v1"
+RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA = "heel.runner-configured-plan-sync-result.v1"
+RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA = "heel.runner-configured-approval-projection-submit.v1"
+CONFIGURED_CONDITION_REVIEW_SCHEMA = "heel.configured-condition-review.v1"
+CONFIGURED_RUNNER_CAPABILITY = "heel.configured-live-read.v1"
+CONFIGURED_PLAN_KINDS = ("configured_live_read", "configured_regression")
+CONFIGURED_READINESS_KINDS = ("route", "role_credential", "local_input", "frozen_run")
+CONFIGURED_READINESS_STATES = ("ready", "missing", "revoked", "unsupported")
+RUNNER_CONFIGURED_SYNC_MAX_BYTES = 8 * 1024
+RUNNER_CONFIGURED_SUBMIT_MAX_BYTES = 69_632
+_CRUN = re.compile(r"^crun_[0-9a-f]{32}$")
+_CONFIGURED_ROLES = frozenset(role for pair in CONFIGURED_ROLE_ORDER.values() for role in pair)
+_CONFIGURED_SNAPSHOT_FIELDS = {
+    "test_instance_id", "scenario_id", "source", "method", "route_template", "assertion",
+    "assertion_digest", "local_input_refs", "local_input_binding_digest",
+}
+
+
+def _source_ref(value: Any) -> dict[str, Any]:
+    source = _object(value, {"source_scenario_id", "source_revision"})
+    if not isinstance(source["source_scenario_id"], str) or not _SOURCE_SCENARIO_ID.fullmatch(source["source_scenario_id"]):
+        _fail("invalid source scenario")
+    _integer(source["source_revision"], lower=1, upper=10_000)
+    return source
+
+
+def _literal_configured_route(value: Any) -> str:
+    route = _route(value)
+    if "{" in route or "}" in route or len(route.encode("utf-8")) > 512:
+        _fail("configured routes must be literal")
+    return route
+
+
+def _configured_plan_labels(value: Any, instances: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Operator-supplied labels: exactly the two plan roles iff any instance compares plans."""
+    needs = any(item["scenario_id"] == "plan_entitlement_read" for item in instances)
+    labels = _plan_labels(value, minimum=2 if needs else 0)
+    if not needs and labels:
+        _fail("plan labels apply only to plan comparisons")
+    return labels
+
+
+def configured_plan_snapshot_instance(value: Any) -> dict[str, Any]:
+    """One frozen instance as the control plane delivers it: configuration, never values."""
+    from heel.runner.content_assertion import live_read_assertion_digest
+
+    obj = _object(value, _CONFIGURED_SNAPSHOT_FIELDS)
+    if not isinstance(obj["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(obj["test_instance_id"]):
+        _fail("invalid test instance ID")
+    _enum(obj["scenario_id"], set(CONFIGURED_ROLE_ORDER)); _source_ref(obj["source"])
+    _method(obj["method"]); _literal_configured_route(obj["route_template"])
+    assertion = _configured_assertion(obj["assertion"])
+    if obj["assertion_digest"] != live_read_assertion_digest(assertion):
+        _fail("configured assertion digest mismatch")
+    if obj["local_input_refs"] != configured_assertion_refs(obj["assertion"]):
+        _fail("local input references do not match the assertion")
+    if obj["local_input_binding_digest"] is not None:
+        _hash(obj["local_input_binding_digest"])
+    return obj
+
+
+def _snapshot_instances(value: Any) -> list[dict[str, Any]]:
+    entries = _list(value, maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries:
+        _fail("at least one configured test instance is required")
+    instances = [configured_plan_snapshot_instance(item) for item in entries]
+    if len({item["test_instance_id"] for item in instances}) != len(instances):
+        _fail("duplicate test instance")
+    return instances
+
+
+def validate_configured_plan_request(value: Any) -> dict[str, Any]:
+    """The browser's selection: private revisions (live) or one saved instance (regression)."""
+    obj = _contract(value, 2 * 1024); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    kind = obj.get("plan_kind") if isinstance(obj, Mapping) else None
+    if kind == "configured_regression":
+        obj = _object(obj, {"schema_version", "plan_kind", "source_run_id", "test_instance_id"})
+        if not isinstance(obj["source_run_id"], str) or not _CRUN.fullmatch(obj["source_run_id"]):
+            _fail("invalid source run")
+        if not isinstance(obj["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(obj["test_instance_id"]):
+            _fail("invalid test instance ID")
+    else:
+        obj = _object(obj, {"schema_version", "plan_kind", "tests", "plan_labels"})
+        _enum(obj["plan_kind"], {"configured_live_read"})
+        tests = _list(obj["tests"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+        if not tests:
+            _fail("select at least one configured test")
+        seen = set()
+        for item in tests:
+            item = _source_ref(item)
+            key = (item["source_scenario_id"], item["source_revision"])
+            if key in seen:
+                _fail("duplicate configured test")
+            seen.add(key)
+        _plan_labels(obj["plan_labels"], minimum=0)
+    _enum(obj["schema_version"], {CONFIGURED_PLAN_REQUEST_SCHEMA})
+    return copy.deepcopy(obj)
+
+
+def configured_plan_snapshot(value: Any) -> dict[str, Any]:
+    """The exact frozen request a bound runner receives (``request`` of a sync result)."""
+    obj = _object(value, {
+        "plan_request_id", "plan_request_nonce", "plan_kind", "instances", "plan_labels",
+        "source_run_id", "expires_at_ms",
+    })
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    kind = _enum(obj["plan_kind"], set(CONFIGURED_PLAN_KINDS))
+    instances = _snapshot_instances(obj["instances"])
+    _configured_plan_labels(obj["plan_labels"], instances)
+    if kind == "configured_regression":
+        if len(instances) != 1 or instances[0]["local_input_binding_digest"] is None:
+            _fail("a regression replays exactly one frozen instance")
+        if not isinstance(obj["source_run_id"], str) or not _CRUN.fullmatch(obj["source_run_id"]):
+            _fail("invalid source run")
+    elif obj["source_run_id"] is not None or any(item["local_input_binding_digest"] is not None for item in instances):
+        _fail("a live plan freezes no handles before the runner compiles it")
+    _integer(obj["expires_at_ms"], lower=1)
+    return obj
+
+
+def _readiness(value: Any) -> dict[str, Any]:
+    obj = _object(value, {"plan_request_id", "plan_request_nonce", "instances"})
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    entries = _list(obj["instances"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries:
+        _fail("readiness must cover the selected instances")
+    seen = set()
+    for entry in entries:
+        entry = _object(entry, {"test_instance_id", "requirements"})
+        if not isinstance(entry["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(entry["test_instance_id"]):
+            _fail("invalid test instance ID")
+        if entry["test_instance_id"] in seen:
+            _fail("duplicate readiness instance")
+        seen.add(entry["test_instance_id"])
+        requirements = _list(entry["requirements"], maximum=8)
+        if not requirements:
+            _fail("readiness requires at least one requirement")
+        keys = []
+        for item in requirements:
+            item = _object(item, {"kind", "subject", "state"})
+            kind = _enum(item["kind"], set(CONFIGURED_READINESS_KINDS))
+            state = _enum(item["state"], set(CONFIGURED_READINESS_STATES))
+            subject = item["subject"]
+            if kind == "role_credential":
+                _enum(subject, set(_CONFIGURED_ROLES))
+                if state not in {"ready", "missing"}: _fail("invalid readiness state")
+            elif kind == "local_input":
+                if not isinstance(subject, str) or not _FIXTURE_REF.fullmatch(subject): _fail("invalid local input reference")
+                if state == "unsupported": _fail("invalid readiness state")
+            else:
+                if subject is not None: _fail("readiness subject is not applicable")
+                if kind == "frozen_run" and state not in {"ready", "missing"}: _fail("invalid readiness state")
+                if kind == "route" and state == "revoked": _fail("invalid readiness state")
+            keys.append((kind, subject or ""))
+        if keys != sorted(set(keys)):
+            _fail("readiness requirements must be sorted and unique")
+    return obj
+
+
+def validate_runner_configured_plan_sync(value: Any) -> dict[str, Any]:
+    obj = _contract(value, RUNNER_CONFIGURED_SYNC_MAX_BYTES); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "binding_id", "binding_digest", "capability", "readiness"})
+    _enum(obj["schema_version"], {RUNNER_CONFIGURED_PLAN_SYNC_SCHEMA})
+    if not isinstance(obj["binding_id"], str) or not _CONTEXT_BINDING_ID.fullmatch(obj["binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["binding_digest"]); _enum(obj["capability"], {CONFIGURED_RUNNER_CAPABILITY})
+    if obj["readiness"] is not None:
+        _readiness(obj["readiness"])
+    return copy.deepcopy(obj)
+
+
+def validate_runner_configured_plan_sync_result(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 64 * 1024)
+    obj = _object(obj, {"schema_version", "server_time_ms", "request"})
+    _enum(obj["schema_version"], {RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA}); _integer(obj["server_time_ms"])
+    if obj["request"] is not None:
+        configured_plan_snapshot(obj["request"])
+    return copy.deepcopy(obj)
+
+
+def validate_runner_configured_projection_submit(value: Any) -> dict[str, Any]:
+    obj = _contract(value, RUNNER_CONFIGURED_SUBMIT_MAX_BYTES)
+    obj = _object(obj, {
+        "schema_version", "context_binding_id", "context_binding_digest", "plan_request_id",
+        "plan_request_nonce", "approval_projection",
+    })
+    _enum(obj["schema_version"], {RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA})
+    if not isinstance(obj["context_binding_id"], str) or not _CONTEXT_BINDING_ID.fullmatch(obj["context_binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["context_binding_digest"])
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    obj["approval_projection"] = validate_configured_approval_projection(obj["approval_projection"])
+    if len(canonical_bytes(obj["approval_projection"])) > 65536:
+        _fail("approval projection exceeds size limit")
+    return copy.deepcopy(obj)
+
+
+def validate_runner_projection_submission(value: Any) -> dict[str, Any]:
+    """Exactly the v1 submit envelope or exactly the configured one; nothing else."""
+    if _schema_of(value) == RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA:
+        return validate_runner_configured_projection_submit(value)
+    return validate_runner_approval_projection_submit(value)
+
+
+def configured_condition_review(projection: Mapping[str, Any], plan_labels: list[Any]) -> dict[str, Any]:
+    """The exact acknowledgement an approver's client must echo for one v3 projection.
+
+    It restates every frozen condition, route, role pair, source revision and the request
+    budget, so a client that cannot display them cannot construct it from a digest alone.
+    """
+    projection = validate_configured_approval_projection(projection)
+    return {
+        "schema_version": CONFIGURED_CONDITION_REVIEW_SCHEMA,
+        "plan_labels": copy.deepcopy(list(plan_labels)),
+        "maximum_requests": projection["budgets"]["maximum_requests"],
+        "instances": [{
+            "test_instance_id": item["test_instance_id"],
+            "source": copy.deepcopy(item["source"]),
+            "scenario_id": item["scenario_id"],
+            "method": item["method"],
+            "route_template": item["route_template"],
+            "roles": list(CONFIGURED_ROLE_ORDER[item["scenario_id"]]),
+            "request_count": 2,
+            "assertion": copy.deepcopy(item["assertion"]),
+            "local_input_refs": list(item["local_input_refs"]),
+        } for item in projection["test_instances"]],
+    }
+
+
+def validate_configured_condition_review(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 16 * 1024)
+    obj = _object(obj, {"schema_version", "plan_labels", "maximum_requests", "instances"})
+    _enum(obj["schema_version"], {CONFIGURED_CONDITION_REVIEW_SCHEMA})
+    _plan_labels(obj["plan_labels"], minimum=0); _integer(obj["maximum_requests"], lower=1, upper=20)
+    entries = _list(obj["instances"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries:
+        _fail("review must restate every configured instance")
+    for entry in entries:
+        entry = _object(entry, {
+            "test_instance_id", "source", "scenario_id", "method", "route_template", "roles",
+            "request_count", "assertion", "local_input_refs",
+        })
+        _source_ref(entry["source"]); _enum(entry["scenario_id"], set(CONFIGURED_ROLE_ORDER))
+        _configured_assertion(entry["assertion"])
+    return copy.deepcopy(obj)

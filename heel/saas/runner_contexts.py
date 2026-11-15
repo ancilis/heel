@@ -6,6 +6,7 @@ grant, claim a run, or authorize target traffic.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import secrets
@@ -16,6 +17,16 @@ from typing import Callable
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import (
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_PLAN_REQUEST_TTL_MS,
+    RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA,
+    configured_assertion_refs,
+    configured_plan_snapshot,
+    configured_plan_snapshot_instance,
+    validate_configured_plan_request,
+    validate_runner_approval_projection,
+    validate_runner_configured_plan_sync,
+    validate_runner_configured_plan_sync_result,
     RUNNER_PLAN_REQUEST_SCHEMA,
     ContractError,
     canonical_bytes,
@@ -32,6 +43,7 @@ from heel.canary_contracts import (
 from heel.crypto import load_public_key_base64
 
 from .canary_runs import DiscoveryError
+from .scenario_library import ScenarioLibraryError, ensure_configured_live_test_schema, resolve_custom_live_test
 
 
 CONTEXT_DOMAIN = b"heel.runner-context-binding.v1\0"
@@ -1088,4 +1100,321 @@ class RunnerContextBindingService:
             "max_ops": row["max_ops"], "inventory_digest": row["inventory_digest"],
             "selection_digest": row["selection_digest"], "routes": json.loads(row["routes_json"]),
             "expires_at_ms": row["expires_at_ms"],
+        })
+
+
+# --- E3: configured live-read plan requests (browser selection -> paired runner) -------------
+
+class ConfiguredPlanService:
+    """Freeze workspace-private live tests into one context-bound request a runner can claim.
+
+    The browser names exact custom revisions (or one saved configured instance to replay); this
+    service resolves them inside the authenticated workspace, generates fresh instance IDs and a
+    single-use nonce, and stores the immutable snapshot. Only the bound runner receives it, over
+    its PoP claim chain; readiness it reports is bounded to the snapshot's own requirements.
+    Nothing here reserves quota, issues a grant or authorizes target traffic.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, *, signing, clock: Callable[[], float] = time.time):
+        self.conn = conn
+        self.conn.row_factory = sqlite3.Row
+        self.contexts = RunnerContextBindingService(conn, signing=signing, clock=clock)
+        self.clock = clock
+
+    def _now_ms(self) -> int:
+        return max(0, int(float(self.clock()) * 1000))
+
+    def _expire_in_transaction(self, now: int, *, workspace_id: str, binding_id: str | None = None) -> None:
+        if binding_id is None:
+            self.conn.execute(
+                "UPDATE canary_configured_plan_requests SET status='expired' WHERE workspace_id=? "
+                "AND status='open' AND expires_at_ms<=?",
+                (workspace_id, now),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE canary_configured_plan_requests SET status='expired' WHERE workspace_id=? AND rcb_id=? "
+                "AND status='open' AND expires_at_ms<=?",
+                (workspace_id, binding_id, now),
+            )
+
+    @staticmethod
+    def _snapshot_instance(live: dict, source_scenario_id: str, revision: int) -> dict:
+        from heel.runner.compiler import new_test_instance_id
+        from heel.runner.content_assertion import live_read_assertion_digest, validate_live_read_assertion
+
+        assertion = validate_live_read_assertion(live["assertion"])
+        return configured_plan_snapshot_instance({
+            "test_instance_id": new_test_instance_id(),
+            "scenario_id": live["scenario_id"],
+            "source": {"source_scenario_id": source_scenario_id, "source_revision": revision},
+            "method": live["method"],
+            "route_template": live["route_template"],
+            "assertion": assertion.to_json(),
+            "assertion_digest": live_read_assertion_digest(assertion),
+            "local_input_refs": configured_assertion_refs(assertion.to_json()),
+            "local_input_binding_digest": None,
+        })
+
+    def _regression_snapshot(self, workspace_id: str, project_id: str, binding: sqlite3.Row,
+                             source_run_id: str, test_instance_id: str) -> tuple[list[dict], list]:
+        row = self.conn.execute(
+            "SELECT a.projection_json,a.runner_id,r.status AS run_status FROM canary_approval_projections a "
+            "JOIN canary_runs r ON r.workspace_id=a.workspace_id AND r.project_ref=a.project_ref AND r.run_id=a.run_id "
+            "WHERE a.workspace_id=? AND a.project_ref=? AND a.run_id=?",
+            (workspace_id, project_id, source_run_id),
+        ).fetchone()
+        if row is None or row["projection_json"] is None:
+            raise DiscoveryError("configured_source_run_unavailable")
+        try:
+            projection = validate_runner_approval_projection(json.loads(row["projection_json"]))
+        except (ContractError, TypeError, ValueError):
+            raise DiscoveryError("configured_source_run_unavailable") from None
+        if (projection["schema_version"] != CONFIGURED_APPROVAL_PROJECTION_SCHEMA
+                or row["run_status"] != "terminal" or row["runner_id"] != binding["runner_id"]):
+            # Frozen local input handles exist only on the runner that executed the original run.
+            raise DiscoveryError("configured_source_run_unavailable")
+        matches = [item for item in projection["test_instances"] if item["test_instance_id"] == test_instance_id]
+        if len(matches) != 1:
+            raise DiscoveryError("configured_source_run_unavailable")
+        frozen = matches[0]
+        instance = configured_plan_snapshot_instance({
+            "test_instance_id": frozen["test_instance_id"],
+            "scenario_id": frozen["scenario_id"],
+            "source": copy.deepcopy(frozen["source"]),
+            "method": frozen["method"],
+            "route_template": frozen["route_template"],
+            "assertion": copy.deepcopy(frozen["assertion"]),
+            "assertion_digest": frozen["assertion_digest"],
+            "local_input_refs": list(frozen["local_input_refs"]),
+            "local_input_binding_digest": frozen["local_input_binding_digest"],
+        })
+        origin = self.conn.execute(
+            "SELECT snapshot_json FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? AND run_id=?",
+            (workspace_id, project_id, source_run_id),
+        ).fetchone()
+        labels = []
+        if origin is not None:
+            labels = json.loads(origin["snapshot_json"])["plan_labels"]
+        if frozen["scenario_id"] != "plan_entitlement_read":
+            labels = []
+        if frozen["scenario_id"] == "plan_entitlement_read" and len(labels) != 2:
+            raise DiscoveryError("configured_source_run_unavailable")
+        return [instance], labels
+
+    def create(self, workspace_id: str, project_id: str, binding_id: str, request: object, *,
+               actor: object, role: object) -> dict:
+        actor, role = self.contexts._require_actor(actor, role)
+        try:
+            request = validate_configured_plan_request(request)
+        except (ContractError, TypeError, ValueError):
+            raise DiscoveryError("invalid_configured_plan_request") from None
+        ensure_configured_live_test_schema(self.conn)
+        now = self._now_ms()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.contexts._assert_membership(workspace_id, actor, role)
+            binding = self.conn.execute(
+                "SELECT * FROM canary_runner_context_bindings WHERE workspace_id=? AND project_ref=? AND rcb_id=? "
+                "AND status='active' AND expires_at_ms>?",
+                (workspace_id, project_id, binding_id, now),
+            ).fetchone()
+            if binding is None:
+                raise DiscoveryError("runner_context_binding_not_found")
+            self._expire_in_transaction(now, workspace_id=workspace_id, binding_id=binding_id)
+            if self.conn.execute(
+                "SELECT 1 FROM canary_configured_plan_requests WHERE workspace_id=? AND rcb_id=? AND status='open'",
+                (workspace_id, binding_id),
+            ).fetchone() is not None:
+                raise DiscoveryError("plan_request_open")
+            if request["plan_kind"] == "configured_regression":
+                instances, labels = self._regression_snapshot(
+                    workspace_id, project_id, binding, request["source_run_id"], request["test_instance_id"],
+                )
+                source_run_id = request["source_run_id"]
+            else:
+                instances = []
+                for item in request["tests"]:
+                    try:
+                        live = resolve_custom_live_test(
+                            self.conn, workspace_id, item["source_scenario_id"], item["source_revision"],
+                        )
+                    except ScenarioLibraryError as error:
+                        raise DiscoveryError(
+                            "live_test_not_configured" if error.code == "live_test_not_configured"
+                            else "custom_revision_not_found"
+                        ) from None
+                    instances.append(self._snapshot_instance(live, item["source_scenario_id"], item["source_revision"]))
+                labels = request["plan_labels"]
+                source_run_id = None
+            plan_request_id = "cpr_" + secrets.token_hex(16)
+            nonce = secrets.token_urlsafe(32)
+            snapshot = {
+                "plan_request_id": plan_request_id, "plan_request_nonce": nonce,
+                "plan_kind": request["plan_kind"], "instances": instances, "plan_labels": labels,
+                "source_run_id": source_run_id, "expires_at_ms": now + CONFIGURED_PLAN_REQUEST_TTL_MS,
+            }
+            try:
+                snapshot = configured_plan_snapshot(snapshot)
+            except (ContractError, TypeError, ValueError):
+                raise DiscoveryError("plan_labels_required") from None
+            stored = {key: value for key, value in snapshot.items() if key not in {"plan_request_id", "plan_request_nonce", "expires_at_ms"}}
+            self.conn.execute(
+                "INSERT INTO canary_configured_plan_requests(plan_request_id,workspace_id,project_ref,environment_id,"
+                "rcb_id,binding_digest,runner_id,runner_key_id,plan_kind,plan_request_nonce,snapshot_json,snapshot_digest,"
+                "status,created_by,created_at_ms,expires_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)",
+                (
+                    plan_request_id, workspace_id, project_id, binding["environment_id"], binding_id,
+                    binding["binding_digest"], binding["runner_id"], binding["runner_key_id"], request["plan_kind"],
+                    nonce, canonical_bytes(stored).decode(), canonical_digest(stored), actor, now,
+                    now + CONFIGURED_PLAN_REQUEST_TTL_MS,
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO admin_audit(actor,action,subject,reason,ts) VALUES(?,?,?,?,?)",
+                (actor, "configured_plan_requested", f"{workspace_id}:{project_id}:{plan_request_id}",
+                 f"froze {len(instances)} configured live test instance(s) for one runner context",
+                 now / 1000),
+            )
+            self.conn.commit()
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        return self.view(workspace_id, project_id, plan_request_id, actor=actor)
+
+    def _member(self, workspace_id: str, project_id: str, actor: object) -> None:
+        if type(actor) is not str or not actor:
+            raise DiscoveryError("configured_request_not_found")
+        if self.conn.execute(
+            "SELECT 1 FROM memberships WHERE workspace_id=? AND user_id=?", (workspace_id, actor),
+        ).fetchone() is None or self.conn.execute(
+            "SELECT 1 FROM projects WHERE workspace_id=? AND project_ref=?", (workspace_id, project_id),
+        ).fetchone() is None:
+            raise DiscoveryError("configured_request_not_found")
+
+    @staticmethod
+    def _row_view(row: sqlite3.Row) -> dict:
+        snapshot = json.loads(row["snapshot_json"])
+        if canonical_digest(snapshot) != row["snapshot_digest"]:
+            raise DiscoveryError("discovery_unavailable")
+        readiness = None
+        if row["readiness_json"] is not None:
+            readiness = {"reported_at_ms": row["readiness_at_ms"], **json.loads(row["readiness_json"])}
+        return {
+            "schema_version": "heel.configured-plan-request-view.v1",
+            "plan_request_id": row["plan_request_id"], "binding_id": row["rcb_id"],
+            "environment_id": row["environment_id"], "runner_id": row["runner_id"],
+            "plan_kind": row["plan_kind"], "status": row["status"],
+            "instances": snapshot["instances"], "plan_labels": snapshot["plan_labels"],
+            "source_run_id": snapshot["source_run_id"],
+            "created_at_ms": row["created_at_ms"], "expires_at_ms": row["expires_at_ms"],
+            "runner_seen_at_ms": row["last_runner_sync_at_ms"], "readiness": readiness,
+            "approval_id": row["approval_id"], "run_id": row["run_id"],
+            "projection_digest": row["projection_digest"],
+        }
+
+    def view(self, workspace_id: str, project_id: str, plan_request_id: str, *, actor: object) -> dict:
+        ensure_configured_live_test_schema(self.conn)
+        self._member(workspace_id, project_id, actor)
+        self._expire_in_transaction(self._now_ms(), workspace_id=workspace_id)
+        if self.conn.in_transaction:
+            self.conn.commit()
+        row = self.conn.execute(
+            "SELECT * FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? AND plan_request_id=?",
+            (workspace_id, project_id, plan_request_id),
+        ).fetchone()
+        if row is None:
+            raise DiscoveryError("configured_request_not_found")
+        return self._row_view(row)
+
+    def list_recent(self, workspace_id: str, project_id: str, *, actor: object) -> dict:
+        ensure_configured_live_test_schema(self.conn)
+        self._member(workspace_id, project_id, actor)
+        now = self._now_ms()
+        self._expire_in_transaction(now, workspace_id=workspace_id)
+        if self.conn.in_transaction:
+            self.conn.commit()
+        rows = self.conn.execute(
+            "SELECT * FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? "
+            "ORDER BY created_at_ms DESC, plan_request_id LIMIT 8",
+            (workspace_id, project_id),
+        ).fetchall()
+        return {
+            "schema_version": "heel.configured-plan-request-list.v1", "server_time_ms": now,
+            "requests": [self._row_view(row) for row in rows],
+        }
+
+    def cancel(self, workspace_id: str, project_id: str, plan_request_id: str, *, actor: object, role: object) -> dict:
+        actor, role = self.contexts._require_actor(actor, role)
+        ensure_configured_live_test_schema(self.conn)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.contexts._assert_membership(workspace_id, actor, role)
+            changed = self.conn.execute(
+                "UPDATE canary_configured_plan_requests SET status='cancelled' WHERE workspace_id=? AND project_ref=? "
+                "AND plan_request_id=? AND status='open'",
+                (workspace_id, project_id, plan_request_id),
+            )
+            if changed.rowcount != 1:
+                raise DiscoveryError("configured_request_closed")
+            self.conn.commit()
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        return self.view(workspace_id, project_id, plan_request_id, actor=actor)
+
+    def sync_in_transaction(self, workspace_id: str, runner_id: str, runner_key_id: str,
+                            binding_id: str, request: object) -> dict:
+        """Deliver the open snapshot to its exact bound runner; record bounded readiness."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("configured plan sync requires caller transaction")
+        try:
+            request = validate_runner_configured_plan_sync(request)
+        except (ContractError, TypeError, ValueError):
+            raise RunnerContextError("invalid_runner_context_binding") from None
+        if request["binding_id"] != binding_id:
+            raise RunnerContextError("invalid_runner_context_binding")
+        binding = self.contexts.active_binding_for_projection_in_transaction(
+            workspace_id, runner_id, runner_key_id, binding_id, request["binding_digest"],
+        )
+        now = self._now_ms()
+        self._expire_in_transaction(now, workspace_id=workspace_id, binding_id=binding_id)
+        row = self.conn.execute(
+            "SELECT * FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? AND rcb_id=? "
+            "AND binding_digest=? AND runner_id=? AND runner_key_id=? AND status='open'",
+            (workspace_id, binding["project_ref"], binding_id, binding["binding_digest"], runner_id, runner_key_id),
+        ).fetchone()
+        if row is None:
+            return validate_runner_configured_plan_sync_result({
+                "schema_version": RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA, "server_time_ms": now, "request": None,
+            })
+        stored = json.loads(row["snapshot_json"])
+        if canonical_digest(stored) != row["snapshot_digest"]:
+            raise RunnerContextError("invalid_runner_context_binding")
+        readiness = request["readiness"]
+        readiness_json = row["readiness_json"]
+        readiness_at = row["readiness_at_ms"]
+        if readiness is not None:
+            expected = [item["test_instance_id"] for item in stored["instances"]]
+            if (readiness["plan_request_id"] != row["plan_request_id"]
+                    or readiness["plan_request_nonce"] != row["plan_request_nonce"]
+                    or [item["test_instance_id"] for item in readiness["instances"]] != expected):
+                raise RunnerContextError("invalid_runner_context_binding")
+            readiness_json = canonical_bytes({"instances": readiness["instances"]}).decode()
+            readiness_at = now
+        self.conn.execute(
+            "UPDATE canary_configured_plan_requests SET last_runner_sync_at_ms=?,readiness_json=?,readiness_at_ms=? "
+            "WHERE plan_request_id=? AND status='open'",
+            (now, readiness_json, readiness_at, row["plan_request_id"]),
+        )
+        return validate_runner_configured_plan_sync_result({
+            "schema_version": RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA, "server_time_ms": now,
+            "request": {
+                "plan_request_id": row["plan_request_id"], "plan_request_nonce": row["plan_request_nonce"],
+                "plan_kind": row["plan_kind"], "instances": stored["instances"],
+                "plan_labels": stored["plan_labels"], "source_run_id": stored["source_run_id"],
+                "expires_at_ms": row["expires_at_ms"],
+            },
         })

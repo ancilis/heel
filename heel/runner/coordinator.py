@@ -11,11 +11,14 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from heel.canary_contracts import (
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_ROLE_ORDER,
     DISCLOSURE_PERMIT_SCHEMA,
     OPERATIONAL_RUN_SCHEMA,
     canonical_bytes,
     canonical_digest,
     validate_canary_findings,
+    validate_runner_findings,
     validate_disclosure_permit,
     validate_operational_run,
 )
@@ -35,6 +38,7 @@ from heel.runner.execution import (
     _gate_failure,
     validate_execution_bundle,
 )
+from heel.runner.compiler import CanaryCompiler
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
 from heel.runner.store import RunReservationProbe, RunnerContext, RunnerStore, RunnerStoreError
@@ -729,6 +733,11 @@ class RunnerCoordinator:
             manifest, projection = self.store.load_approved_pair(pending["projection_id"])
         except (RunnerStoreError, ValueError):
             manifest = projection = None
+        if projection is not None and projection.get("schema_version") == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+            # A configured plan is admitted only with its browser request's nonce, which the
+            # configured step submits; the legacy queue never sends it.
+            self.store.settle_projection_submission(pending, state="refused", reason="projection_unavailable")
+            return None
         if (
             projection is None or projection["projection_digest"] != pending["projection_digest"]
             or manifest["manifest_digest"] != pending["manifest_digest"]
@@ -746,6 +755,150 @@ class RunnerCoordinator:
             run_id=submitted["run_id"], status=submitted["status"],
         )
         return submitted
+
+    # --- E3: configured live-read plans requested in the browser --------------------------
+
+    def _configured_readiness(self, request: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Bounded requirement states for exactly this request's instances; never values.
+
+        Only the selected tests' route, non-anonymous roles and named local inputs (or, for a
+        replay, the frozen run and its frozen handles) are examined. Nothing unrelated to the
+        request, and no vault content, is read or reported.
+        """
+        routes = {(item["method"], item["route_template"]) for item in self.store.list_routes()}
+        credentials = {
+            item["semantic_role"] for item in self.store.list_credentials()
+            if item["state"] == "active" and item["backend"] in {"macos_keychain", "linux_secret_service"}
+        }
+        inputs = self.store.list_live_inputs()
+        frozen_handles: dict[str, list[str]] | None = None
+        if request["plan_kind"] == "configured_regression":
+            frozen_handles = {}
+            from heel.runner.regressions import SavedRegressionError, _verified_terminal_run
+
+            try:
+                manifest = _verified_terminal_run(self.store, request["source_run_id"])["manifest"]
+            except (RunnerStoreError, SavedRegressionError, ValueError, KeyError, TypeError):
+                manifest = None
+            if isinstance(manifest, Mapping) and manifest.get("schema_version") == "heel.test-manifest.v2":
+                for instance in manifest["test_instances"]:
+                    frozen_handles[instance["test_instance_id"]] = [
+                        item["input_handle_id"] for item in instance["local_inputs"]
+                    ]
+        report = []
+        for instance in request["instances"]:
+            requirements: list[dict[str, Any]] = []
+            route = (instance["method"], instance["route_template"])
+            requirements.append({
+                "kind": "route", "subject": None,
+                "state": "unsupported" if "{" in instance["route_template"] else
+                ("ready" if route in routes else "missing"),
+            })
+            for role in CONFIGURED_ROLE_ORDER[instance["scenario_id"]]:
+                if role != "anonymous":
+                    requirements.append({
+                        "kind": "role_credential", "subject": role,
+                        "state": "ready" if role in credentials else "missing",
+                    })
+            if frozen_handles is not None:
+                handles = frozen_handles.get(instance["test_instance_id"])
+                requirements.append({
+                    "kind": "frozen_run", "subject": None,
+                    "state": "ready" if handles is not None else "missing",
+                })
+                by_handle = {item["input_handle_id"]: item for item in inputs}
+                for ref, handle in zip(instance["local_input_refs"], handles or []):
+                    record = by_handle.get(handle)
+                    requirements.append({
+                        "kind": "local_input", "subject": ref,
+                        "state": "ready" if record is not None and record["state"] == "active"
+                        else ("revoked" if record is not None else "missing"),
+                    })
+            else:
+                for ref in instance["local_input_refs"]:
+                    named = [item for item in inputs if item["name"] == ref]
+                    current = [item for item in named if item["selection"] == "current" and item["state"] == "active"]
+                    requirements.append({
+                        "kind": "local_input", "subject": ref,
+                        "state": "ready" if len(current) == 1 else ("revoked" if named else "missing"),
+                    })
+            requirements.sort(key=lambda item: (item["kind"], item["subject"] or ""))
+            report.append({"test_instance_id": instance["test_instance_id"], "requirements": requirements})
+        return report
+
+    def process_configured_plan(self) -> dict[str, Any] | None:
+        """One idle step: fetch the bound context's open configured request, then either
+        report what is missing for exactly those tests or compile and submit the signed plan.
+
+        The projection is admitted only with the request's single-use nonce; it creates an
+        awaiting-approval record and nothing else. No target request happens here.
+        """
+        try:
+            binding = self.store.verify_cloud_context_binding(
+                identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+            )
+        except RunnerStoreError:
+            return None  # a static local context has no browser-requested plans
+        synced = self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], None)
+        request = synced["request"]
+        if request is None:
+            return None
+        readiness = self._configured_readiness(request)
+        ready = all(item["state"] == "ready" for entry in readiness for item in entry["requirements"])
+        if not ready:
+            self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], {
+                "plan_request_id": request["plan_request_id"],
+                "plan_request_nonce": request["plan_request_nonce"],
+                "instances": readiness,
+            })
+            return {"plan_request_id": request["plan_request_id"], "state": "setup_required"}
+        # Report readiness first so the browser shows the exact checked state even if the
+        # submission below is refused.
+        self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], {
+            "plan_request_id": request["plan_request_id"],
+            "plan_request_nonce": request["plan_request_nonce"],
+            "instances": readiness,
+        })
+        compiler = CanaryCompiler(
+            store=self.store, identity=self.identity, signer=self.signer, now_ms=self._now_ms(),
+        )
+        queued = None
+        if request["plan_kind"] == "configured_regression":
+            instance = request["instances"][0]
+            regression, _created = self.store.add_saved_regression(
+                run_id=request["source_run_id"], test_instance_id=instance["test_instance_id"],
+                name=f"replay {instance['source']['source_scenario_id']} r{instance['source']['source_revision']}"[:64],
+                now_ms=self._now_ms(),
+            )
+            result = compiler.compile_configured_replay(regression)
+            queued, _replay = self.store.queue_regression_replay(
+                regression["regression_id"], result.projection["projection_id"],
+                binding_digest=binding["binding_digest"], now_ms=self._now_ms(),
+            )
+        else:
+            result = compiler.compile_configured([{
+                "test_instance_id": item["test_instance_id"],
+                "scenario_id": item["scenario_id"],
+                "source_scenario_id": item["source"]["source_scenario_id"],
+                "source_revision": item["source"]["source_revision"],
+                "method": item["method"],
+                "route_template": item["route_template"],
+                "assertion": item["assertion"],
+                "local_inputs": {ref: ref for ref in item["local_input_refs"]},
+            } for item in request["instances"]])
+        submitted = self.control.submit_configured_projection(
+            binding["binding_id"], binding["binding_digest"], request["plan_request_id"],
+            request["plan_request_nonce"], result.projection,
+        )
+        if (submitted.get("approval_id") != result.projection["projection_id"]
+                or submitted.get("projection_digest") != result.projection["projection_digest"]):
+            raise ValueError("configured submission answer does not match the compiled plan")
+        if queued is not None:
+            self.store.settle_projection_submission(
+                queued, state="submitted", approval_id=submitted["approval_id"],
+                run_id=submitted["run_id"], status=submitted["status"],
+            )
+        return {"plan_request_id": request["plan_request_id"], "state": "submitted", "run_id": submitted["run_id"]}
 
     def _claimed_projection(
         self, manifest: dict[str, Any], projection: dict[str, Any], grant: dict[str, Any],
@@ -775,7 +928,7 @@ class RunnerCoordinator:
                 "runner_version": self.identity.runner_version,
                 "engine_version": manifest["compiler"]["engine_version"],
                 "adapter_versions": sorted({
-                    item["adapter_version"] for item in manifest["scenarios"]
+                    item["adapter_version"] for item in manifest.get("test_instances", manifest.get("scenarios", []))
                 }),
             },
             "error_category": "none", "stop_reason": "none",
@@ -964,7 +1117,7 @@ class RunnerCoordinator:
             raise ValueError("active runner claim is required")
         try:
             permit_value = validate_disclosure_permit(permit)
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
         except (TypeError, ValueError):
             raise ValueError("invalid runner findings upload") from None
         unsigned = {
@@ -1018,7 +1171,7 @@ class RunnerCoordinator:
         """The exact store-verified local findings projection ``heel runner findings`` prints."""
         try:
             finals = self.store.load_final_projections(run_id)
-            return validate_canary_findings(finals["local_view"]["findings_projection"])
+            return validate_runner_findings(finals["local_view"]["findings_projection"])
         except (RunnerStoreError, KeyError, TypeError, ValueError) as exc:
             raise ValueError("local findings projection is unavailable") from exc
 
@@ -1047,7 +1200,7 @@ class RunnerCoordinator:
         if type(run_id) is not str or not run_id:
             raise ValueError("active runner claim is required")
         try:
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
             runtime_terminal = self.control.runtime.load_terminal_state(run_id)
             if runtime_terminal is None:
                 raise RunnerStoreError("local terminal disclosure authority is unavailable")

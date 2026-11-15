@@ -35,7 +35,7 @@ class CanaryMigrationTests(unittest.TestCase):
 
     def test_current_migrations_create_tenant_bound_unique_tables(self):
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-14:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-16:]],
             [
                 (21, "runner_context_affinity_guards"),
                 (22, "pending_approval_live_seek"),
@@ -51,6 +51,8 @@ class CanaryMigrationTests(unittest.TestCase):
                 (32, "stop_ack_signed_witness"),
                 (33, "inactive_claim_attestation_audit"),
                 (34, "scenario_library_and_run_bindings"),
+                (35, "configured_live_tests_and_plan_requests"),
+                (36, "configured_findings_disclosure"),
             ],
         )
         tables = (
@@ -72,7 +74,7 @@ class CanaryMigrationTests(unittest.TestCase):
     def test_migrations_twenty_three_to_twenty_five_add_purge_and_runner_receipts(self):
         """The direct/runtime schema target includes the append-only v23-v25 additions."""
         self.assertEqual(
-            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-14:]],
+            [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-16:]],
             [
                 (21, "runner_context_affinity_guards"),
                 (22, "pending_approval_live_seek"),
@@ -88,6 +90,8 @@ class CanaryMigrationTests(unittest.TestCase):
                 (32, "stop_ack_signed_witness"),
                 (33, "inactive_claim_attestation_audit"),
                 (34, "scenario_library_and_run_bindings"),
+                (35, "configured_live_tests_and_plan_requests"),
+                (36, "configured_findings_disclosure"),
             ],
         )
         self.assertIsNotNone(self.conn.execute(
@@ -408,7 +412,7 @@ class CanaryMigrationTests(unittest.TestCase):
         ledger("runner_heartbeat:run", 2, "runner_heartbeat", "/v1/workspaces/ws/runners/runner/runs/run/stop-ack")
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36])
         self.assertEqual([tuple(row) for row in conn.execute(
             "SELECT chain_name,next_sequence,generation FROM canary_runner_chain_cursors ORDER BY chain_name"
         )], [("heartbeat:run", 2, 0), ("progress:run", 3, 0), ("stop-ack:run", 3, 0)])
@@ -453,8 +457,8 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34])
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 34)
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version(), 36)
         self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.assertEqual(
             [tuple(row) for row in conn.execute(
@@ -560,8 +564,8 @@ class CanaryMigrationTests(unittest.TestCase):
         conn.commit()
 
         migration = Migrator(conn, CONTROL_PLANE_MIGRATIONS)
-        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34])
-        self.assertEqual(migration.current_version(), 34)
+        self.assertEqual(migration.apply_all(), [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36])
+        self.assertEqual(migration.current_version(), 36)
         affinity = conn.execute(
             "SELECT project_ref,environment_id,runner_key_id,established_rcb_id,established_binding_digest "
             "FROM canary_runner_context_affinities WHERE workspace_id='ws_affinity' AND runner_id='runr_affinity'",
@@ -835,7 +839,7 @@ class CanaryMigrationTests(unittest.TestCase):
             )
         conn.commit()
 
-        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34])
+        self.assertEqual(Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all(), [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36])
         self.assertEqual(
             [tuple(row) for row in conn.execute("SELECT chain_name,sequence FROM canary_runner_request_ledger")],
             [("progress:real", 1)],
@@ -1095,8 +1099,8 @@ class CanaryMigrationTests(unittest.TestCase):
         ).fetchone())
         conn.execute("DELETE FROM usage_ledger WHERE entry_id='refund-2'")
         conn.commit()
-        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34])
-        self.assertEqual(migration.current_version(), 34)
+        self.assertEqual(migration.apply_all(), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36])
+        self.assertEqual(migration.current_version(), 36)
         self.assertIn("reason", {row[1] for row in conn.execute("PRAGMA table_info(usage_ledger)")})
 
     def test_consumed_canary_refund_is_once_and_reason_bounded(self):
@@ -1228,7 +1232,7 @@ def test_migration_30_adds_discovery_tables_and_inventory_columns_additively():
         assert after[table] == []
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == []
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31, 32, 33, 34]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31, 32, 33, 34, 35, 36]
 
     def authorization(suffix: str, state: str = "open"):
         closed = None if state == "open" else 2
@@ -1363,20 +1367,23 @@ def test_migration_v32_adds_nullable_complete_ack_witness_without_backfill():
     assert json.loads(conn.execute("SELECT receipt_json FROM canary_operational_receipts").fetchone()[0])[
         "timestamps"]["stop_acknowledged_at_ms"] is not None
     before = _dump(conn)
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [32, 33, 34]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [32, 33, 34, 35, 36]
     assert CONTROL_PLANE_MIGRATIONS[31].version == 32
     assert CONTROL_PLANE_MIGRATIONS[31].name == "stop_ack_signed_witness"
     assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == []
     after = _dump(conn)
     tracked = after.pop("schema_migrations")
-    assert tracked[:-3] == before.pop("schema_migrations")
-    assert [row[:2] for row in tracked[-3:]] == [
+    assert tracked[:-5] == before.pop("schema_migrations")
+    assert [row[:2] for row in tracked[-5:]] == [
         (32, "stop_ack_signed_witness"), (33, "inactive_claim_attestation_audit"),
-        (34, "scenario_library_and_run_bindings"),
+        (34, "scenario_library_and_run_bindings"), (35, "configured_live_tests_and_plan_requests"),
+        (36, "configured_findings_disclosure"),
     ]
     assert after.pop("canary_inactive_claim_attestations") == []  # append-only v33 starts empty
     assert after.pop("workspace_custom_scenarios") == []  # v34 library tables start empty
     assert after.pop("run_scenario_bindings") == []
+    assert after.pop("workspace_custom_live_tests") == []  # v35 configured tables start empty
+    assert after.pop("canary_configured_plan_requests") == []
     old_runs, new_runs = before.pop("canary_runs"), after.pop("canary_runs")
     assert after == before  # every other table is byte-identical
     # Additive only: each prior run value is unchanged and the witness is never backfilled from
@@ -1434,7 +1441,7 @@ def test_migration_v32_adds_nullable_complete_ack_witness_without_backfill():
         CanaryStore(tracked)
         tracked.commit()
         assert not set(_ACK_WITNESS_COLUMNS) & {row[1] for row in tracked.execute("PRAGMA table_info(canary_runs)")}
-        assert Migrator(tracked, CONTROL_PLANE_MIGRATIONS).apply_all() == [32, 33, 34]
+        assert Migrator(tracked, CONTROL_PLANE_MIGRATIONS).apply_all() == [32, 33, 34, 35, 36]
         CanaryStore(tracked)
     finally:
         tracked.close()
@@ -1579,14 +1586,14 @@ def test_migration_34_registers_the_runtime_scenario_library_schema_append_only(
         digest.update(f"{migration.version}\0{migration.name}\0{migration.sql}\0".encode())
     assert digest.hexdigest() == _MIGRATIONS_1_TO_33_SHA256
     assert hashlib.sha256(SCENARIO_LIBRARY_MIGRATION.encode()).hexdigest() == _SCENARIO_LIBRARY_SQL_SHA256
-    head = CONTROL_PLANE_MIGRATIONS[-1]
+    head = CONTROL_PLANE_MIGRATIONS[33]
     assert (head.version, head.name) == (34, "scenario_library_and_run_bindings")
     assert head.sql is SCENARIO_LIBRARY_MIGRATION
 
     # From an empty database: every object exists and equals the direct ControlPlane runtime.
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys=ON")
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == list(range(1, 35))
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == list(range(1, 37))
     assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == []
     migrated = _library_sql(conn)
     assert None not in migrated.values()
@@ -1610,14 +1617,18 @@ def test_migration_34_upgrades_a_populated_v33_database_and_keeps_every_row():
     assert set(_library_sql(conn).values()) == {None}
     before = _dump(conn)
     assert before["users"] and before["workspaces"] and before["projects"]
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [34]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [34, 35, 36]
     assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == []
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 34
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 36
     after = _dump(conn)
     assert after.pop("workspace_custom_scenarios") == [] and after.pop("run_scenario_bindings") == []
+    assert after.pop("workspace_custom_live_tests") == [] and after.pop("canary_configured_plan_requests") == []
     tracked = after.pop("schema_migrations")
-    assert tracked[:-1] == before.pop("schema_migrations")
-    assert tracked[-1][:2] == (34, "scenario_library_and_run_bindings")
+    assert tracked[:-3] == before.pop("schema_migrations")
+    assert [row[:2] for row in tracked[-3:]] == [
+        (34, "scenario_library_and_run_bindings"), (35, "configured_live_tests_and_plan_requests"),
+        (36, "configured_findings_disclosure"),
+    ]
     assert after == before  # users, workspaces, projects and every canary row are unchanged
 
     keys = _insert_library_rows(conn)
@@ -1641,12 +1652,17 @@ def test_migration_34_records_over_tables_the_service_already_created_without_lo
     runtime_sql = _library_sql(conn)
     before = _dump(conn)
     assert len(before["workspace_custom_scenarios"]) == len(before["run_scenario_bindings"]) == 1
-    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [34]
+    assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [34, 35, 36]
     assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == []
     after = _dump(conn)
     tracked = after.pop("schema_migrations")
-    assert tracked[:-1] == before.pop("schema_migrations")
-    assert tracked[-1][:2] == (34, "scenario_library_and_run_bindings")
+    assert tracked[:-3] == before.pop("schema_migrations")
+    assert [row[:2] for row in tracked[-3:]] == [
+        (34, "scenario_library_and_run_bindings"), (35, "configured_live_tests_and_plan_requests"),
+        (36, "configured_findings_disclosure"),
+    ]
+    after.pop("workspace_custom_live_tests", None); after.pop("canary_configured_plan_requests", None)
+    before.pop("workspace_custom_live_tests", None); before.pop("canary_configured_plan_requests", None)
     assert after == before  # the library rows survive the recorded migration
     assert _library_sql(conn) == runtime_sql
     _assert_library_refusals(conn, keys)

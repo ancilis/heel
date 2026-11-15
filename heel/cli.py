@@ -233,8 +233,11 @@ def _runner_credential_add(args) -> int:
 def _runner_input(args) -> int:
     """Local expected values for configured live tests: OS vault only, prompt or --secret-fd.
 
-    The value is one JSON scalar (for example ``"abc"``, ``42``, ``true``). It is never
-    accepted from argv or the environment and is never printed; output is handles only.
+    ``--type text`` (ordinary text, no JSON quoting), ``number``, ``boolean`` or ``null``
+    states the value's kind; the default ``json`` keeps the legacy one-JSON-scalar entry
+    (for example ``"abc"``, ``42``, ``true``). Every kind ends in the same strict decoder.
+    A value is never accepted from argv or the environment and is never printed; output
+    is handles only.
     """
     from .runner.store import decode_live_input_scalar
     from .runner.vault import select_vault
@@ -250,16 +253,33 @@ def _runner_input(args) -> int:
             record = store.revoke_live_input(args.handle, vault=select_vault(args.backend))
             printed = {"input_handle": record["input_handle_id"], "state": record["state"]}
         else:
-            if args.secret_fd is not None:
+            kind = getattr(args, "value_type", "json") or "json"
+            if kind == "null":
+                raw = b"null"
+            elif args.secret_fd is not None:
                 raw = _runner_secret_from_fd(args.secret_fd)
+                if kind == "text" and raw.endswith(b"\n"):
+                    # One line terminator from ``printf '%s\n'``/``echo`` is not part of text.
+                    raw = raw[:-2] if raw.endswith(b"\r\n") else raw[:-1]
             else:
                 if not sys.stdin.isatty():
                     raise ValueError("interactive input requires a TTY")
-                raw = getpass.getpass("Expected value (JSON scalar): ").encode("utf-8")
+                prompt = {
+                    "json": "Expected value (JSON scalar): ", "text": "Expected value (text): ",
+                    "number": "Expected value (number): ", "boolean": "Expected value (true or false): ",
+                }[kind]
+                raw = getpass.getpass(prompt).encode("utf-8")
             try:
+                if kind == "text":
+                    # Ordinary text becomes exactly one JSON string; strict UTF-8 only.
+                    raw = json.dumps(raw.decode("utf-8"), ensure_ascii=False).encode("utf-8")
+                elif kind == "boolean" and raw.strip(b" \t\r\n") not in {b"true", b"false"}:
+                    raise ValueError("local input is invalid")
                 # Strict: an inexact, non-finite or out-of-bound token is refused here,
                 # before any handle or metadata record exists.
                 value = decode_live_input_scalar(raw)
+                if kind == "number" and (type(value) not in {int, float}):
+                    raise ValueError("local input is invalid")
             finally:
                 raw = b""
             record = store.create_live_input(
@@ -1420,6 +1440,10 @@ def main(argv=None):
     runner_input_add.add_argument("--name", required=True)
     runner_input_add.add_argument("--backend", required=True, choices=("keychain", "secret-service"))
     runner_input_add.add_argument("--secret-fd", type=int)
+    runner_input_add.add_argument(
+        "--type", dest="value_type", default="json", choices=("text", "number", "boolean", "null", "json"),
+        help="value kind: text needs no JSON quotes; json (default) keeps the legacy JSON-scalar entry",
+    )
     runner_input_revoke = runner_input_sub.add_parser(
         "revoke", help="revoke one handle explicitly; approvals that froze it stop resolving",
     )

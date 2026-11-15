@@ -22,11 +22,16 @@ from heel.canary_contracts import (
     CANARY_FINDINGS_SCHEMA,
     DISCLOSURE_PERMIT_SCHEMA,
     DISCLOSURE_POLL_STATES,
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_FINDINGS_SCHEMA,
     canonical_bytes,
     canonical_digest,
+    findings_results,
     validate_approval_projection,
     validate_canary_findings,
     validate_disclosure_permit,
+    validate_runner_approval_projection,
+    validate_runner_findings,
     validate_execution_grant,
     validate_operational_run,
     validate_runner_disclosure_poll_request,
@@ -34,6 +39,17 @@ from heel.canary_contracts import (
 from heel.crypto import load_public_key_base64, verify_envelope
 
 from .canary_store import CanaryStore
+
+
+def findings_schema_for_approval(projection_json: object) -> str:
+    """The one findings version a run's own signed approval selects (v3 plan -> v2 findings)."""
+    try:
+        approval = validate_runner_approval_projection(json.loads(projection_json))
+    except (TypeError, ValueError):
+        raise CanaryDisclosureError("canary_authority_unavailable") from None
+    if approval["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+        return CONFIGURED_FINDINGS_SCHEMA
+    return CANARY_FINDINGS_SCHEMA
 
 
 DISCLOSURE_REQUEST_TTL_MS = 24 * 60 * 60 * 1000
@@ -138,7 +154,7 @@ class CanaryDisclosureService:
         scenario_count: object,
         finding_count: object,
     ) -> dict[str, object]:
-        if projection_schema_version != CANARY_FINDINGS_SCHEMA:
+        if projection_schema_version not in (CANARY_FINDINGS_SCHEMA, CONFIGURED_FINDINGS_SCHEMA):
             raise CanaryDisclosureError("invalid_canary_projection")
         if (
             type(projection_digest) is not str
@@ -314,6 +330,8 @@ class CanaryDisclosureService:
             self._require_active_authority(row)
             if runner_key_id != row["runner_key_id"]:
                 raise CanaryDisclosureError("canary_authority_unavailable")
+            if metadata["schema_version"] != findings_schema_for_approval(row["approval_projection_json"]):
+                raise CanaryDisclosureError("invalid_canary_projection")
             prior = self.conn.execute(
                 "SELECT * FROM canary_disclosure_requests WHERE workspace_id=? "
                 "AND project_ref=? AND run_id=?",
@@ -684,7 +702,7 @@ class CanaryDisclosureService:
                     row["runner_id"],
                     row["runner_key_id"],
                     DISCLOSURE_PERMIT_SCHEMA,
-                    CANARY_FINDINGS_SCHEMA,
+                    metadata["schema_version"],
                     metadata["projection_digest"],
                     value["permit_digest"],
                     serialized,
@@ -750,7 +768,7 @@ class CanaryDisclosureService:
                 raise CanaryDisclosureError("invalid_canary_projection")
             run_id = _identifier(request["run_id"])
             permit = validate_disclosure_permit(request["permit"])
-            findings = validate_canary_findings(request["findings_projection"])
+            findings = validate_runner_findings(request["findings_projection"])
         except CanaryDisclosureError:
             raise
         except (TypeError, ValueError):
@@ -785,10 +803,10 @@ class CanaryDisclosureService:
         findings: dict,
     ) -> tuple[bytes, int, int]:
         projection_bytes = canonical_bytes(findings)
-        scenario_count = len(findings["scenario_results"])
-        finding_count = sum(
-            item["finding"] is not None for item in findings["scenario_results"]
-        )
+        configured = findings["schema_version"] == CONFIGURED_FINDINGS_SCHEMA
+        results = findings_results(findings)
+        scenario_count = len(results)
+        finding_count = sum(item["finding"] is not None for item in results)
         metadata_matches = (
             permit["projection"]["schema_version"] == findings["schema_version"]
             and permit["projection"]["projection_digest"]
@@ -805,41 +823,62 @@ class CanaryDisclosureService:
         if not metadata_matches:
             raise CanaryDisclosureError("invalid_canary_projection")
         try:
-            approval = validate_approval_projection(
+            approval = validate_runner_approval_projection(
                 json.loads(row["approval_projection_json"])
             )
+            if (approval["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA) != configured:
+                raise ValueError("findings version does not match the approved plan")
             grant = validate_execution_grant(json.loads(row["grant_json"]))
             receipt = validate_operational_run(json.loads(row["receipt_json"]))
             self._verify_signed_record(receipt, row["public_key"], "projection_digest")
         except (TypeError, ValueError):
             raise CanaryDisclosureError("invalid_canary_projection") from None
-        expected_scenarios = [
-            (item["scenario_id"], item["adapter_version"])
-            for item in approval["scenarios"]
-        ]
-        actual_scenarios = [
-            (item["scenario_id"], item["adapter_version"])
-            for item in findings["scenario_results"]
-        ]
-        action_routes = {
-            (
-                item["scenario_id"],
-                item["adapter_version"],
-                item["method"],
-                item["route_template"],
+        if configured:
+            # Each result must be exactly one signed instance, in order, with its frozen source,
+            # condition digest and route; instances of one primitive are never merged.
+            expected_scenarios = [
+                (item["test_instance_id"], item["scenario_id"], item["adapter_version"],
+                 item["source"]["source_scenario_id"], item["source"]["source_revision"],
+                 item["assertion_digest"], item["assertion"]["condition"]["kind"],
+                 item["method"], item["route_template"])
+                for item in approval["test_instances"]
+            ]
+            actual_scenarios = [
+                (item["test_instance_id"], item["scenario_id"], item["adapter_version"],
+                 item["source"]["source_scenario_id"], item["source"]["source_revision"],
+                 item["assertion_digest"], item["condition_kind"],
+                 item["route"]["method"], item["route"]["route_template"])
+                for item in results
+            ]
+            routes_match = True
+        else:
+            expected_scenarios = [
+                (item["scenario_id"], item["adapter_version"])
+                for item in approval["scenarios"]
+            ]
+            actual_scenarios = [
+                (item["scenario_id"], item["adapter_version"])
+                for item in findings["scenario_results"]
+            ]
+            action_routes = {
+                (
+                    item["scenario_id"],
+                    item["adapter_version"],
+                    item["method"],
+                    item["route_template"],
+                )
+                for item in approval["actions"]
+            }
+            routes_match = all(
+                (
+                    item["scenario_id"],
+                    item["adapter_version"],
+                    item["route"]["method"],
+                    item["route"]["route_template"],
+                )
+                in action_routes
+                for item in findings["scenario_results"]
             )
-            for item in approval["actions"]
-        }
-        routes_match = all(
-            (
-                item["scenario_id"],
-                item["adapter_version"],
-                item["route"]["method"],
-                item["route"]["route_template"],
-            )
-            in action_routes
-            for item in findings["scenario_results"]
-        )
         bound = (
             findings["run_id"] == row["run_id"] == grant["run_id"] == receipt["run_id"]
             and findings["grant_id"]
@@ -1157,7 +1196,7 @@ class CanaryDisclosureService:
         if row is None:
             raise CanaryDisclosureError("canary_run_not_found")
         try:
-            value = validate_canary_findings(json.loads(row["projection_json"]))
+            value = validate_runner_findings(json.loads(row["projection_json"]))
             self._verify_signed_record(value, row["public_key"], "projection_digest")
         except (TypeError, ValueError):
             raise CanaryDisclosureError("canary_authority_unavailable") from None
@@ -1165,8 +1204,9 @@ class CanaryDisclosureService:
             value["projection_digest"] != row["projection_digest"]
             or canonical_bytes(value).decode("utf-8") != row["projection_json"]
             or len(canonical_bytes(value)) != row["byte_count"]
-            or len(value["scenario_results"]) != row["scenario_count"]
-            or sum(item["finding"] is not None for item in value["scenario_results"])
+            or value["schema_version"] != row["schema_version"]
+            or len(findings_results(value)) != row["scenario_count"]
+            or sum(item["finding"] is not None for item in findings_results(value))
             != row["finding_count"]
         ):
             raise CanaryDisclosureError("canary_authority_unavailable")

@@ -532,6 +532,13 @@ class _ServeCoordinator:
         finally:
             self._leave()
 
+    def process_configured_plan(self):
+        self._enter()
+        try:
+            return self._coordinator.process_configured_plan()
+        finally:
+            self._leave()
+
     def advance_disclosures(self):
         self._enter()
         try:
