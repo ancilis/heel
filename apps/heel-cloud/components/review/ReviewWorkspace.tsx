@@ -207,7 +207,7 @@ export function ReviewWorkspace({ initialReview }: { initialReview: ReviewEnvelo
     ? "Your completed review"
     : provenance === "history"
       ? "Saved local review"
-      : "Completed example review";
+      : "Static sample review · hypotheses only, no target traffic";
 
   async function refreshHistory(reviewId: string): Promise<void> {
     const store = storeRef.current;

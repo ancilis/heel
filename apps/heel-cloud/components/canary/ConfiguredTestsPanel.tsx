@@ -12,6 +12,7 @@ import type {
   ScenarioLibraryEntry,
 } from "../../lib/canary-api";
 import { CanaryApiError } from "../../lib/canary-api";
+import { selectionQuery } from "../../lib/account-context";
 import {
   COMPARISON_LABELS,
   STATE_WORDS,
@@ -147,7 +148,7 @@ export function ConfiguredTestsPanel({
       {notice ? <p role="alert">{notice}</p> : null}
       {bindingId === null ? <p>Authorize a paired runner for your verified target first; configured tests run only through it.</p> : null}
       {library === null || requests === null ? <p>Loading your private tests…</p> : <>
-        {configured.length === 0 ? <p>No private tests yet. Create one in the scenario library below.</p> : (
+        {configured.length === 0 ? <p>No private tests yet. Create one in the scenario library on this page (Open scenario library, then Create a private live test).</p> : (
           <fieldset disabled={!canManage || busy || blocked}>
             <legend>Tests for the next dry run</legend>
             <ul aria-label="Private tests" className="scenario-library-list">
@@ -217,6 +218,13 @@ export function ConfiguredTestsPanel({
             </ol>
             {current.status === "open" && canManage ? (
               <button className="button button-secondary" disabled={busy} onClick={() => void cancel(current.planRequestId)} type="button">Cancel this request</button>
+            ) : null}
+            {current.runId !== null && current.status === "approved" ? (
+              <p>
+                <a href={`/dashboard${selectionQuery({ workspaceRef, projectRef, runRef: current.runId })}`}>
+                  Open run {current.runId}: status, sharing and result
+                </a>
+              </p>
             ) : null}
             {current.status === "projected" && onReviewApproval ? (
               <button className="button button-primary" onClick={onReviewApproval} type="button">Review and approve the dry run</button>

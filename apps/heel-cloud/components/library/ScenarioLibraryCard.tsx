@@ -55,10 +55,12 @@ export interface ScenarioLibraryCardProps {
   onSaved?: () => void;
 }
 
-// The static fields a private copy may carry (server CUSTOM_EVALUATION_FIELDS); the library template supplies them.
+// The static fields a new private copy takes from its library template (a subset of the server's
+// CUSTOM_EVALUATION_FIELDS). Library investigation_signals use operators the custom validator refuses, and they
+// are optional, so a guided copy omits them rather than failing the save.
 const CUSTOM_FIELDS = new Set([
   "id", "category", "objective", "kind", "success_criterion", "severity_model", "recommended_control",
-  "containment_limits", "applies_when", "pack", "probe_strategy", "investigation_signals", "exploitability_reduction",
+  "containment_limits", "applies_when", "pack", "probe_strategy", "exploitability_reduction",
 ]);
 const TEMPLATE_FOR: Readonly<Record<ScenarioBindableCatalogId, string>> = Object.freeze({
   plan_entitlement_read: "sc.flag.tiergate",
@@ -410,10 +412,11 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
             <div className="approval-fields">
               <label>
                 Method
-                <select disabled={busy} value={guided.method}
+                <span id="guided-method-hint">HEAD returns no body, so a field condition on HEAD is always inconclusive.</span>
+                <select aria-describedby="guided-method-hint" disabled={busy} value={guided.method}
                   onChange={(event) => setGuided((form) => ({ ...form, method: event.target.value as "GET" | "HEAD" }))}>
                   <option value="GET">GET</option>
-                  <option value="HEAD">HEAD (status only: always inconclusive for a field condition)</option>
+                  <option value="HEAD">HEAD</option>
                 </select>
               </label>
               <label>

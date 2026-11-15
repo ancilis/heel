@@ -214,7 +214,7 @@ describe("Heel anonymous launch review", () => {
       sync_state: "local_only",
     }]);
     render(<Home />);
-    expect(screen.getByText("Completed example review")).toBeTruthy();
+    expect(screen.getByText("Static sample review · hypotheses only, no target traffic")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /analyze mine/i }));
     fireEvent.change(screen.getByLabelText(/paste openapi json/i), { target: { value: sampleSource } });

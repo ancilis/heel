@@ -154,3 +154,35 @@ Not in E2: browser authoring and authenticated delivery of definitions and v3 pr
 submission/claim/upload through the control plane (E3); disclosure of v2 findings (E3); new
 release artifacts (E4). Containment events keep schema v1: an event's signed action ordinal maps
 to exactly one instance in the signed manifest.
+
+## E3: browser authoring and authenticated delivery (source only)
+
+- **Authoring.** A workspace-private custom revision may carry one `heel.custom-live-test.v1`
+  (primitive, GET/HEAD, literal imported route, canonical E1 assertion) through
+  `heel.custom-scenario.v2`. It is stored beside the immutable revision (`workspace_custom_live_tests`,
+  migration 35); the static definition keeps its static meaning. Parameterized routes are refused
+  with `live_test_route_unsupported`. The dashboard form needs no JSON; references are names only.
+- **Request.** `POST …/runner-context-bindings/{rcb}/configured-plan-requests`
+  (`heel.configured-plan-request.v1`) names exact private revisions (or one observed instance of a
+  terminal configured run to replay). The control plane resolves them in the authenticated
+  workspace, generates instance IDs and a single-use nonce, and freezes the snapshot
+  (`canary_configured_plan_requests`; one open per binding; `GET`/`cancel` for the browser).
+- **Runner.** Over its PoP claim chain the paired runner sends `heel.runner-configured-plan-sync.v1`
+  (runner runtime state v7 registers this one operation) and receives the snapshot. It reports
+  readiness for exactly the snapshot's instances (route, non-anonymous roles, named local inputs,
+  or for a replay the frozen run and handles) as closed states, then compiles the v2 manifest/v3
+  projection and submits `heel.runner-configured-approval-projection-submit.v1` with the nonce. The
+  control plane admits it only if every signed instance equals the frozen snapshot. Old runners
+  never claim the request; the dashboard says so.
+- **Approval.** A v3 projection is approved only with `heel.canary-execution-approval.v2` carrying a
+  `heel.configured-condition-review.v1` that restates every instance (source revision, primitive,
+  route, role pair, request count, condition, reference names), the operator-supplied plan labels
+  and the request ceiling; a v1 (digest-only) approval is refused (`configured_review_required`).
+- **Results.** Disclosure tables admit `heel.canary-findings-projection.v2` (lossless rebuild,
+  migration 36). The dashboard shows per-instance outcome, closed reason, control/restricted
+  states, containment notes and local evidence references; inconclusive is stated as neither pass
+  nor failure. "Save and replay" requests a configured regression of one observed instance; the
+  runner saves it from its own verified finals and recompiles with the frozen handles.
+- **Local values.** `heel runner input add --type text|number|boolean|null|json` (default `json`,
+  the legacy entry); text needs no quotes; every kind ends in the strict decoder; values come only
+  from the hidden prompt or `--secret-fd`.
