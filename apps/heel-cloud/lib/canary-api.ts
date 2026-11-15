@@ -1054,7 +1054,8 @@ function validDisclosurePermit(value: unknown, workspaceRef: string, projectRef:
     || !identifier(value.grant_id) || !exact(value.runner_binding, ["runner_id", "runner_key_id"])
     || !identifier(value.runner_binding.runner_id) || !identifier(value.runner_binding.runner_key_id)
     || !exact(value.projection, ["schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"])
-    || value.projection.schema_version !== "heel.canary-findings-projection.v1"
+    // A configured run's permit names the v2 findings projection; the server binds the version to the run.
+    || !["heel.canary-findings-projection.v1", "heel.canary-findings-projection.v2"].includes(String(value.projection.schema_version))
     || !digest(value.projection.projection_digest) || !integer(value.projection.maximum_bytes, 1, 256 * 1024)
     || !integer(value.projection.scenario_count, 0, 4)
     || !integer(value.projection.finding_count, 0, value.projection.scenario_count as number)
@@ -1525,6 +1526,13 @@ export class CanaryApi {
   async getConfiguredPlanRequest(workspaceRef: string, projectRef: string, planRequestId: string, signal?: AbortSignal): Promise<ConfiguredPlanRequestView> {
     if (!PLAN_REQUEST_REF.test(planRequestId)) invalidRequest();
     return parseConfiguredPlanView(await this.#json(projectPath(workspaceRef, projectRef, `/configured-plan-requests/${planRequestId}`), "GET", undefined, 200, {}, signal));
+  }
+
+  /** The frozen configured request a run's signed plan was admitted against (never the current library). */
+  async getConfiguredPlanForRun(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<ConfiguredPlanRequestView> {
+    const value = parseConfiguredPlanView(await this.#json(runPath(workspaceRef, projectRef, runRef, "/configured-plan"), "GET", undefined, 200, {}, signal));
+    if (value.runId !== runRef) invalidResponse();
+    return value;
   }
 
   async cancelConfiguredPlanRequest(workspaceRef: string, projectRef: string, planRequestId: string): Promise<ConfiguredPlanRequestView> {

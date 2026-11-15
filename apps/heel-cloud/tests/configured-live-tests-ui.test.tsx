@@ -239,6 +239,7 @@ describe("configured results", () => {
     expect(screen.getByText(/refused at least one request before sending it/)).toBeTruthy();
     expect(screen.getByText(/does not test the whole scenario objective/)).toBeTruthy();
     expect(screen.getByText(/heel runner findings --run crun_9+/)).toBeTruthy();
+    expect(screen.getByText(/verified, signed redacted summary and these evidence references; it does not print response bodies/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /replay/ })).toBeNull();
   });
 
@@ -247,5 +248,40 @@ describe("configured results", () => {
     render(<FindingsCard findings={findings([result("observed", "restricted_condition_true")])} onReplay={onReplay} />);
     fireEvent.click(screen.getByRole("button", { name: "Save and replay this exact test" }));
     expect(onReplay).toHaveBeenCalledWith("lti_" + "e".repeat(32));
+  });
+});
+
+describe("configured results show the frozen condition of exactly that run", () => {
+  const PLAN_EQUALS: LiveReadAssertion = { ...ASSERTION, condition: { kind: "json_scalar_equals_fixture", path: ["export", "plan"], expected_fixture: "pro_plan" } };
+  const second = { ...result("blocked", "restricted_condition_false"), ordinal: 1, test_instance_id: "lti_" + "f".repeat(32),
+    source: { source_scenario_id: "sc.internal.export-plan", source_revision: 1 }, assertion_digest: "sha256:" + "c".repeat(64) };
+  const frozenPlan = view({
+    status: "approved", runId: "crun_" + "9".repeat(32), approvalId: "p", projectionDigest: "2".repeat(64),
+    instances: [view().instances[0], { ...view().instances[0], testInstanceId: "lti_" + "f".repeat(32),
+      source: { sourceScenarioId: "sc.internal.export-plan", sourceRevision: 1 }, assertion: PLAN_EQUALS,
+      assertionDigest: "sha256:" + "c".repeat(64), localInputRefs: ["export_ok", "pro_plan"] }],
+  });
+
+  test("two conditions on one route stay distinguishable, with reference names only", () => {
+    render(<FindingsCard findings={findings([result("observed", "restricted_condition_true"), second])} frozenPlan={frozenPlan} />);
+    const items = screen.getAllByRole("listitem").filter((item) => item.querySelector("h3"));
+    expect(within(items[0]).getByText(/"export" › "rows" › \[0\] › "ssn_hint" equals your local value “secret_hint”/)).toBeTruthy();
+    expect(within(items[1]).getByText(/"export" › "plan" equals your local value “pro_plan”/)).toBeTruthy();
+    expect(within(items[1]).getByText("export_ok, pro_plan")).toBeTruthy();
+  });
+
+  test("a different run, signed plan or assertion digest is shown as unavailable, never substituted", () => {
+    const edited = view({ ...frozenPlan, instances: [{ ...frozenPlan.instances[0], assertionDigest: "sha256:" + "d".repeat(64),
+      assertion: PLAN_EQUALS }] });
+    render(<FindingsCard findings={findings([result("observed", "restricted_condition_true")])} frozenPlan={edited} />);
+    expect(screen.getByText(/The exact frozen condition for this result is unavailable/)).toBeTruthy();
+    expect(screen.queryByText(/"export" › "plan"/)).toBeNull();
+    cleanup();
+    render(<FindingsCard findings={findings([result("observed", "restricted_condition_true")])} frozenPlan="unavailable" />);
+    expect(screen.getByText(/The current library is not substituted/)).toBeTruthy();
+    cleanup();
+    render(<FindingsCard findings={findings([result("observed", "restricted_condition_true")])}
+      frozenPlan={view({ ...frozenPlan, projectionDigest: "9".repeat(64) })} />);
+    expect(screen.getByText(/The exact frozen condition for this result is unavailable/)).toBeTruthy();
   });
 });

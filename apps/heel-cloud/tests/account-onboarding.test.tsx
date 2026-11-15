@@ -1797,7 +1797,7 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     render(<Dashboard />);
     await screen.findByRole("heading", { name: "Create your Heel account" });
     const sample = screen.getByRole("link", { name: "Try the static sample — no account" });
-    expect(sample.getAttribute("href")).toBe("/#review");
+    expect(sample.getAttribute("href")).toBe("/");
     expect(sample.closest("p")?.textContent).toMatch(/browser-only example that never contacts a target or changes this account/);
     expect(screen.getByRole("link", { name: "paired runner guide" }).getAttribute("href")).toBe("/guide");
   });

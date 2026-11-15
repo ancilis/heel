@@ -19,7 +19,7 @@ import { ScenarioLibraryCard } from "../../components/library/ScenarioLibraryCar
 import { BrowserReviewClient } from "../../lib/browser-review-client";
 import { TargetRegistrationCard, type OwnershipProofMethod, type PendingTarget } from "../../components/onboarding/TargetRegistrationCard";
 import {
-  CanaryApi, CanaryApiError, configuredConditionReview, type AnyCanaryFindingsProjection, type CanaryApprovalSummary, type CanaryDisclosureState,
+  CanaryApi, CanaryApiError, configuredConditionReview, type AnyCanaryFindingsProjection, type CanaryApprovalSummary, type CanaryDisclosureState, type ConfiguredPlanRequestView,
   type CanaryPendingApprovalRequest, type CanaryRunDashboard, type FrozenScenarioBinding, type PendingEnvironmentProof,
   type RunnerContextBindingDashboard, type RunnerPairingView, type RunScenarioBindingsView, type ScenarioBindingItem,
   type ScenarioLibraryEntry, type VerifiedEnvironmentRecord,
@@ -245,6 +245,12 @@ export default function Dashboard() {
   // Selection provenance for the open approval, and the frozen rows of a run whose findings are shown.
   const [bindingState, setBindingState] = useState<{ runId: string; view: RunScenarioBindingsView; entries: readonly ScenarioLibraryEntry[] } | null>(null);
   const [findingsBindings, setFindingsBindings] = useState<{ runId: string; bindings: readonly FrozenScenarioBinding[] } | null>(null);
+  // The frozen configured request behind the shown configured result (never the current library).
+  const [findingsPlan, setFindingsPlan] = useState<{ runId: string; plan: ConfiguredPlanRequestView | "unavailable" } | null>(null);
+  // A run opened by its address (load, reload or an explicit open) is brought into view once; polling never moves focus.
+  const landingRun = useRef<string | null>(null);
+  const resultLandingRef = useRef<HTMLDivElement | null>(null);
+  const statusLandingRef = useRef<HTMLDivElement | null>(null);
   // Bumped after a replay request so the configured-test panel re-reads its server-backed state.
   const [configuredTick, setConfiguredTick] = useState(0);
 
@@ -309,7 +315,9 @@ export default function Dashboard() {
       if (ticket !== generation.current) return;
       if (next.phase !== "ready") clearApprovalIdentity();
       setConnection(next);
-      setRunHint(runHintFor(initialSelection, next));
+      const hint = runHintFor(initialSelection, next);
+      landingRun.current = hint?.runRef ?? null;
+      setRunHint(hint);
     });
     return () => { generation.current += 1; };
   }, [clearApprovalIdentity, initialSelection]);
@@ -326,7 +334,9 @@ export default function Dashboard() {
     const next = await loadConnection(requested);
     if (ticket !== generation.current) return null;
     setConnection(next);
-    setRunHint(runHintFor(requested, next));
+    const hint = runHintFor(requested, next);
+    landingRun.current = hint?.runRef ?? null;
+    setRunHint(hint);
     return next;
   }, [clearApprovalIdentity]);
 
@@ -659,6 +669,30 @@ export default function Dashboard() {
       .catch(() => { if (!controller.signal.aborted) setFindingsBindings({ runId: findingsRunId, bindings: [] }); });
     return () => controller.abort();
   }, [connection, findingsRunId]);
+  const configuredFindingsRunId = disclosureForRun?.findings?.schema_version === "heel.canary-findings-projection.v2" ? disclosureForRun.runId : null;
+  useEffect(() => {
+    if (connection.phase !== "ready" || configuredFindingsRunId === null) return;
+    const { workspaceRef } = connection.context;
+    const { projectRef } = connection.context.project;
+    const controller = new AbortController();
+    void canaryApi.getConfiguredPlanForRun(workspaceRef, projectRef, configuredFindingsRunId, controller.signal)
+      .then((plan) => { if (!controller.signal.aborted) setFindingsPlan({ runId: configuredFindingsRunId, plan }); })
+      .catch(() => { if (!controller.signal.aborted) setFindingsPlan({ runId: configuredFindingsRunId, plan: "unavailable" }); });
+    return () => controller.abort();
+  }, [connection, configuredFindingsRunId]);
+  useEffect(() => {
+    const target = landingRun.current;
+    if (target === null || shownRunRef !== target) return;
+    const findingsShown = disclosureForRun?.findings !== null && disclosureForRun?.findings !== undefined;
+    const statusShown = disclosureState !== null || (observedRun !== null && observedRun.run.status !== "terminal")
+      || runHint?.unavailable === true;
+    const element = findingsShown ? resultLandingRef.current : statusShown ? statusLandingRef.current : null;
+    if (element === null) return;
+    landingRun.current = null;
+    // Behaviour follows the stylesheet's scroll-behavior, which reduced motion pins to an instant jump.
+    if (typeof element.scrollIntoView === "function") element.scrollIntoView({ block: "start" });
+    element.focus({ preventScroll: true });
+  });
   const hasPlan = pendingApproval !== null && pendingApproval.run.run.status === "awaiting_execution_approval";
   // Progress comes from the server's active records for this project: a runner is paired while its key is active (the
   // bindable list omits a bound runner, so `pairedRunnersOf` adds it back), and it is authorized only by an active,
@@ -1107,7 +1141,7 @@ export default function Dashboard() {
         <div className="dashboard-context"><span className="dashboard-workspace">{selectedProject ? selectedProject.name : "Workspace not connected"}</span><span className="dashboard-presence"><i aria-hidden="true" /> {context ? "Cloud connected" : "Local-first"}</span></div></header>
 
       <p className="runner-recovery">Next: follow the <Link href="/guide">paired runner guide</Link> to verify your own staging target, pair a runner and approve its first plan. Optional, local, no network: the <Link href="/runner">synthetic export reference</Link>.
-        {" "}Not ready to add a real target? <Link href="/#review">Try the static sample — no account</Link>: a browser-only example that never contacts a target or changes this account.</p>
+        {" "}Not ready to add a real target? <Link href="/">Try the static sample — no account</Link>: a browser-only example that never contacts a target or changes this account.</p>
       <section className="dashboard-intro" aria-labelledby="dashboard-title"><div><p className="canary-kicker">Verified target setup</p><h1 id="dashboard-title">Cross the boundary <em>before</em> your customers do.</h1><p>Add one publicly reachable staging or sandbox HTTPS target and prove you own it. Heel Cloud only checks that ownership proof: approved read-only GET and HEAD rehearsals run from a runner on your own machine, and credentials and raw evidence stay there.</p></div>
         <aside className="preview-notice" aria-label="Connection status"><span className="preview-pulse" aria-hidden="true" /><div><strong>{connection.phase === "ready" ? "Ready for customer setup" : "Connect to begin"}</strong><p>{connection.phase === "checking" ? "Checking signed-in context · no request sent" : connection.phase === "ready" ? "Live account state · operational metadata only" : "No sample data is shown"}</p></div></aside></section>
 
@@ -1147,9 +1181,10 @@ export default function Dashboard() {
         {showActivation ? <ActivationCard completedSteps={completedSteps} environmentOrigin={executable?.origin}
           onReviewApproval={hasPlan && approvalKey ? () => setApprovalDialog({ requestKey: approvalKey, open: true }) : undefined}
           scenarioCount={pendingApproval?.summary.scenarios.length ?? 0} snapshot={snapshot} /> : null}
-        {disclosureState?.status === "synchronized" && disclosureForRun?.findings ? <FindingsCard findings={disclosureForRun.findings}
+        {disclosureState?.status === "synchronized" && disclosureForRun?.findings ? <div aria-label="Opened run result" ref={resultLandingRef} tabIndex={-1}><FindingsCard findings={disclosureForRun.findings}
           frozenBindings={findingsBindings?.runId === disclosureForRun.runId ? findingsBindings.bindings : []}
-          replayBusy={working} onReplay={activeBindingId !== null ? (testInstanceId) => void requestReplay(disclosureForRun.runId, testInstanceId) : undefined} /> : null}
+          frozenPlan={findingsPlan?.runId === disclosureForRun.runId ? findingsPlan.plan : undefined}
+          replayBusy={working} onReplay={activeBindingId !== null ? (testInstanceId) => void requestReplay(disclosureForRun.runId, testInstanceId) : undefined} /></div> : null}
         {context ? <ScenarioLibraryCard key={context.workspaceRef} api={canaryApi} workspaceRef={context.workspaceRef}
           canManage={["owner", "admin", "member"].includes(context.account.workspace.role)}
           createAssessor={() => new BrowserReviewClient()} onSaved={() => setConfiguredTick((value) => value + 1)} /> : null}
@@ -1176,10 +1211,11 @@ export default function Dashboard() {
       <aside className="dashboard-rail" aria-label="Safety boundaries"><section className="boundary-ledger"><p className="canary-kicker">Always enforced</p>
         {showActivation ? <><h2>The paired runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status; a redacted summary only if you share it</dd></div></dl></>
           : <><h2>Heel Cloud only verifies ownership; rehearsals run on your machine.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Ownership check</dt><dd>One proof file or DNS record</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>}</section>
+         <div aria-label="Opened run status" ref={statusLandingRef} tabIndex={-1}>
          {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} onStop={runPhase === "running" ? () => void stopRun() : undefined} /> : null}
          {observedRun && !observedRun.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
         {disclosureRunId !== null ? <section aria-label="Result sharing" aria-live="polite" className="disclosure-entry"><span>Result sharing</span>{disclosureStatusCopy}
-          {disclosureDecisionOpen ? <> <button className="text-button" disabled={working} onClick={() => setDisclosureOpen(true)} type="button">Review sharing</button></> : null}</section> : null}
+          {disclosureDecisionOpen ? <> <button className="text-button" disabled={working} onClick={() => setDisclosureOpen(true)} type="button">Review sharing</button></> : null}</section> : null}</div>
         {hintedRunRef !== null && runHint?.unavailable ? <p className="run-recovery" role="status">Heel Cloud could not read that rehearsal right now, so nothing is shown for it. Retrying.</p> : null}
       </aside></div>
 

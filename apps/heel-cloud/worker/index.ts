@@ -130,6 +130,9 @@ const CONFIGURED_PLAN_LIST_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/
 const CONFIGURED_PLAN_VIEW_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/configured-plan-requests/${PLAN_REQUEST_REF}$`,
 );
+const CONFIGURED_PLAN_FOR_RUN_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/configured-plan$`,
+);
 const CONFIGURED_PLAN_CANCEL_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/configured-plan-requests/${PLAN_REQUEST_REF}/cancel$`,
 );
@@ -207,7 +210,8 @@ function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
   if (SCENARIO_LIBRARY_CUSTOM_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_SCENARIO_BINDINGS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
   if (CONFIGURED_PLAN_CREATE_ROUTE.test(upstreamPath)) return method === "POST";
-  if (CONFIGURED_PLAN_LIST_ROUTE.test(upstreamPath) || CONFIGURED_PLAN_VIEW_ROUTE.test(upstreamPath)) return method === "GET";
+  if (CONFIGURED_PLAN_LIST_ROUTE.test(upstreamPath) || CONFIGURED_PLAN_VIEW_ROUTE.test(upstreamPath)
+    || CONFIGURED_PLAN_FOR_RUN_ROUTE.test(upstreamPath)) return method === "GET";
   if (CONFIGURED_PLAN_CANCEL_ROUTE.test(upstreamPath)) return method === "POST";
   return CANARY_FINDINGS_ROUTE.test(upstreamPath) && method === "GET";
 }

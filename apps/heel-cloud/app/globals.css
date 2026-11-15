@@ -2801,3 +2801,15 @@ fieldset.question {
   background: white;
   color: var(--ink);
 }
+
+/* Long opaque identifiers (runner ids, binding origins) wrap inside dashboard cards instead of setting the
+   column's minimum width on narrow screens; the grid column may then shrink to the viewport. */
+.dashboard-grid > div {
+  min-width: 0;
+}
+
+.runner-recovery li > span,
+.runner-recovery code,
+.activation-card code {
+  overflow-wrap: anywhere;
+}

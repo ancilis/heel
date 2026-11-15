@@ -7,9 +7,10 @@ import type {
   CanaryConfiguredResult,
   CanaryFindingsProjection,
   CanaryScenarioResult,
+  ConfiguredPlanRequestView,
   FrozenScenarioBinding,
 } from "../../lib/canary-api";
-import { CONTAINMENT_ADVICE, reasonText } from "../../lib/live-test-text";
+import { CONTAINMENT_ADVICE, conditionText, reasonText, successCheckText } from "../../lib/live-test-text";
 
 
 export interface FindingsCardProps {
@@ -20,6 +21,21 @@ export interface FindingsCardProps {
   /** Configured runs only: request a fresh, separately approved replay of one observed instance. */
   onReplay?: (testInstanceId: string) => void;
   replayBusy?: boolean;
+  /** Configured runs: the frozen request the signed plan was admitted against; "unavailable" when it could not load. */
+  frozenPlan?: ConfiguredPlanRequestView | "unavailable";
+}
+
+/** The frozen definition of exactly this result: same run, signed plan, instance and assertion digest; never the library. */
+export function frozenInstanceFor(
+  findings: Readonly<CanaryConfiguredFindingsProjection>, item: Readonly<CanaryConfiguredResult>,
+  plan: ConfiguredPlanRequestView | "unavailable" | undefined,
+) {
+  if (plan === undefined || plan === "unavailable" || plan.runId !== findings.run_id
+    || plan.projectionDigest !== findings.approval_projection_digest) return null;
+  return plan.instances.find((instance) => instance.testInstanceId === item.test_instance_id
+    && instance.assertionDigest === item.assertion_digest
+    && instance.source.sourceScenarioId === item.source.source_scenario_id
+    && instance.source.sourceRevision === item.source.source_revision) ?? null;
 }
 
 export const INCONCLUSIVE_NOTE = "Inconclusive establishes neither a pass nor a failure: no verdict was reached for this check.";
@@ -33,20 +49,29 @@ function ContainmentNotes({ codes }: { codes: readonly string[] }) {
 function EvidenceRefs({ refs, runId }: { refs: readonly string[]; runId: string }) {
   if (refs.length === 0) return null;
   return <>
-    <p>Local evidence references. The raw responses stay on the runner machine; inspect them there with <code>heel runner findings --run {runId}</code>.</p>
+    <p>Local evidence references. Raw responses never leave the runner machine. On that machine, <code>heel runner findings --run {runId}</code> prints the runner&apos;s verified, signed redacted summary and these evidence references; it does not print response bodies.</p>
     <ul aria-label="Local evidence references">{refs.map((ref) => <li key={ref}><code>{ref}</code></li>)}</ul>
   </>;
 }
 
-function ConfiguredResultItem({ item, runId, onReplay, replayBusy }: {
-  item: Readonly<CanaryConfiguredResult>; runId: string; onReplay?: (id: string) => void; replayBusy: boolean;
+function ConfiguredResultItem({ item, findings, plan, onReplay, replayBusy }: {
+  item: Readonly<CanaryConfiguredResult>; findings: Readonly<CanaryConfiguredFindingsProjection>;
+  plan: ConfiguredPlanRequestView | "unavailable" | undefined; onReplay?: (id: string) => void; replayBusy: boolean;
 }) {
+  const runId = findings.run_id;
+  const frozen = frozenInstanceFor(findings, item, plan);
   return (
     <li>
       <h3><code>{item.source.source_scenario_id}</code> revision {item.source.source_revision}</h3>
       <dl>
         <div><dt>Route</dt><dd><code>{item.route.method} {item.route.route_template}</code></dd></div>
-        <div><dt>Condition kind</dt><dd>{item.condition_kind === "json_field_present" ? "Field is present" : "Value equals your local value"}</dd></div>
+        {frozen !== null ? <>
+          <div><dt>Successful response check</dt><dd>{successCheckText(frozen.assertion)}</dd></div>
+          <div><dt>Condition tested</dt><dd>{conditionText(frozen.assertion)}</dd></div>
+          <div><dt>Local values (names only)</dt><dd>{frozen.localInputRefs.join(", ")}</dd></div>
+        </> : <div><dt>Condition tested</dt><dd>{plan === undefined
+          ? "Loading the exact condition this run used…"
+          : <>The exact frozen condition for this result is unavailable ({item.condition_kind === "json_field_present" ? "field is present" : "value equals a local value"}; definition digest <code>{item.assertion_digest}</code>). The current library is not substituted.</>}</dd></div>}
         <div><dt>Outcome</dt><dd>{OUTCOME_LABELS[item.assessment_outcome]} ({item.assessment_outcome})</dd></div>
         <div><dt>Reason</dt><dd><code>{item.reason}</code>: {reasonText(item.reason)}</dd></div>
         <div><dt>Control read</dt><dd>{item.positive_control === "established" ? "succeeded" : "did not establish a baseline"}</dd></div>
@@ -79,8 +104,9 @@ function ConfiguredResultItem({ item, runId, onReplay, replayBusy }: {
   );
 }
 
-function ConfiguredFindings({ findings, onReplay, replayBusy }: {
-  findings: Readonly<CanaryConfiguredFindingsProjection>; onReplay?: (id: string) => void; replayBusy: boolean;
+function ConfiguredFindings({ findings, plan, onReplay, replayBusy }: {
+  findings: Readonly<CanaryConfiguredFindingsProjection>; plan: ConfiguredPlanRequestView | "unavailable" | undefined;
+  onReplay?: (id: string) => void; replayBusy: boolean;
 }) {
   return (
     <section aria-labelledby="findings-title" className="runner-recovery findings-card">
@@ -93,7 +119,7 @@ function ConfiguredFindings({ findings, onReplay, replayBusy }: {
       </dl>
       <ol aria-label="Configured test results">
         {findings.test_results.map((item) => <ConfiguredResultItem key={item.test_instance_id} item={item}
-          onReplay={onReplay} replayBusy={replayBusy} runId={findings.run_id} />)}
+          findings={findings} plan={plan} onReplay={onReplay} replayBusy={replayBusy} />)}
       </ol>
     </section>
   );
@@ -127,9 +153,9 @@ const OUTCOME_LABELS: Readonly<Record<CanaryAssessmentOutcome, string>> = Object
  * a scenario without a server finding shows none, observations are the status code and body shape the runner
  * recorded (never content), and evidence appears only as opaque references that resolve on the runner machine.
  */
-export function FindingsCard({ findings: any, frozenBindings = [], onReplay, replayBusy = false }: FindingsCardProps) {
+export function FindingsCard({ findings: any, frozenBindings = [], onReplay, replayBusy = false, frozenPlan }: FindingsCardProps) {
   if (any.schema_version === "heel.canary-findings-projection.v2") {
-    return <ConfiguredFindings findings={any} onReplay={onReplay} replayBusy={replayBusy} />;
+    return <ConfiguredFindings findings={any} plan={frozenPlan} onReplay={onReplay} replayBusy={replayBusy} />;
   }
   const findings: Readonly<CanaryFindingsProjection> = any;
   return (

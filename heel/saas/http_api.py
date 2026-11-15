@@ -1150,6 +1150,8 @@ class _Handler(BaseHTTPRequestHandler):
                         return lambda: self._ws_canary_status(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "approve" and method == "POST":
                         return lambda: self._ws_canary_approve(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "configured-plan" and method == "GET":
+                        return lambda: self._ws_configured_plan_for_run(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "events" and method == "GET":
                         return lambda: self._ws_canary_events(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "stop" and method == "POST":
@@ -2603,6 +2605,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _ws_configured_plan_view(self, wid: str, project_ref: str, plan_request_id: str) -> None:
         user_id = self._discovery_scope(wid, project_ref)
         self._json(200, self._configured_plans().view(wid, project_ref, plan_request_id, actor=user_id))
+
+    def _ws_configured_plan_for_run(self, wid: str, project_ref: str, run_id: str) -> None:
+        user_id = self._discovery_scope(wid, project_ref)
+        self._json(200, self._configured_plans().view_for_run(wid, project_ref, run_id, actor=user_id))
 
     def _ws_configured_plan_cancel(self, wid: str, project_ref: str, plan_request_id: str) -> None:
         self._discovery_scope(wid, project_ref)

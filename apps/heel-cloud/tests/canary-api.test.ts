@@ -979,3 +979,20 @@ describe("scenario library and run-frozen bindings", () => {
     await expect(api.freezeRunScenarioBindings(workspace, project, run, "b".repeat(64), [])).rejects.toMatchObject({ code: "invalid_request" });
   });
 });
+
+it("a configured run's disclosure permit (v2 findings projection) is accepted; an unknown version is refused", async () => {
+  const permitFor = (schema: string) => ({
+    schema_version: "heel.disclosure-permit.v1", permit_id: "cdp_0123456789abcdef0123456789abcdef",
+    workspace_id: workspace, project_id: project, run_id: run, grant_id: "cgr_0123456789abcdef0123456789abcdef",
+    runner_binding: { runner_id: "runr_0123456789abcdef0123456789abcdef", runner_key_id: "key_0123456789abcdef" },
+    projection: { schema_version: schema, projection_digest: digest, maximum_bytes: 1024, scenario_count: 2, finding_count: 1 },
+    approved_by: "usr_0123456789abcdef", approved_at_ms: 1, issued_at_ms: 1, expires_at_ms: 600001,
+    permit_nonce: "nonce_0123456789abcdef", permit_digest: "b".repeat(64), signing_key_id: "cloud_0123456789abcdef", signature_b64: "A".repeat(86) + "==",
+  });
+  const metadata = { projectionDigest: digest, projectionBytes: 1024, scenarioCount: 2, findingCount: 1 };
+  const v2 = new CanaryApi({ transport: async () => jsonResponse(permitFor("heel.canary-findings-projection.v2"), 201) });
+  const accepted = await v2.createDisclosurePermit(workspace, project, run, metadata) as { projection: { schema_version: string } };
+  assert.equal(accepted.projection.schema_version, "heel.canary-findings-projection.v2");
+  const v3 = new CanaryApi({ transport: async () => jsonResponse(permitFor("heel.canary-findings-projection.v3"), 201) });
+  await assert.rejects(() => v3.createDisclosurePermit(workspace, project, run, metadata), /invalid canary response/);
+});

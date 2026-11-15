@@ -1328,6 +1328,18 @@ class ConfiguredPlanService:
             raise DiscoveryError("configured_request_not_found")
         return self._row_view(row)
 
+    def view_for_run(self, workspace_id: str, project_id: str, run_id: str, *, actor: object) -> dict:
+        """The frozen configured request that produced one run: what its signed plan was checked against."""
+        ensure_configured_live_test_schema(self.conn)
+        self._member(workspace_id, project_id, actor)
+        row = self.conn.execute(
+            "SELECT * FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? AND run_id=?",
+            (workspace_id, project_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise DiscoveryError("configured_request_not_found")
+        return self._row_view(row)
+
     def list_recent(self, workspace_id: str, project_id: str, *, actor: object) -> dict:
         ensure_configured_live_test_schema(self.conn)
         self._member(workspace_id, project_id, actor)
