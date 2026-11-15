@@ -6,6 +6,25 @@ control plane, and not shipped in any release artifact (`tests/` is excluded by
 `scripts/build_open_core_release.py`). It has no bindings, storage, outbound fetch, redirect,
 dependency or paid feature, and serves only static fake data.
 
+## Standalone files
+
+Deploying the target needs only these four files, extracted together into one directory. No
+repository checkout, git metadata, Heel source or `node_modules` is needed:
+
+| File | Bytes | sha256 |
+|---|---|---|
+| `worker.mjs` | 13120 | `b0d8c1f426986ab613c1f4ca46302607c249cf4a7bcb47c415ac747b552d3bf3` |
+| `wrangler.jsonc` | 765 | `9c33fbf3092722dbfde0f09d6ff68557a07e6cb7379c9e2d72509faaf46b988a` |
+| `openapi.json` | 2282 | `520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19` |
+| `README.md` | this file | |
+
+Check them before deploying (`shasum -a 256 worker.mjs wrangler.jsonc openapi.json`). The
+publisher of these files states one explicit source version with them: the 40-character
+lowercase hex commit they were taken from. The steps below call it `SOURCE_REVISION`; the
+target reports it at `/healthz`. Do not guess it, and do not use `git rev-parse` in an
+extracted copy. `target.test.mjs` and the repository paths named below (`heel/runner/...`,
+`tests/...`) are repository-only background; deployment does not need them.
+
 It closes three target prerequisites of the older loopback harness
 (`tests/plan_differential_support.py`): it is reachable over ordinary public HTTPS once
 deployed (T-1), serves an ownership-proof file (T-2), and has a `patched` mode whose refusal the
@@ -163,42 +182,80 @@ All values are fake; `billing@example.test` is a reserved-domain placeholder.
 Heel evaluator on these two routes; which Heel path decides them, and how, belongs to the
 upcoming configurable-read acceptance, not to this fixture.
 
-**Prepared prerequisites for the upcoming public-only reviewer (declared, not yet provided).** A
-reviewer working only from public surfaces will need, from the operator: an already-running
-controlled deployment of this target that includes these routes (the current deployment does
-not); staging-only free and pro credentials supplied out of band through the existing Keychain
-and secret-fd flow (never in docs, argv or chat); the target's HTTPS origin and its served
-`/openapi.json`; and publishing access for the ownership-proof token. The operator setup and
-rollback below are unchanged by this addition.
+The prerequisites a public-only reviewer needs are listed under
+[Prerequisites](#prerequisites-declared-not-provided-by-these-files).
 
-### Runner mapping
+### Configured tests on this fixture
+
+These are the guide's examples: two comparisons applied to three ordinary access rules, not
+three detectors and not complete coverage of any rule. Every test uses `GET` (a field condition
+on `HEAD` is always inconclusive) and the success check: field `account_id` equals the local
+value `expected_account`, entered on the runner as text `acct_canary`.
+
+| Test | Comparison (restricted → control) | Route | Condition |
+|---|---|---|---|
+| authentication | anonymous → signed-in (free or pro credential) | `/api/private-record` | `record_id` is present |
+| field-level redaction | lower plan (free) → higher plan (pro) | `/api/profile` | `profile` › `billing_contact` is present |
+| whole-feature entitlement | lower plan (free) → higher plan (pro) | `/api/export` | `rows` is present |
+
+Expected outcome per mode, derived from the response tables above and the configured evaluator,
+**not recorded**:
+
+| `HEEL_TARGET_MODE` | `/api/private-record` | `/api/profile` | `/api/export` |
+|---|---|---|---|
+| `vulnerable` | `observed` (anonymous `200` record) | `observed` (free gets the leaf) | `observed` (free gets the export) |
+| `patched` | `blocked` (empty `401`) | `blocked` (free `200` profile, leaf withheld) | `blocked` (empty `403`) |
+| `error_envelope` | `inconclusive` (JSON `401`) | `inconclusive` (JSON `403`) | `inconclusive` (JSON `403`) |
+
+Runner side, with the released runner's installed path (shown here as `./heel-rc5/bin/heel`,
+which follows the release the guide names) and `--backend secret-service` instead of
+`keychain` on Linux. Credentials come from the operator's Keychain items (step 1 below) over a
+file descriptor, never argv; the value `acct_canary` is typed at the hidden prompt. `HOST` and
+`SVC` are set in [Operator setup](#operator-setup-after-independent-review-only):
 
 ```sh
-curl -sS -o openapi.json "https://HOST/openapi.json"     # or use this folder's openapi.json
-heel runner import-openapi openapi.json
+H=./heel-rc5/bin/heel                       # used as "$H" below; quoted, so zsh and bash agree
+curl -sS -o openapi.json "https://HOST/openapi.json"     # or this directory's openapi.json
+"$H" runner import-openapi openapi.json
+"$H" runner credential add --role lower_plan  --profile bearer --label "staging free" --backend keychain --secret-fd 3 \
+  3< <(/usr/bin/security find-generic-password -s "$SVC" -a free -w | tr -d '\n')
+"$H" runner credential add --role higher_plan --profile bearer --label "staging pro"  --backend keychain --secret-fd 3 \
+  3< <(/usr/bin/security find-generic-password -s "$SVC" -a pro -w | tr -d '\n')
+"$H" runner credential add --role authenticated --profile bearer --label "staging signed-in" --backend keychain --secret-fd 3 \
+  3< <(/usr/bin/security find-generic-password -s "$SVC" -a pro -w | tr -d '\n')
+"$H" runner input add --name expected_account --type text --backend keychain   # type acct_canary
+```
+
+The three tests themselves are created, reviewed and approved in the browser, as the guide
+describes. This choreography (credentials taken from the operator's Keychain items) is specific
+to this controlled fixture, whose tokens the operator generated; it is not a general Heel
+requirement.
+
+### Legacy fixed-marker mapping
+
+The routes `/api/exports/{id}` and `/api/auth-records/{id}` serve the earlier fixed-marker
+checks (`runner map`, `runner prepare`, `runner regress`). Configured tests do not use them:
+a configured test needs a literal route.
+
+```sh
+"$H" runner import-openapi openapi.json
 # Ordinary route: no placeholder, so no fixture (empty fixture bindings).
-heel runner map --scenario plan_entitlement_read --method GET --route /api/export
+"$H" runner map --scenario plan_entitlement_read --method GET --route /api/export
 # Canary route (paired canary validation only):
-heel runner map --scenario plan_entitlement_read --method GET --route '/api/exports/{id}' \
+"$H" runner map --scenario plan_entitlement_read --method GET --route '/api/exports/{id}' \
   --fixture-fd 3 3< <(printf '%s' '{"id":"heel-canary-export-0001"}')
 # Authentication read route (anonymous vs authenticated; the anonymous role sends no credential):
-heel runner map --scenario anonymous_authenticated_read --method GET --route '/api/auth-records/{id}' \
+"$H" runner map --scenario anonymous_authenticated_read --method GET --route '/api/auth-records/{id}' \
   --fixture-fd 3 3< <(printf '%s' '{"id":"heel-canary-auth-0001"}')
 ```
 
 For the authentication read, the `anonymous` role needs no credential. The `authenticated` role
-needs one runner credential whose bearer token is either canary token (free or pro). Use the
-same Keychain item as step 3 below:
-
-```sh
-heel runner credential add --role authenticated --profile bearer --label "staging authenticated" --backend keychain --secret-fd 3 \
-  3< <(/usr/bin/security find-generic-password -s "$SVC" -a pro -w | tr -d '\n')
-```
-
-On the canary route the fixture id must be exactly `heel-canary-export-0001`; any other id
-reaches only `404`s and stays `inconclusive`. Which Heel path turns an ordinary `/api/export`
-run into an observed result is a runner property, not this fixture's. This fixture only
-supplies the markerless payload.
+needs one runner credential whose bearer token is either canary token (free or pro); the
+`authenticated` credential add in the configured section above is the same one. On the canary
+route the fixture id must be exactly `heel-canary-export-0001`; any other id reaches only `404`s
+and stays `inconclusive`. Which Heel path turns an ordinary `/api/export` run into an observed
+result is a runner property, not this fixture's. This fixture only supplies the markerless
+payload.
 
 Each request writes one console receipt: a generated `receipt` id, `method` (GET/HEAD/OTHER),
 `route` (a known route or `unknown`), `role` (free/pro/none/malformed/unknown/`-`), `status`,
@@ -206,9 +263,9 @@ Each request writes one console receipt: a generated `receipt` id, `method` (GET
 
 ## Proof status
 
-`target.test.mjs` is **component proof only**: constructed `Request` objects passed to the
-Worker in-process, plus the worker's own responses evaluated by the unchanged Python product
-code: the standalone comparator, and the paired composition (served inventory →
+`target.test.mjs` (repository only) is **component proof only**: constructed `Request` objects
+passed to the Worker in-process, plus the worker's own responses evaluated by the unchanged
+Python product code: the standalone comparator, and the paired composition (served inventory →
 `RouteInventory` → store mapping validator → catalog action → `prepare_action` → body shape →
 `protected_content` with the bound marker → `evaluate_pair`), without mocks.
 CI runs it in the `browser-alpha` job. It proves nothing about DNS, TLS, workers.dev response
@@ -219,27 +276,52 @@ authenticated role).
 For `/api/private-record` and `/api/profile` it proves the credential/mode matrices, the `200`
 redaction control, markerless bodies, `HEAD` framing, method and unknown-path rejection, fail-closed
 configuration, receipt privacy and served/static inventory parity (including `RouteInventory`
-reading all five routes); it runs no Heel evaluator on them.
+reading all five routes); it runs no Heel evaluator on them, so the configured outcomes above
+are expectations only.
 For `/api/export` it also proves the inventory → empty-binding mapping → `prepare_action` steps
 and the comparator rows; it does not run the runner's ordinary plan-differential executor bridge,
 which is implemented and reviewed separately.
 
 ```sh
-node --test tests/fixtures/customer_staging/target.test.mjs     # from the repository root
-wrangler deploy --dry-run --outdir "$SCRATCH/out" --config tests/fixtures/customer_staging/wrangler.jsonc
+node --test tests/fixtures/customer_staging/target.test.mjs     # repository checkout only, from its root
 ```
+
+## Prerequisites (declared, not provided by these files)
+
+These files do not grant any access. Before a deployment or a public-only review, the operator
+must hold, and must state that they hold:
+
+1. **Authorized Cloudflare access**: Wrangler logged in (`wrangler login`) to a Cloudflare
+   account the operator is authorized to deploy to, with a `workers.dev` subdomain. The Workers
+   Free plan is sufficient.
+2. **Node.js and Wrangler**: Node.js with `npx`; the steps below run Wrangler 4.154.0 (the
+   version the Heel repository pins) through `npx`, which downloads it from npm.
+3. **Local synthetic credentials**: the two fake free and pro canary tokens generated in step 1,
+   kept in the operator's macOS Keychain. They never appear in these files, argv, chat or logs.
+   A reviewer receives them out of band through the Keychain and secret-fd flow only.
+4. **Ownership-proof publication**: the ability to run `wrangler secret put HEEL_VERIFY_TOKEN`
+   for this Worker with the token Heel issues for the target's exact origin.
+5. **Target control**: the operator alone changes `HEEL_TARGET_MODE`, by redeploying. The target
+   has no public control endpoint; a reviewer who needs a mode change asks the operator who
+   declared control of the target.
+6. **The source version**: the `SOURCE_REVISION` stated by the publisher of these files.
+
+The current deployment does not include `/api/private-record` or `/api/profile`; a deployment
+from these files does.
 
 ## Operator setup (after independent review only)
 
-All commands run from the repository root on the operator's macOS machine, already logged in
-with `wrangler login` to the existing account. The Workers Free plan and the account's
-`workers.dev` subdomain are sufficient. **If any step asks to add a payment method or upgrade
-the plan, stop and report that one decision; do not upgrade.** Placeholders: `HOST` is the
+All commands run in the directory that holds the four extracted files, on the operator's macOS
+machine, with the prerequisites above. **If any step asks to add a payment method or upgrade the
+plan, stop and report that one decision; do not upgrade.** Placeholders: `HOST` is the
 `heel-customer-staging-target.<SUBDOMAIN>.workers.dev` hostname printed by the first deploy.
 
 ```sh
-CFG=tests/fixtures/customer_staging/wrangler.jsonc
-SVC=heel-customer-staging-target            # Keychain service name for the two canary tokens
+wr() { npx --yes wrangler@4.154.0 "$@"; }  # a function, so zsh and bash run it the same way
+CFG=./wrangler.jsonc                         # this directory's config; main is ./worker.mjs
+SVC=heel-customer-staging-target             # Keychain service name for the two canary tokens
+SOURCE_REVISION=PUBLISHED_40_HEX_COMMIT      # exactly as stated with these files
+wr deploy --dry-run --outdir "$(mktemp -d)" --config "$CFG"   # local bundle check; deploys nothing
 ```
 
 ### 1. Canary tokens stay in the macOS Keychain; the Worker gets only digests
@@ -260,54 +342,50 @@ done
 ### 2. First deploy (fails closed until secrets exist), then digests and ownership token
 
 ```sh
-wrangler deploy --config "$CFG" --var HEEL_TARGET_MODE:vulnerable --var "HEEL_TARGET_REVISION:$(git rev-parse HEAD)"
+wr deploy --config "$CFG" --var HEEL_TARGET_MODE:vulnerable --var "HEEL_TARGET_REVISION:$SOURCE_REVISION"
 for ROLE in free pro; do
   NAME=$( [ "$ROLE" = free ] && echo HEEL_FREE_TOKEN_SHA256 || echo HEEL_PRO_TOKEN_SHA256 )
   /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w | tr -d '\n' \
-    | shasum -a 256 | cut -c1-64 | tr -d '\n' | wrangler secret put "$NAME" --config "$CFG"
+    | shasum -a 256 | cut -c1-64 | tr -d '\n' | wr secret put "$NAME" --config "$CFG"
 done
-# Heel issues the ownership token in onboarding step 2. Copy it to the clipboard, then:
-pbpaste | tr -d '\r\n' | wrangler secret put HEEL_VERIFY_TOKEN --config "$CFG"
-curl -sS "https://HOST/healthz"     # expect mode vulnerable, both *_configured true
+# Heel issues the ownership token when you create the HTTPS-file proof for https://HOST.
+# Copy it to the clipboard, then:
+pbpaste | tr -d '\r\n' | wr secret put HEEL_VERIFY_TOKEN --config "$CFG"
+curl -sS "https://HOST/healthz"     # expect mode vulnerable, revision $SOURCE_REVISION, both *_configured true
 curl -sS "https://HOST/.well-known/heel-verify.txt"
 ```
 
+A `revision` of `unknown` means `SOURCE_REVISION` was not 7-40 lowercase hex characters.
+
 ### 3. Runner credentials from the same Keychain items (secret fd, no argv)
 
-```sh
-heel runner credential add --role lower_plan  --profile bearer --label "staging free" --plan-label free --backend keychain --secret-fd 3 \
-  3< <(/usr/bin/security find-generic-password -s "$SVC" -a free -w | tr -d '\n')
-heel runner credential add --role higher_plan --profile bearer --label "staging pro"  --plan-label pro  --backend keychain --secret-fd 3 \
-  3< <(/usr/bin/security find-generic-password -s "$SVC" -a pro -w | tr -d '\n')
-```
+Use the credential commands in [Configured tests on this fixture](#configured-tests-on-this-fixture).
 
 ### 4. Clean-machine curl check (header from stdin, never argv)
 
 ```sh
 for ROLE in free pro; do
-  /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
-    | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
-    | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/export"
-  /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
-    | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
-    | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/exports/heel-canary-export-0001"
-  /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
-    | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
-    | curl -sS -o /dev/null -w "$ROLE %{http_code} %{size_download}\n" -H @- "https://HOST/api/auth-records/heel-canary-auth-0001"
+  for ROUTE in /api/export /api/private-record /api/profile; do
+    /usr/bin/security find-generic-password -s "$SVC" -a "$ROLE" -w \
+      | { IFS= read -r t; printf 'Authorization: Bearer %s\n' "$t"; } \
+      | curl -sS -o /dev/null -w "$ROLE $ROUTE %{http_code} %{size_download}\n" -H @- "https://HOST$ROUTE"
+  done
 done
-curl -sS -o /dev/null -w "anonymous %{http_code} %{size_download}\n" "https://HOST/api/auth-records/heel-canary-auth-0001"
+curl -sS -o /dev/null -w "anonymous /api/private-record %{http_code} %{size_download}\n" "https://HOST/api/private-record"
 ```
 
-In `vulnerable` mode the `/api/export` lines should read `200 97`, the canary lines `200 142`,
-the authenticated record lines `200 130` and the anonymous line `200 130`. In `patched` mode the
-anonymous line reads `401 0`, and in `error_envelope` mode it reads `401 27`.
+In `vulnerable` mode every authenticated line reads `200`: `/api/export` 97 bytes,
+`/api/private-record` 94 and `/api/profile` 114, and the anonymous line reads `200 94`. In
+`patched` mode free `/api/export` reads `403 0`, free `/api/profile` `200 73` and the anonymous
+line `401 0`. In `error_envelope` mode free `/api/export` and free `/api/profile` read `403 28`
+(`{"error":"upgrade required"}`), and the anonymous line reads `401 27`.
 
 ### 5. Receipts during the journey (bounded fields only)
 
 `wrangler tail` events also carry request metadata, so keep only the logged receipt lines:
 
 ```sh
-wrangler tail heel-customer-staging-target --format json \
+wr tail heel-customer-staging-target --format json \
   | jq -c --unbuffered '.logs[]?.message[]? | fromjson? | select(type == "object" and has("receipt"))' \
   > "$EVIDENCE_DIR/target-receipts.jsonl"
 ```
@@ -317,32 +395,33 @@ wrangler tail heel-customer-staging-target --format json \
 Record each version id (non-secret) in the operator's evidence before changing mode:
 
 ```sh
-wrangler deployments list --config "$CFG"                                   # note current VERSION_ID
-wrangler deploy --config "$CFG" --var HEEL_TARGET_MODE:patched        --var "HEEL_TARGET_REVISION:$(git rev-parse HEAD)"
-wrangler deploy --config "$CFG" --var HEEL_TARGET_MODE:error_envelope --var "HEEL_TARGET_REVISION:$(git rev-parse HEAD)"
-wrangler rollback VERSION_ID --config "$CFG" --message "restore recorded target mode"
-wrangler delete --config "$CFG"                                             # only on an explicit teardown decision
+wr deployments list --config "$CFG"                                   # note current VERSION_ID
+wr deploy --config "$CFG" --var HEEL_TARGET_MODE:patched        --var "HEEL_TARGET_REVISION:$SOURCE_REVISION"
+wr deploy --config "$CFG" --var HEEL_TARGET_MODE:error_envelope --var "HEEL_TARGET_REVISION:$SOURCE_REVISION"
+wr rollback VERSION_ID --config "$CFG" --message "restore recorded target mode"
+wr delete --config "$CFG"                                             # only on an explicit teardown decision
 ```
 
 Secrets persist across deploys. Rotate a canary by repeating step 1 for that role, its digest
-in step 2, and its runner credential in step 3.
+in step 2, and its runner credentials.
 
 ## Expected deployed acceptance (not yet run)
 
-From a clean machine with the released runner and the mappings above, ownership verifies over
-HTTPS and each runner request appears as one receipt.
+From a clean machine with the released runner, ownership verifies over HTTPS and each runner
+request appears as one receipt. None of the following has been run against a deployment of these
+files.
 
-- **Ordinary plan-differential exposure**, `GET /api/export`: a runner whose ordinary
+- **Configured tests**, the three tests in
+  [Configured tests on this fixture](#configured-tests-on-this-fixture): `observed` in
+  `vulnerable`, `blocked` in `patched` and `inconclusive` in `error_envelope`, as in that table.
+- **Ordinary plan-differential exposure** (legacy), `GET /api/export`: a runner whose ordinary
   plan-differential bridge is deployed is expected to report the markerless comparator result:
   `observed` (row 6 key-path superset) in `vulnerable`, `blocked` (row 7) in `patched` and
   `inconclusive` (row 9) in `error_envelope`. Without that bridge the run is `inconclusive`.
-- **Canary-dependent paired read validation**, `GET /api/exports/{id}`: `observed` in
+- **Canary-dependent paired read validation** (legacy), `GET /api/exports/{id}`: `observed` in
   `vulnerable`, `blocked` in `patched` and `inconclusive` in `error_envelope`.
-- **Authentication read**, `GET /api/auth-records/{id}` (`anonymous_authenticated_read`):
-  `observed` in `vulnerable`, `blocked` in `patched` and `inconclusive` in `error_envelope`.
-  This is expected only. The fixture tests above are in-process component proof. No deployed
-  run of this route has happened, and the deployed target has not been redeployed with it.
+- **Authentication read** (legacy), `GET /api/auth-records/{id}`
+  (`anonymous_authenticated_read`): `observed` in `vulnerable`, `blocked` in `patched` and
+  `inconclusive` in `error_envelope`.
 
-All three are checks of this one synthetic target, not a product coverage claim. The
-`/api/private-record` and `/api/profile` routes are not deployed and have no expected deployed
-result recorded here; that belongs to E4.
+All are checks of this one synthetic target, not a product coverage claim.
