@@ -12,7 +12,8 @@ import type {
   ScenarioLibraryEntry,
 } from "../../lib/canary-api";
 import { CanaryApiError } from "../../lib/canary-api";
-import { BACKEND_NOTE, COMPARISON_LABELS, TYPE_NOTE, conditionText, inputCommand, successCheckText } from "../../lib/live-test-text";
+import { COMPARISON_LABELS, conditionText, successCheckText, type LocalBackend, type LocalValueType } from "../../lib/live-test-text";
+import { LocalValueCommands } from "../canary/LocalValueChoices";
 import {
   LiveAssertionFields,
   emptyLiveAssertionDraft,
@@ -149,6 +150,8 @@ function errorText(error: unknown): string {
 export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssessor, retainedInput = null, onSaved }: ScenarioLibraryCardProps) {
   const [guided, setGuided] = useState<GuidedForm>(newGuidedForm);
   const [savedNote, setSavedNote] = useState<{ id: string; revision: number; refs: readonly string[] } | null>(null);
+  const [backend, setBackend] = useState<LocalBackend>("keychain");
+  const [valueTypes, setValueTypes] = useState<Readonly<Record<string, LocalValueType>>>({});
   const [library, setLibrary] = useState<Readonly<ScenarioLibrary> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
@@ -440,10 +443,8 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
             {savedNote ? (
               <div role="status">
                 <p>Saved <code>{savedNote.id}</code> revision {savedNote.revision}. Before requesting a dry run, enter each named value on the runner (hidden prompt):</p>
-                <ul aria-label="Local values to enter on the runner">
-                  {savedNote.refs.map((ref) => <li key={ref}><code>{inputCommand(ref)}</code></li>)}
-                </ul>
-                <p>{TYPE_NOTE} {BACKEND_NOTE}</p>
+                <LocalValueCommands backend={backend} onBackend={setBackend} references={savedNote.refs}
+                  onType={(reference, value) => setValueTypes((current) => ({ ...current, [reference]: value }))} types={valueTypes} />
               </div>
             ) : null}
           </fieldset>

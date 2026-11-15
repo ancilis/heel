@@ -40,19 +40,46 @@ export function roleText(role: string, labels: readonly PlanLabel[]): string {
 /** One local step: plain-language text, exact commands to run on the runner machine, and an optional note. */
 export interface LocalAdvice { text: string; commands: readonly string[]; note?: string }
 
-/** The local OS secret store choices the runner supports, as its CLI spells them. */
-export const BACKEND_NOTE = "Use --backend keychain on macOS or --backend secret-service on Linux.";
-/**
- * How to pick --type so the stored value compares equal to the response: equality is strict, so the text "42" never
- * equals the number 42 and the text "true" never equals the boolean true.
- */
-export const TYPE_NOTE = "Pick --type to match the JSON value in the response: text for \"abc\" (typed without quotes), number for 42 or 1.5, "
-  + "boolean for true or false. --type null stores JSON null and asks for nothing. Every other type asks in a hidden prompt; "
-  + "the value never reaches this browser or Heel Cloud.";
+/** Non-secret choices the browser may make for a generated local command. */
+export type LocalValueType = "text" | "number" | "boolean" | "null";
+export type LocalBackend = "keychain" | "secret-service";
+export const VALUE_TYPE_LABELS: Readonly<Record<LocalValueType, string>> = Object.freeze({
+  text: "Text (for example abc, typed without quotes)", number: "Number (for example 42 or 1.5)",
+  boolean: "Boolean (true or false)", null: "Null (stores JSON null; nothing is asked)",
+});
+export const BACKEND_LABELS: Readonly<Record<LocalBackend, string>> = Object.freeze({
+  keychain: "macOS Keychain", "secret-service": "Linux Secret Service",
+});
+/** Why the type matters: equality is strict, so the text "42" never equals the number 42. */
+export const TYPE_NOTE = "Choose the type of the JSON value in the response; equality is strict, so text \"42\" never equals the number 42. "
+  + "Any type except null asks for the value in a hidden prompt on the runner; it never reaches this browser or Heel Cloud.";
 
-/** The command that stores one named expected value locally (the value itself is typed only at the hidden prompt). */
-export function inputCommand(ref: string): string {
-  return `${RUNNER_RC5_CLI} runner input add --name ${ref} --type <text|number|boolean|null> --backend <keychain|secret-service>`;
+const SAFE_ARGUMENT = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+function quoted(value: string): string {
+  if (!SAFE_ARGUMENT.test(value)) throw new Error("unsafe command argument");
+  return value.includes(" ") ? `"${value}"` : value;
+}
+
+/** One runnable command storing a named expected value locally; the value is typed only at the hidden prompt. */
+export function inputCommand(ref: string, type: LocalValueType, backend: LocalBackend): string {
+  return `${RUNNER_RC5_CLI} runner input add --name ${quoted(ref)} --type ${type} --backend ${backend}`;
+}
+
+/** One runnable bearer-credential command; the token is typed only at the hidden prompt. */
+export function credentialCommand(role: string, planLabel: string | null, backend: LocalBackend): string {
+  const words = role.replace("_", " ");
+  const plan = planLabel !== null && role.endsWith("_plan") ? ` --plan-label ${quoted(planLabel)}` : "";
+  return `${RUNNER_RC5_CLI} runner credential add --role ${quoted(role)} --label ${quoted(words)}${plan} --profile bearer --backend ${backend}`;
+}
+
+/** Placeholder path: the customer's own OpenAPI file, which the browser never sees. */
+export const OPENAPI_PATH = "./openapi.json";
+export const IMPORT_COMMAND = `${RUNNER_RC5_CLI} runner import-openapi ${OPENAPI_PATH}`;
+
+export interface AdviceChoices {
+  backend: LocalBackend;
+  typeFor: (ref: string) => LocalValueType;
+  planLabelFor: (role: string) => string | null;
 }
 
 /**
@@ -60,22 +87,22 @@ export function inputCommand(ref: string): string {
  * (configured_regression) must reuse the ORIGINAL frozen input handles, so it never advises re-adding a value.
  */
 export function readinessAdvice(
-  item: ConfiguredReadinessRequirement, route: string, planKind: "configured_live_read" | "configured_regression" = "configured_live_read",
+  item: ConfiguredReadinessRequirement, route: string,
+  planKind: "configured_live_read" | "configured_regression" = "configured_live_read",
+  choices: AdviceChoices = { backend: "keychain", typeFor: () => "text", planLabelFor: () => null },
 ): LocalAdvice | null {
   if (item.state === "ready") return null;
   if (item.kind === "route") {
     return item.state === "unsupported"
       ? { text: "Parameterized routes are not supported for configured tests yet. Choose a literal route.", commands: [] }
-      : { text: `Import the OpenAPI document that contains ${route} on the runner:`, commands: [`${RUNNER_RC5_CLI} runner import-openapi <openapi.json>`] };
+      : { text: `Import the OpenAPI document that contains ${route} on the runner:`, commands: [IMPORT_COMMAND],
+        note: `${OPENAPI_PATH} stands for the path of your own OpenAPI file on the runner machine.` };
   }
   if (item.kind === "role_credential") {
     const role = item.subject ?? "";
-    const words = role.replace("_", " ");
-    const planLabel = role.endsWith("_plan") ? ` --plan-label <your ${role.replace("_plan", "")}-plan name>` : "";
     return {
-      text: `Store the ${words} credential on the runner (hidden prompt):`,
-      commands: [`${RUNNER_RC5_CLI} runner credential add --role ${role} --label "${words}"${planLabel} --profile <bearer|cookie_jar|x_api_key> --backend <keychain|secret-service>`],
-      note: BACKEND_NOTE,
+      text: `Store the ${role.replace("_", " ")} bearer token on the runner (hidden prompt):`,
+      commands: [credentialCommand(role, choices.planLabelFor(role), choices.backend)],
     };
   }
   if (item.kind === "local_input") {
@@ -87,12 +114,13 @@ export function readinessAdvice(
         commands: [],
       };
     }
+    const ref = item.subject ?? "";
     return {
       text: item.state === "revoked"
-        ? `The current value for “${item.subject}” was revoked. Store a new one on the runner:`
-        : `Enter the expected value on the runner (hidden prompt, never in the browser):`,
-      commands: [inputCommand(item.subject ?? "")],
-      note: `${TYPE_NOTE} ${BACKEND_NOTE}`,
+        ? `The current value for “${ref}” was revoked. Store a new one on the runner:`
+        : "Enter the expected value on the runner (never in the browser):",
+      commands: [inputCommand(ref, choices.typeFor(ref), choices.backend)],
+      note: TYPE_NOTE,
     };
   }
   return { text: "The original run is not on this runner. Replay it from the runner that executed it, or request a new dry run of the test.", commands: [] };

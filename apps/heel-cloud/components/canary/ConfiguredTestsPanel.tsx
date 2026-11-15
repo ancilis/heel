@@ -13,6 +13,8 @@ import type {
 } from "../../lib/canary-api";
 import { CanaryApiError } from "../../lib/canary-api";
 import { selectionQuery } from "../../lib/account-context";
+import { BackendChoice, ValueTypeChoice } from "./LocalValueChoices";
+import type { LocalBackend, LocalValueType } from "../../lib/live-test-text";
 import {
   COMPARISON_LABELS,
   STATE_WORDS,
@@ -85,6 +87,8 @@ export function ConfiguredTestsPanel({
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
+  const [backend, setBackend] = useState<LocalBackend>("keychain");
+  const [valueTypes, setValueTypes] = useState<Readonly<Record<string, LocalValueType>>>({});
 
   const reload = useCallback(() => setTick((value) => value + 1), []);
 
@@ -190,6 +194,9 @@ export function ConfiguredTestsPanel({
           <article aria-labelledby="configured-request-title" className="configured-request">
             <h3 id="configured-request-title">{current.planKind === "configured_regression" ? "Latest replay request" : "Latest dry-run request"}</h3>
             <p role="status">{statusText(current)}</p>
+            {current.status === "open" && current.readiness?.instances.some((entry) => entry.requirements.some((item) => item.state !== "ready")) ? (
+              <BackendChoice onChange={setBackend} value={backend} />
+            ) : null}
             <ol aria-label="Frozen tests in this request">
               {current.instances.map((instance, index) => {
                 const readiness = current.readiness?.instances[index];
@@ -202,10 +209,16 @@ export function ConfiguredTestsPanel({
                     {readiness && current.status === "open" ? (
                       <ul aria-label={`Runner readiness for ${instance.source.sourceScenarioId}`}>
                         {readiness.requirements.map((item) => {
-                          const advice = readinessAdvice(item, `${instance.method} ${instance.routeTemplate}`, current.planKind);
+                          const advice = readinessAdvice(item, `${instance.method} ${instance.routeTemplate}`, current.planKind, {
+                            backend, typeFor: (ref) => valueTypes[ref] ?? "text",
+                            planLabelFor: (role) => current.planLabels.find((label) => label.role === role)?.plan_label ?? null,
+                          });
+                          const chooseType = item.kind === "local_input" && advice !== null && advice.commands.length > 0 && item.subject !== null;
                           return (
                             <li key={`${item.kind}:${item.subject ?? ""}`}>
                               {requirementLabel(item)}: <strong>{STATE_WORDS[item.state]}</strong>
+                              {chooseType ? <ValueTypeChoice reference={item.subject as string} value={valueTypes[item.subject as string] ?? "text"}
+                                onChange={(value) => setValueTypes((types) => ({ ...types, [item.subject as string]: value }))} /> : null}
                               {advice ? <>
                                 <br /><span>{advice.text}</span>
                                 {advice.commands.map((command) => <span key={command}><br /><code>{command}</code></span>)}
