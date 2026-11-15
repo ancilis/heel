@@ -68,6 +68,11 @@ _RESYNC_ATTEMPT_SCHEMA = "heel.runner-resync-attempt.v1"
 _SUPERSEDED_CALL_SCHEMA = "heel.runner-superseded-call.v1"
 # C recovery: a cloud-attested inactive, unexecuted claim is retired into one sealed archive row.
 _RETIRED_CLAIM_SCHEMA = "heel.runner-retired-claim.v1"
+# What retirement observed locally: no reservation, or a never-activated (verified, event-free) one.
+_RETIRED_LOCAL_OBSERVATIONS = (
+    {"reservation": "absent", "terminal": "absent"},
+    {"reservation": "reserved", "terminal": "absent"},
+)
 _RUN_CHAIN_OPERATIONS = ("heartbeat", "progress", "result", "stop-ack")
 _RETIRED_ATTESTATION_HEADERS = frozenset({
     "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature",
@@ -4877,14 +4882,14 @@ class RunnerRuntimeState:
     def _retired_core(
         self, *, run_id: str, created_at_ms: int, sealing_identity: Mapping[str, Any],
         active: Mapping[str, Any], chains: list[Mapping[str, Any]], pending: list[Mapping[str, Any]],
-        attestation: Mapping[str, Any],
+        attestation: Mapping[str, Any], reservation: str = "absent",
     ) -> dict[str, Any]:
         """Assemble the closed archive shape (RETIREMENT-RESYNC §4.1) and its retired digest."""
         core = {
             "schema_version": _RETIRED_CLAIM_SCHEMA, "reason": "cloud_inactive_attested",
             "run_id": run_id, "run_hash": _run_hash(run_id), "created_at_ms": created_at_ms,
             "sealing_identity": dict(sealing_identity),
-            "local_observations": {"reservation": "absent", "terminal": "absent"},
+            "local_observations": {"reservation": reservation, "terminal": "absent"},
             "chain_recovery": {
                 "run_chain_rows": 0,
                 "run_chains": {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS},
@@ -4929,7 +4934,7 @@ class RunnerRuntimeState:
         _safe_int(identity["authority_epoch"], "runtime retired sealing identity", minimum=1)
         keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
         if (
-            value["local_observations"] != {"reservation": "absent", "terminal": "absent"}
+            value["local_observations"] not in _RETIRED_LOCAL_OBSERVATIONS
             or not isinstance(value["chain_recovery"], Mapping)
             or set(value["chain_recovery"]) != {"run_chain_rows", "run_chains"}
             or type(value["chain_recovery"]["run_chain_rows"]) is not int
@@ -5111,8 +5116,11 @@ class RunnerRuntimeState:
         The caller, not this method, guarantees that no ``reserve_run`` caller exists in any process:
         it holds the exclusive serve lock for this HEEL_HOME and retires before hydration.  The
         snapshot digest proves only that the runtime row is unchanged; ``reservation_probe`` must be
-        the Store's ``RunReservationProbe.ABSENT`` observed under that ownership.  Pending delivery
-        stays uncertain, nothing in ``chain_recovery`` is written, and nothing grants execution.
+        the Store's ``RunReservationProbe.ABSENT`` observed under that ownership, or ``reserved``
+        when the caller observed, under the same ownership, a never-activated local reservation
+        (``verified`` with an empty containment log).  A reserved run's signed Store authority is
+        left untouched; only this runtime group is sealed and removed.  Pending delivery stays
+        uncertain, nothing in ``chain_recovery`` is written, and nothing grants execution.
 
         The archived ``local_observations.reservation`` is that ``RunReservationProbe`` value observed
         under the serve lock at retirement: ``absent`` means no reservation record exists now (never
@@ -5124,8 +5132,10 @@ class RunnerRuntimeState:
         run_hash = _run_hash(run_id)
         expected_state_digest = _digest(expected_state_digest, "runtime retirement state digest")
         now_ms = _safe_int(now_ms, "runtime retirement time")
-        if not isinstance(reservation_probe, str) or reservation_probe != "absent":
-            raise RunnerRuntimeConflict("runtime retirement requires an absent local reservation")
+        if not isinstance(reservation_probe, str) or reservation_probe not in {"absent", "reserved"}:
+            raise RunnerRuntimeConflict(
+                "runtime retirement requires an absent or never-activated local reservation"
+            )
         attestation = self._retirement_attestation(evidence)
         keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
         with self._connection() as conn:
@@ -5212,7 +5222,7 @@ class RunnerRuntimeState:
                         "delivery": "uncertain",
                         "sealed_blob_b64": self._canonical_b64(row["sealed_blob"]),
                     } for row in pending_rows],
-                    attestation=attestation,
+                    attestation=attestation, reservation=reservation_probe,
                 )
                 try:
                     metadata = _retired_metadata_size(core)

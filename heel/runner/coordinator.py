@@ -25,6 +25,8 @@ from heel.canary_contracts import (
 from heel.crypto import verify_envelope
 from heel.runner.control_client import (
     RunnerChainRecoveryDeferred,
+    RunnerInactiveClaimRecoveryBlocked,
+    RunnerInactiveClaimRecoveryWaiting,
     RunnerChainRecoveryRequired,
     RunnerControlClient,
     RunnerResultChainRecovered,
@@ -276,48 +278,87 @@ class RunnerCoordinator:
             raise RunnerStoreError("local findings replay authority is invalid") from None
         return request
 
-    def _inactive_claim_eligible(self, active: object, pending: tuple[object, ...], now_ms: int) -> bool:
+    def _inactive_claim_eligible(
+        self, active: object, pending: tuple[object, ...], now_ms: int,
+    ) -> tuple[RunReservationProbe, bool] | None:
         """POSTRESET §7.1 L2-L5 for one loaded (L1-valid) active row; L6 is construction order.
 
+        Returns ``None`` (keep the existing restart path) or ``(probe, required)``.
+
         L2 is exactly the hydration failure C exists for: a failed persisted gate or an expired
-        grant.  Every other row keeps its existing restart path.  The coordinator is built before
-        any executor exists and ``serve`` holds the exclusive instance lock, so no reservation can
-        appear between the Store probe and the retirement.
+        grant.  The coordinator is built before any executor exists and ``serve`` holds the
+        exclusive instance lock, so no reservation can appear or advance between the Store reads
+        and the retirement.
+
+        Besides ``ABSENT``, a ``RESERVED`` run is eligible only while it provably never activated:
+        its local state is ``verified`` and its signed containment log is empty (``running`` is
+        durable before any secret, DNS or target action).  Such a reservation exists after a lost
+        claim answer was replayed at restart.  It is eligible under L2 (``required``: a refusal is
+        raised exactly as for an absent reservation), and also when the row can no longer be
+        dispatched by ``_recovered_lease`` (revision > 1 or a staged heartbeat, e.g. a lost
+        recovery-heartbeat answer) so that a Cloud Stop is learned at restart (not ``required``:
+        a ``run_live`` answer keeps the row and construction continues).  A dispatchable row
+        (revision 1, no staged call, passing gate) keeps the ab3a112 recovered-dispatch path.
         """
         try:
             gate = ExecutionGate(**dict(active.gate))
         except (TypeError, ValueError):
-            return False
-        if (
+            return None
+        l2 = not (
             _gate_failure(gate, active.grant["kill_switch_generation"]) is None
             and now_ms < active.grant["expires_at_ms"]
-        ):
-            return False
+        )
         if self.control.runtime.load_terminal_state(active.run_id) is not None:
-            return False
+            return None
+        staged = [item for item in pending if item.run_id == active.run_id]
         if any(
-            item.run_id == active.run_id
-            and (item.chain_operation != "heartbeat" or item.request_operation != "heartbeat")
-            for item in pending
+            item.chain_operation != "heartbeat" or item.request_operation != "heartbeat"
+            for item in staged
         ):
-            return False
-        return self.store.probe_run_reservation(active.run_id) is RunReservationProbe.ABSENT
+            return None
+        probe = self.store.probe_run_reservation(active.run_id)
+        if probe is RunReservationProbe.ABSENT:
+            return (probe, True) if l2 else None
+        if probe is not RunReservationProbe.RESERVED:
+            return None
+        local = self.store.load_run(active.run_id)
+        if local["state"] != "verified" or self.store.load_run_events(active.run_id):
+            return None  # possibly activated: never retired here; existing refusals apply
+        if l2:
+            return probe, True
+        if active.revision != 1 or staged:
+            return probe, False
+        return None
 
     def _reconcile_inactive_claims(self) -> None:
         """Retire every eligible pre-activation claim before any active authority is hydrated.
 
         Only a pinned grant-authority attestation of this exact claim retires it, through the control
         client's per-run guard.  Any refusal, unusable answer or transport failure is raised with the
-        sealed group intact; the next construction asks again with a new challenge.
+        sealed group intact; the next construction asks again with a new challenge.  The one
+        exception is a non-L2 never-activated reservation the Cloud does not attest inactive (still
+        live, or a closed refusal): that row is kept unchanged and construction continues, as it
+        did before it was eligible.
         """
         pending = self.control.runtime.load_pending_calls(limit=74)
         now_ms = self._now_ms()
         for active in self.control.runtime.load_active_run_controls(limit=64):
-            if not self._inactive_claim_eligible(active, pending, now_ms):
+            eligible = self._inactive_claim_eligible(active, pending, now_ms)
+            if eligible is None:
                 continue
-            verified = self.control._attest_inactive_claim(active.run_id)
+            probe, required = eligible
+            try:
+                verified = self.control._attest_inactive_claim(active.run_id)
+            except (RunnerInactiveClaimRecoveryWaiting, RunnerInactiveClaimRecoveryBlocked):
+                # A required (L2) row cannot hydrate: the refusal is raised as before.  A non-L2
+                # never-activated row was restartable without this request; any Cloud refusal
+                # keeps it exactly as it was.  An untrusted answer or a transport failure is
+                # raised in both cases.
+                if required:
+                    raise
+                continue
             self.control._retire_inactive_claim(
-                verified, reservation_probe=RunReservationProbe.ABSENT.value, now_ms=self._now_ms(),
+                verified, reservation_probe=probe.value, now_ms=self._now_ms(),
             )
             with self._lock:
                 if (
