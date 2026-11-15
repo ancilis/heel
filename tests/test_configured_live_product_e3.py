@@ -18,7 +18,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import sqlite3
 
 import pytest
@@ -124,26 +123,8 @@ class E3Vault:
         self.items.pop(handle_id, None)
 
 
-def mirror_worker_sync_route(monkeypatch):
-    """The test edge mirrors the Worker allowlist; the accepted harness file stays byte-identical
-    (it is a hash-pinned H2 input), so the one new runner route the Worker now allows is added here."""
-    import tests.support.edge_tls_harness as edge
-
-    sync = re.compile(rf"^/v1/workspaces/{edge._WS}/runners/{edge._RUNNER}/contexts/rcb_[0-9a-f]{{32}}/configured-plan-requests/sync$")
-    original, original_cap = edge._RUNNER_CONTEXT_CONTROL, edge._body_cap
-
-    class Either:
-        @staticmethod
-        def match(path):
-            return original.match(path) or sync.match(path)
-
-    monkeypatch.setattr(edge, "_RUNNER_CONTEXT_CONTROL", Either())
-    monkeypatch.setattr(edge, "_body_cap", lambda path: 8 * 1024 if sync.match(path) else original_cap(path))
-
-
 class E3Customer(Customer):
     def __init__(self, tmp_path, serve_harness, monkeypatch, name):
-        mirror_worker_sync_route(monkeypatch)
         super().__init__(tmp_path, serve_harness, monkeypatch, name)
         self.vault = E3Vault()
         self.target = BillingTarget()
