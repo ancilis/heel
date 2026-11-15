@@ -120,6 +120,19 @@ const CANARY_FINDINGS_ROUTE = new RegExp(
 // selection bindings. All three ride the human canary family: cookie only, exact same-origin POST.
 const SCENARIO_LIBRARY_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/scenario-library$`);
 const SCENARIO_LIBRARY_CUSTOM_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/scenario-library/custom$`);
+// E3 configured live tests: a browser request names private revisions for one runner context;
+// the paired runner alone receives it over its PoP chain (configured-plan-requests/sync).
+const PLAN_REQUEST_REF = "cpr_[0-9a-f]{32}";
+const CONFIGURED_PLAN_CREATE_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/runner-context-bindings/${RUNNER_CONTEXT_REF}/configured-plan-requests$`,
+);
+const CONFIGURED_PLAN_LIST_ROUTE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/configured-plan-requests$`);
+const CONFIGURED_PLAN_VIEW_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/configured-plan-requests/${PLAN_REQUEST_REF}$`,
+);
+const CONFIGURED_PLAN_CANCEL_ROUTE = new RegExp(
+  `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/configured-plan-requests/${PLAN_REQUEST_REF}/cancel$`,
+);
 const CANARY_SCENARIO_BINDINGS_ROUTE = new RegExp(
   `^/v1/workspaces/${WORKSPACE_REF}/projects/${PROJECT_REF}/canary-runs/${CANARY_RUN_REF}/scenario-bindings$`,
 );
@@ -147,6 +160,7 @@ const MAX_RUNNER_CONTROL_BODY_BYTES = 36 * 1024;
 const MAX_RUNNER_CONTEXT_LIST_BODY_BYTES = 128;
 const MAX_RUNNER_CONTEXT_CLAIM_BODY_BYTES = 256;
 const MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES = 69632;
+const MAX_RUNNER_CONFIGURED_SYNC_BODY_BYTES = 8 * 1024;
 const MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES = 272 * 1024;
 const MAX_RUNNER_RESYNC_BODY_BYTES = 2 * 1024;
 const MAX_RUNNER_DISCLOSURE_POLL_BODY_BYTES = 2 * 1024;
@@ -167,7 +181,7 @@ const RUNNER_ROTATION_APPROVE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/run
 const RUNNER_REVOKE = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/revoke$`);
 const RUNNER_ROTATION_PUBLIC = /^\/v1\/runner-rotations\/rotation_[0-9a-f]{32}\/(?:activate|poll|activation-abort)$/;
 const RUNNER_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}(?:/claim|/runs/[A-Za-z0-9_-]{1,128}/(?:heartbeat|progress|result|stop-ack))$`);
-const RUNNER_CONTEXT_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/contexts(?:/list|/${RUNNER_CONTEXT_REF}/(?:claim|approval-projections))$`);
+const RUNNER_CONTEXT_CONTROL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/contexts(?:/list|/${RUNNER_CONTEXT_REF}/(?:claim|approval-projections|configured-plan-requests/sync))$`);
 const RUNNER_RESULT_PROJECTION = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/result-projection$`);
 // Metadata-only result-handoff poll on the run's result chain: runner-proof family, 2 KiB.
 const RUNNER_DISCLOSURE_POLL = new RegExp(`^/v1/workspaces/${WORKSPACE_REF}/runners/[A-Za-z0-9_-]{1,128}/runs/${CANARY_RUN_REF}/disclosure-poll$`);
@@ -192,6 +206,9 @@ function isHumanCanaryRoute(method: string, upstreamPath: string): boolean {
   if (SCENARIO_LIBRARY_ROUTE.test(upstreamPath)) return method === "GET";
   if (SCENARIO_LIBRARY_CUSTOM_ROUTE.test(upstreamPath)) return method === "POST";
   if (CANARY_SCENARIO_BINDINGS_ROUTE.test(upstreamPath)) return method === "GET" || method === "POST";
+  if (CONFIGURED_PLAN_CREATE_ROUTE.test(upstreamPath)) return method === "POST";
+  if (CONFIGURED_PLAN_LIST_ROUTE.test(upstreamPath) || CONFIGURED_PLAN_VIEW_ROUTE.test(upstreamPath)) return method === "GET";
+  if (CONFIGURED_PLAN_CANCEL_ROUTE.test(upstreamPath)) return method === "POST";
   return CANARY_FINDINGS_ROUTE.test(upstreamPath) && method === "GET";
 }
 
@@ -403,9 +420,10 @@ function controlPlaneRequestHeaders(
     ? runnerResultProjection
       ? MAX_RUNNER_RESULT_PROJECTION_BODY_BYTES
       : runnerDisclosurePoll ? MAX_RUNNER_DISCLOSURE_POLL_BODY_BYTES : (upstreamPath.endsWith("/contexts/list") ? MAX_RUNNER_CONTEXT_LIST_BODY_BYTES
+        : (runnerContextControl && upstreamPath.endsWith("/configured-plan-requests/sync") ? MAX_RUNNER_CONFIGURED_SYNC_BODY_BYTES
         : (runnerContextControl && upstreamPath.endsWith("/claim") ? MAX_RUNNER_CONTEXT_CLAIM_BODY_BYTES
           : (upstreamPath.endsWith("/approval-projections") ? MAX_RUNNER_CONTEXT_SUBMIT_BODY_BYTES
-            : (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES))))
+            : (upstreamPath.endsWith("/claim") ? MAX_RUNNER_CLAIM_BODY_BYTES : MAX_RUNNER_CONTROL_BODY_BYTES)))))
     : runnerResync
       ? MAX_RUNNER_RESYNC_BODY_BYTES
       : (runnerPairingPublic || runnerPairingHuman)

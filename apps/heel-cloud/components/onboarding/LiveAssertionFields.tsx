@@ -135,7 +135,7 @@ function segmentError(row: LivePathRowDraft): string | null {
   // Saved checks are canonicalized as NFC and must never rename a real JSON key, so only keys already in NFC are
   // supported here. The typed text is kept exactly as entered; it is not normalized for the customer.
   if (row.text !== row.text.normalize("NFC")) {
-    return "This key uses decomposed Unicode (for example e followed by a combining accent). Saved checks support keys in composed (NFC) form only; type the key with composed characters, matching the response exactly.";
+    return "This release cannot target non-NFC response keys. Use another supported key; do not change the spelling unless it exactly matches the response.";
   }
   if ([...row.text].length > LIVE_KEY_MAX_CHARS) return "Use at most 128 characters in one key.";
   if (ENCODER.encode(row.text).length > LIVE_KEY_MAX_BYTES) return "Use at most 256 bytes (UTF-8) in one key.";

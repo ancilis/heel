@@ -297,7 +297,7 @@ describe("guided assertion editor", () => {
     expect(key.value).toBe("cafe\u0301");
     expect(lastDraft().conditionPath[2]!.text).toBe("cafe\u0301");
     expect(key.getAttribute("aria-invalid")).toBe("true");
-    expect(describedText(key)).toMatch(/composed \(NFC\) form/);
+    expect(describedText(key)).toMatch(/cannot target non-NFC response keys/);
     const rejected = lastValidation();
     expect(rejected.ok).toBe(false);
     expect(Object.keys(rejected.ok ? {} : rejected.errors)).toEqual([`condition.segment.${lastDraft().conditionPath[2]!.id}`]);

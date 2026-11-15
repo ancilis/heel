@@ -29,7 +29,7 @@ function entry(id: string, overrides: Partial<ScenarioLibraryEntry> = {}): Scena
     category: "unintended_endpoints", kind: "endpoint", pack: "core_saas", recommendedControl: "control",
     mechanismId: id, applicability: "unknown", applicabilityRule: "always", evidenceState: "inferred",
     executionSupport: "static_only", catalogScenarioId: null, bindingVersion: null, coverageStatement: null,
-    prerequisites: [], ...overrides,
+    prerequisites: [], liveTest: null, liveSupport: overrides.source === "custom" ? "static_only" : "template_only", ...overrides,
   };
 }
 

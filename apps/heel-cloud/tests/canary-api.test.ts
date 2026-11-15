@@ -839,7 +839,7 @@ describe("disclosure state and synchronized findings reads", () => {
     const value = await api.getFindings(workspace, project, run);
     expect(calls).toEqual([findingsPath]);
     expect(value).toEqual(findings());
-    expect(Object.isFrozen(value.scenario_results[0].finding)).toBe(true);
+    expect(value.schema_version === "heel.canary-findings-projection.v1" && Object.isFrozen(value.scenario_results[0].finding)).toBe(true);
 
     const aborted = new AbortController();
     aborted.abort();
@@ -872,11 +872,12 @@ describe("scenario library and run-frozen bindings", () => {
     mechanism_id: "route-access", applicability: "unknown", applicability_rule: "always", evidence_state: "inferred",
     execution_support: "runner_supported", catalog_scenario_id: "anonymous_authenticated_read", binding_version: 1,
     coverage_statement: "Executed check: anonymous_authenticated_read (GET/HEAD, roles anonymous and authenticated).",
-    prerequisites: ["methods: GET, HEAD"], ...overrides,
+    prerequisites: ["methods: GET, HEAD"], live_test: null,
+    live_support: overrides.source === "custom" ? "static_only" : "template_only", ...overrides,
   });
   const listing = (rows: unknown[] = [libraryRow()]) => ({
     schema_version: "heel.scenario-library.v1", library_digest: "f".repeat(64), engine_version: "1.3.0rc4", binding_version: 1,
-    custom_coverage_statements: coverage, scenarios: rows,
+    custom_coverage_statements: coverage, live_test_coverage_statements: coverage, scenarios: rows,
   });
   const frozen = {
     catalog_scenario_id: "anonymous_authenticated_read", method: "GET", route_template: "/api/canary",

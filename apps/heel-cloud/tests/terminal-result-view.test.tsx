@@ -106,7 +106,7 @@ const realGetFindings = CanaryApi.prototype.getFindings;
 async function strictFindings(): Promise<Readonly<CanaryFindingsProjection>> {
   const body = JSON.stringify(findingsWire());
   const api = new CanaryApi({ transport: async () => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }) });
-  return realGetFindings.call(api, WS, PRJ, RUN);
+  return realGetFindings.call(api, WS, PRJ, RUN) as Promise<Readonly<CanaryFindingsProjection>>;
 }
 
 let runReads: CanaryRunDashboard[];
