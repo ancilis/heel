@@ -111,7 +111,7 @@ it("rejects a runner revoke result outside the typed contract and names the refu
 // The 1.3.0rc6 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC6.md ("Customer install
 // command"), pinned here rather than read from the runbook. It may be deployed only after the release owner's anonymous
 // verify-public for v1.3.0rc6 passes. Every self-serve install surface shows this one command.
-const RC6_WHEEL_SHA256 = "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e";
+const RC6_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
 const RC6_RUNBOOK_INSTALL = "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install "
   + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=${RC6_WHEEL_SHA256}'`
   + " && ./heel-rc6/bin/heel --version";

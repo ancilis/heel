@@ -39,7 +39,7 @@ virtual environment in `./heel-rc6`, installs the hash-pinned public wheel with 
 and prints the installed version:
 
 ```bash
-python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e' && ./heel-rc6/bin/heel --version
+python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version
 ```
 
 It prints `heel 1.3.0rc6`; the CLI is then `./heel-rc6/bin/heel`. Review a sanitized OpenAPI

@@ -138,7 +138,7 @@ beforeEach(() => {
 // deployed only after the release owner's anonymous verify-public for v1.3.0rc6 passes. 1.3.0rc1, rc2, rc3, rc4 and
 // rc5 remain published and are named only as history.
 const PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc6";
-const PUBLIC_WHEEL_SHA256 = "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e";
+const PUBLIC_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
 const PUBLIC_INSTALL =
   "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install " +
   `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'` +

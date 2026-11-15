@@ -19,7 +19,7 @@ const INSTALL_AGENT = `python3 -m venv heel-rc6
 // The public v1.3.0rc6 release wheel digest, pinned literally from docs/RUNNER_PREVIEW_RELEASE_RC6.md. The build refuses
 // to render this page unless it equals the bundled manifest's wheel digest, so the public command and the same-origin
 // download name the same bytes.
-const PUBLIC_WHEEL_SHA256 = "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e";
+const PUBLIC_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
 
 if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {
   throw new Error("the public Heel Agent wheel digest does not match the bundled release manifest");
