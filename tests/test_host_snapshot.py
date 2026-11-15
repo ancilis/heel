@@ -1072,11 +1072,12 @@ def test_migration_31_and_direct_construction_parity(short_tmp):
 
     full = sqlite3.connect(os.path.join(short_tmp, "full.db"))
     try:
-        assert Migrator(full, CONTROL_PLANE_MIGRATIONS).apply_all() == list(range(1, 35))
-        assert (CONTROL_PLANE_MIGRATIONS[-4].version, CONTROL_PLANE_MIGRATIONS[-4].name) == (31, "host_authority_generations")
-        assert (CONTROL_PLANE_MIGRATIONS[-3].version, CONTROL_PLANE_MIGRATIONS[-3].name) == (32, "stop_ack_signed_witness")
-        assert (CONTROL_PLANE_MIGRATIONS[-2].version, CONTROL_PLANE_MIGRATIONS[-2].name) == (33, "inactive_claim_attestation_audit")
-        assert (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name) == (34, "scenario_library_and_run_bindings")
+        assert Migrator(full, CONTROL_PLANE_MIGRATIONS).apply_all() == list(range(1, 37))
+        assert (CONTROL_PLANE_MIGRATIONS[30].version, CONTROL_PLANE_MIGRATIONS[30].name) == (31, "host_authority_generations")
+        assert (CONTROL_PLANE_MIGRATIONS[31].version, CONTROL_PLANE_MIGRATIONS[31].name) == (32, "stop_ack_signed_witness")
+        assert (CONTROL_PLANE_MIGRATIONS[32].version, CONTROL_PLANE_MIGRATIONS[32].name) == (33, "inactive_claim_attestation_audit")
+        assert (CONTROL_PLANE_MIGRATIONS[33].version, CONTROL_PLANE_MIGRATIONS[33].name) == (34, "scenario_library_and_run_bindings")
+        assert (CONTROL_PLANE_MIGRATIONS[-1].version, CONTROL_PLANE_MIGRATIONS[-1].name) == (36, "configured_findings_disclosure")
     finally:
         full.close()
     conn = sqlite3.connect(os.path.join(short_tmp, "older.db"))
@@ -1085,8 +1086,8 @@ def test_migration_31_and_direct_construction_parity(short_tmp):
         assert Migrator(conn, CONTROL_PLANE_MIGRATIONS[:30]).apply_all() == list(range(1, 31))
         CanaryStore(conn)  # direct construction creates the ledger (IF NOT EXISTS)
         conn.commit()
-        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31, 32, 33, 34]
-        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 34
+        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).apply_all() == [31, 32, 33, 34, 35, 36]
+        assert Migrator(conn, CONTROL_PLANE_MIGRATIONS).current_version() == 36
         assert {
             "stop_ack_source_event_sequence", "stop_ack_projection_digest", "stop_ack_runner_local_at_ms",
         } <= {row[1] for row in conn.execute("PRAGMA table_info(canary_runs)")}

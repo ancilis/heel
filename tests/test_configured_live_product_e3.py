@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 
 import pytest
@@ -123,8 +124,26 @@ class E3Vault:
         self.items.pop(handle_id, None)
 
 
+def mirror_worker_sync_route(monkeypatch):
+    """The test edge mirrors the Worker allowlist; the accepted harness file stays byte-identical
+    (it is a hash-pinned H2 input), so the one new runner route the Worker now allows is added here."""
+    import tests.support.edge_tls_harness as edge
+
+    sync = re.compile(rf"^/v1/workspaces/{edge._WS}/runners/{edge._RUNNER}/contexts/rcb_[0-9a-f]{{32}}/configured-plan-requests/sync$")
+    original, original_cap = edge._RUNNER_CONTEXT_CONTROL, edge._body_cap
+
+    class Either:
+        @staticmethod
+        def match(path):
+            return original.match(path) or sync.match(path)
+
+    monkeypatch.setattr(edge, "_RUNNER_CONTEXT_CONTROL", Either())
+    monkeypatch.setattr(edge, "_body_cap", lambda path: 8 * 1024 if sync.match(path) else original_cap(path))
+
+
 class E3Customer(Customer):
     def __init__(self, tmp_path, serve_harness, monkeypatch, name):
+        mirror_worker_sync_route(monkeypatch)
         super().__init__(tmp_path, serve_harness, monkeypatch, name)
         self.vault = E3Vault()
         self.target = BillingTarget()
@@ -372,6 +391,13 @@ def test_two_conditions_on_one_primitive_route_flow_from_private_revisions_to_si
     # The old run stays frozen at revision 1 with its original verdict.
     status, old_findings = c.browser("GET", f"{c.base}/canary-runs/{run_id}/findings")
     assert status == 200 and old_findings == findings
+    # The frozen definitions behind the old result are still the revision-1 conditions, by instance.
+    status, frozen = c.browser("GET", f"{c.base}/canary-runs/{run_id}/configured-plan")
+    assert status == 200 and frozen["run_id"] == run_id
+    assert frozen["projection_digest"] == findings["approval_projection_digest"]
+    assert {item["test_instance_id"]: item["assertion"] for item in frozen["instances"]} == dict(zip(first_ids, [HINT_EQUALS, PLAN_EQUALS]))
+    assert {item["test_instance_id"]: item["assertion_digest"] for item in frozen["instances"]} == {
+        item["test_instance_id"]: item["assertion_digest"] for item in findings["test_results"]}
 
     # Save/replay the observed instance through the product: frozen handles, fresh approval.
     hint_instance = results["sc.internal.export-hint"]["test_instance_id"]

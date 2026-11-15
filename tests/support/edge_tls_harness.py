@@ -56,7 +56,7 @@ _RUNNER_ROTATION_START = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/r
 _RUNNER_ROTATION_APPROVE = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/rotations/rotation_[0-9a-f]{{32}}/approve$")
 _RUNNER_REVOKE = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/revoke$")
 _RUNNER_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}(?:/claim|/runs/{_RUNNER}/(?:heartbeat|progress|result|stop-ack))$")
-_RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections|configured-plan-requests/sync))$")
+_RUNNER_CONTEXT_CONTROL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/contexts(?:/list|/rcb_[0-9a-f]{{32}}/(?:claim|approval-projections))$")
 _RUNNER_RESULT_PROJECTION = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/result-projection$")
 # ``index.ts`` ``RUNNER_DISCLOSURE_POLL``: the metadata-only result-handoff poll, runner-proof family.
 _RUNNER_DISCLOSURE_POLL = re.compile(rf"^/v1/workspaces/{_WS}/runners/{_RUNNER}/runs/crun_[0-9a-f]{{32}}/disclosure-poll$")
@@ -150,8 +150,6 @@ def _body_cap(path: str) -> int:
     if _RUNNER_CONTEXT_CONTROL.match(path):
         if path.endswith("/contexts/list"):
             return 128
-        if path.endswith("/configured-plan-requests/sync"):
-            return 8 * 1024
         return 256 if path.endswith("/claim") else 69632
     if _RUNNER_CONTROL.match(path):
         return 256 if path.endswith("/claim") else 36 * 1024
