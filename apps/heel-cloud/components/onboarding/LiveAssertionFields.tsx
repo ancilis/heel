@@ -197,14 +197,16 @@ export function validateLiveAssertionDraft(draft: LiveAssertionDraft): LiveAsser
   return { ok: true, assertion, canonical };
 }
 
+// Hydration input is already-parsed JSON, so an object is a plain record; own enumerable keys are compared
+// exactly (no reflective prototype access, per the repository's privacy-boundary source rules).
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (!isPlainObject(value)) return false;
   const own = Object.keys(value);
-  return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+  return own.length === keys.length && keys.every((key) => own.includes(key));
 }
 
 function hydratePath(side: Side, value: unknown): LivePathRowDraft[] | null {
@@ -264,12 +266,14 @@ const REFERENCE_HINT = "Enter the reference name, not the expected value; values
 export function LiveAssertionFields({ draft, onChange, disabled = false, showErrors = true }: LiveAssertionFieldsProps) {
   const base = useId();
   const pendingFocus = useRef<string | null>(null);
+  const root = useRef<HTMLDivElement | null>(null);
   const validation = validateLiveAssertionDraft(draft);
   const errors: Readonly<Partial<Record<LiveAssertionField, string>>> = showErrors && !validation.ok ? validation.errors : {};
 
   useEffect(() => {
     if (pendingFocus.current === null) return;
-    document.getElementById(pendingFocus.current)?.focus();
+    const target = pendingFocus.current;
+    [...(root.current?.querySelectorAll<HTMLElement>("input, select, button") ?? [])].find((element) => element.id === target)?.focus();
     pendingFocus.current = null;
   });
 
@@ -358,7 +362,7 @@ export function LiveAssertionFields({ draft, onChange, disabled = false, showErr
   const conditionKindId = fieldId("condition-kind");
   const equality = draft.conditionKind === "json_scalar_equals_fixture";
   return (
-    <div className="account-form live-assertion-fields">
+    <div className="account-form live-assertion-fields" ref={root}>
       <fieldset>
         <legend>Successful response check</legend>
         <p>Heel first confirms the response is the successful read you expect: the field at this path must equal a value kept on your runner. If that field is missing or does not match, the outcome is inconclusive.</p>
