@@ -50,7 +50,9 @@ from heel.runner.http_transport import (
 )
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.redaction import Redactor
-from heel.runner.store import LiveInputUnavailable, RunnerStore, RunnerStoreError
+from heel.runner.store import (
+    LiveInputUnavailable, RunReservationProbe, RunnerStore, RunnerStoreError,
+)
 from heel.runner.vault import EphemeralVault, VaultUnavailable, validate_credential_secret
 
 
@@ -708,6 +710,23 @@ class LocalCanaryExecutor:
             known_stop = getattr(cancellation, "stop_reason", None)
             if known_stop is not None:
                 return UnactivatedExecution(known_stop)
+            if self.store.probe_run_reservation(grant["run_id"]) is RunReservationProbe.RESERVED:
+                # Restart recovery already reserved this exact grant for a claim whose answer was
+                # lost.  Adopt only a never-activated reservation (``verified``, no containment
+                # event): its retention is part of the signed marker, so the idempotent
+                # ``reserve_run`` below then proves the same grant and initial state, and the
+                # ``running`` transition stays the single activation point.  Any other
+                # reservation keeps the fresh retention, which ``reserve_run`` refuses as before.
+                try:
+                    reserved = self.store.load_run(grant["run_id"])
+                    adoptable = (
+                        reserved["state"] == "verified"
+                        and not self.store.load_run_events(grant["run_id"])
+                    )
+                except RunnerStoreError:
+                    adoptable = False
+                if adoptable:
+                    retention_expires = reserved["retention_expires_at_ms"]
             self.store.reserve_run(grant, retention_expires_at_ms=retention_expires)
             log = _SerializedContainmentLog(
                 ContainmentLog(

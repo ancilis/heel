@@ -139,6 +139,10 @@ class RunnerCoordinator:
         self._gate_receipts: dict[str, float] = {}
         self._bindings: dict[str, tuple[str, str, str]] = {}
         self._terminal_runs: set[str] = set()
+        # Runs hydrated at construction with no local terminal: candidates for one bounded
+        # recovered dispatch through ``claim`` (see ``_recovered_lease``).  Process-local only;
+        # each candidate is considered at most once per coordinator.
+        self._recovered_claims: set[str] = set()
         self._lock = threading.Lock()
         # The client serializes its signed chain, but the coordinator also owns
         # the in-memory gate snapshot.  Keep the read -> signed heartbeat ->
@@ -251,6 +255,7 @@ class RunnerCoordinator:
                     self._bindings.pop(run_id, None)
                     self._heartbeat_guards.pop(run_id, None)
             self._terminal_runs.intersection_update(active_ids)
+            self._recovered_claims.intersection_update(active_ids)
 
     @staticmethod
     def _staged_upload_request(item: Any) -> dict[str, Any]:
@@ -362,6 +367,8 @@ class RunnerCoordinator:
                     if isinstance(exc, RunnerStoreError):
                         raise
                     raise RunnerStoreError("runtime active reservation is unavailable") from exc
+                with self._lock:
+                    self._recovered_claims.add(active.run_id)
             elif terminal.state == "local_terminal":
                 pending = tuple(
                     item for item in self.control.runtime.load_pending_calls(limit=74)
@@ -543,7 +550,98 @@ class RunnerCoordinator:
         claimed = self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16)
         self._finish_prune_states(claimed.items, now_ms=now_ms)
 
+    def _recovered_lease(self) -> ClaimLease | None:
+        """Hand one recovered, provably unexecuted claim to normal execution, or nothing.
+
+        A claim whose answer was lost is replayed at construction and hydrated with a local
+        ``verified`` reservation, but the Cloud then answers every fresh claim with 204: without
+        this step the run is never executed.  It is dispatched only when every fact below holds,
+        each re-read now rather than trusted from construction:
+
+        * the runtime active row is still claim-only (revision 1) with no staged call for the run,
+          so no heartbeat, progress, stop acknowledgement or result was ever sent for it and the
+          Cloud holds no runner snapshot that the recovered claimed projection could contradict;
+        * no runtime terminal exists and the local reservation is still ``verified`` with an
+          empty containment log, so the run was never locally activated and no secret, DNS or
+          target traffic can have happened (``running`` is durable before any of them);
+        * the immutable local approved pair, grant, binding and kill-switch generation still
+          validate now, and a fresh signed heartbeat answers a passing gate.
+
+        The fresh heartbeat is the run's new gate receipt, exactly as a claim response is for a
+        fresh lease; the executor still re-validates it (age <= 0.5 s) before activation, and the
+        store's ``verified`` -> ``running`` transition remains the durable exactly-once point.  A
+        denied gate is persisted by the heartbeat and the run is not dispatched.  Each candidate
+        is considered once per coordinator; anything else keeps the existing restart path.
+        """
+        with self._lock:
+            candidates = sorted(self._recovered_claims)
+        for run_id in candidates:
+            with self._lock:
+                self._recovered_claims.discard(run_id)
+                gate = self._gates.get(run_id)
+                binding = self._bindings.get(run_id)
+                live = run_id in self._gate_receipts or run_id in self._terminal_runs
+            if gate is None or binding is None or live:
+                continue
+            active = next(
+                (
+                    item for item in self.control.runtime.load_active_run_controls(limit=64)
+                    if item.run_id == run_id
+                ),
+                None,
+            )
+            if active is None or active.revision != 1:
+                continue
+            if any(
+                item.run_id == run_id
+                for item in self.control.runtime.load_pending_calls(limit=74)
+            ):
+                continue
+            if self.control.runtime.load_terminal_state(run_id) is not None:
+                continue
+            if self.store.load_run(run_id)["state"] != "verified":
+                continue
+            if self.store.load_run_events(run_id):
+                continue
+            projection = dict(active.approval_projection)
+            grant = dict(active.grant)
+            manifest, local_projection = self.store.load_approved_pair(active.approval_id)
+            if local_projection != projection or binding != (
+                active.grant_id, active.approval_id, active.approval_projection_digest,
+            ) or ExecutionGate(**dict(active.gate)) != gate:
+                raise RunnerStoreError("runtime active approval authority is unavailable")
+            bundle = ExecutionBundle(manifest, projection, grant)
+            try:
+                validate_execution_bundle(
+                    bundle, store=self.store, identity=self.identity,
+                    trusted_grant_keys=self.trusted_grant_keys, now_ms=self._now_ms(), gate=gate,
+                )
+            except RunnerStoreError:
+                raise
+            except (TypeError, ValueError):
+                # Expired or no longer locally valid: never heartbeat or execute it here.
+                continue
+            claimed = self._claimed_projection(
+                manifest, projection, grant, claimed_at_ms=active.claimed_at_ms,
+            )
+            fresh = self.heartbeat(run_id, claimed)
+            try:
+                # Rejects a stop, revocation, kill switch or expired proof in the fresh gate.
+                validate_execution_bundle(
+                    bundle, store=self.store, identity=self.identity,
+                    trusted_grant_keys=self.trusted_grant_keys, now_ms=self._now_ms(), gate=fresh,
+                )
+            except RunnerStoreError:
+                raise
+            except (TypeError, ValueError):
+                continue  # denied: the heartbeat persisted that gate; nothing is dispatched
+            return ClaimLease(run_id, bundle, claimed)
+        return None
+
     def claim(self) -> ClaimLease | None:
+        recovered = self._recovered_lease()
+        if recovered is not None:
+            return recovered
         response = self.control._claim_closed()
         received_at = self._now_monotonic()
         if response is None:
