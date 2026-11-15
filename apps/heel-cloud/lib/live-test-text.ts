@@ -7,7 +7,7 @@ import type {
   PlanLabel,
   ScenarioBindableCatalogId,
 } from "./canary-api";
-import { RUNNER_RC5_CLI } from "../components/canary/RunnerPairingCard";
+import { RUNNER_RC6_CLI } from "../components/canary/RunnerPairingCard";
 
 /** Plain-language names for the two supported comparisons (restricted role first, then control). */
 export const COMPARISON_LABELS: Readonly<Record<ScenarioBindableCatalogId, string>> = Object.freeze({
@@ -62,19 +62,19 @@ function quoted(value: string): string {
 
 /** One runnable command storing a named expected value locally; the value is typed only at the hidden prompt. */
 export function inputCommand(ref: string, type: LocalValueType, backend: LocalBackend): string {
-  return `${RUNNER_RC5_CLI} runner input add --name ${quoted(ref)} --type ${type} --backend ${backend}`;
+  return `${RUNNER_RC6_CLI} runner input add --name ${quoted(ref)} --type ${type} --backend ${backend}`;
 }
 
 /** One runnable bearer-credential command; the token is typed only at the hidden prompt. */
 export function credentialCommand(role: string, planLabel: string | null, backend: LocalBackend): string {
   const words = role.replace("_", " ");
   const plan = planLabel !== null && role.endsWith("_plan") ? ` --plan-label ${quoted(planLabel)}` : "";
-  return `${RUNNER_RC5_CLI} runner credential add --role ${quoted(role)} --label ${quoted(words)}${plan} --profile bearer --backend ${backend}`;
+  return `${RUNNER_RC6_CLI} runner credential add --role ${quoted(role)} --label ${quoted(words)}${plan} --profile bearer --backend ${backend}`;
 }
 
 /** Placeholder path: the customer's own OpenAPI file, which the browser never sees. */
 export const OPENAPI_PATH = "./openapi.json";
-export const IMPORT_COMMAND = `${RUNNER_RC5_CLI} runner import-openapi ${OPENAPI_PATH}`;
+export const IMPORT_COMMAND = `${RUNNER_RC6_CLI} runner import-openapi ${OPENAPI_PATH}`;
 
 export interface AdviceChoices {
   backend: LocalBackend;

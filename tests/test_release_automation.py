@@ -250,7 +250,7 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertEqual(template.replace("${PUBLIC_WHEEL_SHA256}", digest), command)
         # /agent refuses to build unless the public pin equals the bundled manifest's wheel digest.
         self.assertIn("if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {", page)
-        self.assertNotRegex(page, r"releases/(?:tag|download)/v1\.3\.0rc[1234]|heel-rc[1234]\b")
+        self.assertNotRegex(page, r"releases/(?:tag|download)/v1\.3\.0rc[12345]|heel-rc[12345]\b")
         # The internal launch record keeps naming the earlier public rc2 history and stays undeployed.
         launch = " ".join((ROOT / "docs/saas/LAUNCH.md").read_text(encoding="utf-8").split())
         self.assertIn("https://github.com/ancilis/heel/releases/tag/v1.3.0rc2", launch)

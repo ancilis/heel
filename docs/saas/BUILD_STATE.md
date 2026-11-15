@@ -24,12 +24,13 @@ The implemented launch is **Heel free early access**:
   result on first use.
 - Pinned same-origin browser runtime and dedicated Python Web Worker.
 - Optional local browser save, delete, clear, JSON export, and Markdown export.
-- Checked-in Heel 1.3.0rc5 runner preview wheel/source/manifest under
-  `apps/heel-cloud/public/downloads/`, and local MCP setup. Customer copy uses the one public
-  hash-pinned 1.3.0rc5 install, whose wheel digest equals the bundled wheel; v1.3.0rc5 was published
-  as a GitHub prerelease on 2026-11-13 after the release owner's anonymous verify-public passed.
-  1.3.0rc5 is not published to PyPI, and the website is not publicly deployed. 1.3.0rc4 (2026-11-11) and earlier
-  prereleases stay published as history. It treats a
+- Checked-in Heel 1.3.0rc6 runner preview candidate wheel/source/manifest under
+  `apps/heel-cloud/public/downloads/`, and local MCP setup. 1.3.0rc6 is not yet published. Customer
+  copy uses the one hash-pinned 1.3.0rc6 install, whose wheel digest equals the bundled wheel; that
+  pin is provisional until the release owner's anonymous verify-public for v1.3.0rc6 checks the exact
+  published bytes, and the copy is deployable only after it. 1.3.0rc6 will not be on PyPI, and the
+  website is not publicly deployed. 1.3.0rc5 (published 2026-11-13), 1.3.0rc4 (2026-11-11) and
+  earlier prereleases stay published as history. It treats a
   recognized error envelope as inconclusive at every HTTP status, so the synthetic reference
   `error_envelope` (HTTP 200) and `hardened` (HTTP 403) cases are inconclusive and only the
   non-error `public` and `redacted` cases pass; no inconclusive plan-differential pair stores a
@@ -150,12 +151,14 @@ docker compose --env-file deploy/.env.production \
 - The full self-serve product is not launch-ready. Paired runner execution, the cloud route
   inventory bridge, and approval wiring are incomplete, and final launch acceptance has not
   been given. Owner actions alone do not close these gaps.
-- The public one-command install is the hash-pinned 1.3.0rc5 wheel from
-  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>, published 2026-11-13; the CHANGELOG
-  records its publication and anonymous verify-public evidence. That verification proves
-  packaging only; no independent clean-room customer run, deployed library journey, pairing,
-  serve, HTTPS target traffic or hosted findings result is recorded for 1.3.0rc5. 1.3.0rc4 stays
-  published as history (2026-11-11, <https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>).
+- The one-command install in customer copy is the hash-pinned 1.3.0rc6 wheel from
+  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, which is not yet published; its pin is
+  provisional until the anonymous verify-public for v1.3.0rc6 passes, and that verification would
+  prove packaging only. No clean-room customer run, deployed library journey, pairing, serve,
+  HTTPS target traffic or hosted findings result is recorded for 1.3.0rc6. 1.3.0rc5 stays published
+  as history (2026-11-13, <https://github.com/ancilis/heel/releases/tag/v1.3.0rc5>; the CHANGELOG
+  records its publication and anonymous verify-public evidence), as does 1.3.0rc4 (2026-11-11,
+  <https://github.com/ancilis/heel/releases/tag/v1.3.0rc4>).
 
 ## Exact next action
 

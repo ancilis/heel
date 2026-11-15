@@ -2,12 +2,12 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
-import { RUNNER_RC5_CLI, RUNNER_RC5_INSTALL, RUNNER_RC5_RELEASE_URL } from "../../components/canary/RunnerPairingCard";
+import { RUNNER_RC6_CLI, RUNNER_RC6_INSTALL, RUNNER_RC6_RELEASE_URL } from "../../components/canary/RunnerPairingCard";
 
 /** The installed executable path; every runner command on this page starts with it, never a bare `heel`. */
-const CLI = RUNNER_RC5_CLI;
+const CLI = RUNNER_RC6_CLI;
 /** The release named next to the shared install constants above; it changes with them. */
-const RELEASE = "1.3.0rc5";
+const RELEASE = "1.3.0rc6";
 
 const LINUX_VAULT = `sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
 dbus-run-session -- bash                                   # headless only: private session bus
