@@ -7,6 +7,7 @@ import type {
   PlanLabel,
   ScenarioBindableCatalogId,
 } from "./canary-api";
+import { RUNNER_RC5_CLI } from "../components/canary/RunnerPairingCard";
 
 /** Plain-language names for the two supported comparisons (restricted role first, then control). */
 export const COMPARISON_LABELS: Readonly<Record<ScenarioBindableCatalogId, string>> = Object.freeze({
@@ -36,23 +37,65 @@ export function roleText(role: string, labels: readonly PlanLabel[]): string {
   return label ? `${base} (“${label}”, operator-supplied)` : base;
 }
 
-/** The next safe LOCAL command for one missing requirement; never a value, never a browser action. */
-export function readinessAdvice(item: ConfiguredReadinessRequirement, route: string): string | null {
+/** One local step: plain-language text, exact commands to run on the runner machine, and an optional note. */
+export interface LocalAdvice { text: string; commands: readonly string[]; note?: string }
+
+/** The local OS secret store choices the runner supports, as its CLI spells them. */
+export const BACKEND_NOTE = "Use --backend keychain on macOS or --backend secret-service on Linux.";
+/**
+ * How to pick --type so the stored value compares equal to the response: equality is strict, so the text "42" never
+ * equals the number 42 and the text "true" never equals the boolean true.
+ */
+export const TYPE_NOTE = "Pick --type to match the JSON value in the response: text for \"abc\" (typed without quotes), number for 42 or 1.5, "
+  + "boolean for true or false. --type null stores JSON null and asks for nothing. Every other type asks in a hidden prompt; "
+  + "the value never reaches this browser or Heel Cloud.";
+
+/** The command that stores one named expected value locally (the value itself is typed only at the hidden prompt). */
+export function inputCommand(ref: string): string {
+  return `${RUNNER_RC5_CLI} runner input add --name ${ref} --type <text|number|boolean|null> --backend <keychain|secret-service>`;
+}
+
+/**
+ * The next safe LOCAL step for one unmet requirement; never a value, never a browser action. A replay
+ * (configured_regression) must reuse the ORIGINAL frozen input handles, so it never advises re-adding a value.
+ */
+export function readinessAdvice(
+  item: ConfiguredReadinessRequirement, route: string, planKind: "configured_live_read" | "configured_regression" = "configured_live_read",
+): LocalAdvice | null {
   if (item.state === "ready") return null;
   if (item.kind === "route") {
     return item.state === "unsupported"
-      ? "Parameterized routes are not supported for configured tests yet. Choose a literal route."
-      : `Import the OpenAPI document that contains ${route}: heel runner import-openapi <openapi.json>`;
+      ? { text: "Parameterized routes are not supported for configured tests yet. Choose a literal route.", commands: [] }
+      : { text: `Import the OpenAPI document that contains ${route} on the runner:`, commands: [`${RUNNER_RC5_CLI} runner import-openapi <openapi.json>`] };
   }
   if (item.kind === "role_credential") {
-    return `Store the ${item.subject?.replace("_", " ")} credential on the runner (hidden prompt): heel runner credential add --profile bearer --role ${item.subject} --label "${item.subject?.replace("_", " ")}" --backend keychain`;
+    const role = item.subject ?? "";
+    const words = role.replace("_", " ");
+    const planLabel = role.endsWith("_plan") ? ` --plan-label <your ${role.replace("_plan", "")}-plan name>` : "";
+    return {
+      text: `Store the ${words} credential on the runner (hidden prompt):`,
+      commands: [`${RUNNER_RC5_CLI} runner credential add --role ${role} --label "${words}"${planLabel} --profile <bearer|cookie_jar|x_api_key> --backend <keychain|secret-service>`],
+      note: BACKEND_NOTE,
+    };
   }
   if (item.kind === "local_input") {
-    return item.state === "revoked"
-      ? `The value for “${item.subject}” was revoked. Add a new one: heel runner input add --name ${item.subject} --type text --backend keychain`
-      : `Enter the expected value on the runner (hidden prompt, never in the browser): heel runner input add --name ${item.subject} --type text --backend keychain`;
+    if (planKind === "configured_regression") {
+      return {
+        text: `This replay must use the original value it saved for “${item.subject}”, and that value is ${item.state === "revoked" ? "revoked" : "missing"} on this runner. `
+          + "Adding a new value under the same name cannot repair this replay. Cancel this request, then request a new dry run of the test "
+          + "(it freezes the new value) and approve that instead.",
+        commands: [],
+      };
+    }
+    return {
+      text: item.state === "revoked"
+        ? `The current value for “${item.subject}” was revoked. Store a new one on the runner:`
+        : `Enter the expected value on the runner (hidden prompt, never in the browser):`,
+      commands: [inputCommand(item.subject ?? "")],
+      note: `${TYPE_NOTE} ${BACKEND_NOTE}`,
+    };
   }
-  return "The original run is not on this runner. Replay it from the runner that executed it.";
+  return { text: "The original run is not on this runner. Replay it from the runner that executed it, or request a new dry run of the test.", commands: [] };
 }
 
 export const STATE_WORDS: Readonly<Record<ConfiguredReadinessRequirement["state"], string>> = Object.freeze({

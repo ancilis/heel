@@ -202,11 +202,15 @@ export function ConfiguredTestsPanel({
                     {readiness && current.status === "open" ? (
                       <ul aria-label={`Runner readiness for ${instance.source.sourceScenarioId}`}>
                         {readiness.requirements.map((item) => {
-                          const advice = readinessAdvice(item, `${instance.method} ${instance.routeTemplate}`);
+                          const advice = readinessAdvice(item, `${instance.method} ${instance.routeTemplate}`, current.planKind);
                           return (
                             <li key={`${item.kind}:${item.subject ?? ""}`}>
                               {requirementLabel(item)}: <strong>{STATE_WORDS[item.state]}</strong>
-                              {advice ? <><br /><span>{advice.split(": heel ")[0]}{advice.includes(": heel ") ? <>: <code>heel {advice.split(": heel ")[1]}</code></> : null}</span></> : null}
+                              {advice ? <>
+                                <br /><span>{advice.text}</span>
+                                {advice.commands.map((command) => <span key={command}><br /><code>{command}</code></span>)}
+                                {advice.note ? <><br /><small>{advice.note}</small></> : null}
+                              </> : null}
                             </li>
                           );
                         })}

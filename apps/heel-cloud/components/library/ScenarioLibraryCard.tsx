@@ -12,7 +12,7 @@ import type {
   ScenarioLibraryEntry,
 } from "../../lib/canary-api";
 import { CanaryApiError } from "../../lib/canary-api";
-import { COMPARISON_LABELS, conditionText, successCheckText } from "../../lib/live-test-text";
+import { BACKEND_NOTE, COMPARISON_LABELS, TYPE_NOTE, conditionText, inputCommand, successCheckText } from "../../lib/live-test-text";
 import {
   LiveAssertionFields,
   emptyLiveAssertionDraft,
@@ -441,8 +441,9 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
               <div role="status">
                 <p>Saved <code>{savedNote.id}</code> revision {savedNote.revision}. Before requesting a dry run, enter each named value on the runner (hidden prompt):</p>
                 <ul aria-label="Local values to enter on the runner">
-                  {savedNote.refs.map((ref) => <li key={ref}><code>heel runner input add --name {ref} --type text --backend keychain</code></li>)}
+                  {savedNote.refs.map((ref) => <li key={ref}><code>{inputCommand(ref)}</code></li>)}
                 </ul>
+                <p>{TYPE_NOTE} {BACKEND_NOTE}</p>
               </div>
             ) : null}
           </fieldset>

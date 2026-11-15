@@ -96,7 +96,8 @@ describe("guided private live test authoring", () => {
     expect((input.definition.containment_limits as Record<string, unknown>).no_live_targets).toBe(true);
     expect(input.liveTest.routeTemplate).toBe("/billing/features");
     expect(input.liveTest.assertion.condition).toEqual({ kind: "json_field_present", path: ["audit_log"] });
-    expect(await screen.findByText(/heel runner input add --name export_ok --type text --backend keychain/)).toBeTruthy();
+    expect(await screen.findByText("./heel-rc5/bin/heel runner input add --name export_ok --type <text|number|boolean|null> --backend <keychain|secret-service>")).toBeTruthy();
+    expect(screen.getByText(/--type null stores JSON null and asks for nothing/)).toBeTruthy();
   });
 
   test("editing a configured revision supersedes it and says the old revision stays unchanged", async () => {
@@ -166,7 +167,9 @@ describe("configured tests panel", () => {
     render(<ConfiguredTestsPanel api={ready} bindingId={"rcb_" + "d".repeat(32)} canManage projectRef={PRJ} workspaceRef={WS} />);
     const list = await screen.findByRole("list", { name: /Runner readiness for sc\.internal\.export-hint/ });
     expect(within(list).getAllByRole("listitem")).toHaveLength(4);
-    expect(within(list).getByText("heel runner input add --name secret_hint --type text --backend keychain")).toBeTruthy();
+    expect(within(list).getByText("./heel-rc5/bin/heel runner input add --name secret_hint --type <text|number|boolean|null> --backend <keychain|secret-service>")).toBeTruthy();
+    expect(within(list).getByText(/text for "abc" \(typed without quotes\), number for 42 or 1.5, boolean for true or false/)).toBeTruthy();
+    expect(within(list).getByText(/--backend keychain on macOS or --backend secret-service on Linux/)).toBeTruthy();
     expect(within(list).queryByText(/--name export_ok/)).toBeNull();
   });
 
@@ -283,5 +286,41 @@ describe("configured results show the frozen condition of exactly that run", () 
     render(<FindingsCard findings={findings([result("observed", "restricted_condition_true")])}
       frozenPlan={view({ ...frozenPlan, projectionDigest: "9".repeat(64) })} />);
     expect(screen.getByText(/The exact frozen condition for this result is unavailable/)).toBeTruthy();
+  });
+});
+
+describe("setup and replay advice", () => {
+  test("every generated command uses the installed CLI path, explicit types and both OS backends", async () => {
+    const { readinessAdvice } = await import("../lib/live-test-text");
+    const route = readinessAdvice({ kind: "route", subject: null, state: "missing" }, "GET /billing/features");
+    const credential = readinessAdvice({ kind: "role_credential", subject: "lower_plan", state: "missing" }, "GET /x");
+    const input = readinessAdvice({ kind: "local_input", subject: "secret_hint", state: "missing" }, "GET /x");
+    for (const advice of [route, credential, input]) {
+      expect(advice?.commands.every((command) => command.startsWith("./heel-rc5/bin/heel runner "))).toBe(true);
+    }
+    expect(credential?.commands[0]).toBe('./heel-rc5/bin/heel runner credential add --role lower_plan --label "lower plan" --plan-label <your lower-plan name> --profile <bearer|cookie_jar|x_api_key> --backend <keychain|secret-service>');
+    expect(input?.commands[0]).toContain("--type <text|number|boolean|null> --backend <keychain|secret-service>");
+  });
+
+  test("a replay never advises re-adding a value under the same name; a fresh request still does", async () => {
+    const { readinessAdvice } = await import("../lib/live-test-text");
+    for (const state of ["revoked", "missing"] as const) {
+      const replay = readinessAdvice({ kind: "local_input", subject: "secret_hint", state }, "GET /x", "configured_regression");
+      expect(replay?.commands).toEqual([]);
+      expect(replay?.text).toMatch(/cannot repair this replay\. Cancel this request, then request a new dry run/);
+    }
+    const fresh = readinessAdvice({ kind: "local_input", subject: "secret_hint", state: "revoked" }, "GET /x", "configured_live_read");
+    expect(fresh?.commands[0]).toContain("runner input add --name secret_hint");
+  });
+
+  test("the replay panel shows the replay-specific advice for a revoked original value", async () => {
+    const api = panelApi([view({ planKind: "configured_regression", sourceRunId: "crun_" + "9".repeat(32), runnerSeenAtMs: 5,
+      readiness: { reportedAtMs: 5, instances: [{ testInstanceId: "lti_" + "e".repeat(32), requirements: [
+        { kind: "frozen_run", subject: null, state: "ready" }, { kind: "local_input", subject: "secret_hint", state: "revoked" },
+      ] }] } })]);
+    render(<ConfiguredTestsPanel api={api} bindingId={"rcb_" + "d".repeat(32)} canManage projectRef={PRJ} workspaceRef={WS} />);
+    const list = await screen.findByRole("list", { name: /Runner readiness/ });
+    expect(within(list).getByText(/cannot repair this replay/)).toBeTruthy();
+    expect(within(list).queryByText(/runner input add/)).toBeNull();
   });
 });
