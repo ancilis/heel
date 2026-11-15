@@ -12,19 +12,21 @@ from heel.review_contract import ENGINE_VERSION, SUPPORTED_ENGINE_VERSIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 # The Python package, release contract, engine and server.json use the PEP 440 spelling.
-# The current version is 1.3.0rc5, published as a GitHub prerelease on 2026-11-13 after the release
-# owner's anonymous verify-public passed; the CHANGELOG records the publication itself.
-VERSION = "1.3.0rc5"
+# The current version is the checked-in 1.3.0rc6 candidate, not yet published; its customer copy is written
+# for deployment after the release owner's anonymous verify-public for v1.3.0rc6 passes.
+VERSION = "1.3.0rc6"
 # npm metadata needs SemVer; this is the single normalization mapping, not a second version.
-NPM_VERSION = "1.3.0-rc.5"
-LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1", "1.3.0rc2", "1.3.0rc3", "1.3.0rc4"})
+NPM_VERSION = "1.3.0-rc.6"
+LEGACY_VERSIONS = frozenset({"1.1.0", "1.1.1", "1.2.0", "1.3.0rc1", "1.3.0rc2", "1.3.0rc3", "1.3.0rc4", "1.3.0rc5"})
 # The public GitHub prerelease that every customer install surface installs from its pinned release URL,
 # once the release owner's anonymous verify-public for it passes. Earlier previews stay published and are
 # named in copy only as history.
-PUBLIC_VERSION = "1.3.0rc5"
+PUBLIC_VERSION = "1.3.0rc6"
 PREVIOUS_PREVIEW_VERSION = "1.3.0rc1"
-EARLIER_PUBLIC_VERSIONS = ("1.3.0rc1", "1.3.0rc2", "1.3.0rc3", "1.3.0rc4")
+EARLIER_PUBLIC_VERSIONS = ("1.3.0rc1", "1.3.0rc2", "1.3.0rc3", "1.3.0rc4", "1.3.0rc5")
 # Historical release records the CHANGELOG keeps.
+RC5_VERSION = "1.3.0rc5"
+RC5_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{RC5_VERSION}"
 RC4_VERSION = "1.3.0rc4"
 RC4_RELEASE_URL = f"https://github.com/ancilis/heel/releases/tag/v{RC4_VERSION}"
 PAIRED_RUNNER_VERSION = "1.3.0rc3"
@@ -68,8 +70,8 @@ class ReleaseVersionContractTests(unittest.TestCase):
         self.assertEqual(app_lock["packages"][""]["version"], NPM_VERSION)
 
     def test_pep440_and_semver_spellings_name_one_release(self):
-        self.assertRegex(VERSION, r"\A1\.3\.0rc5\Z")
-        self.assertRegex(NPM_VERSION, r"\A1\.3\.0-rc\.5\Z")
+        self.assertRegex(VERSION, r"\A1\.3\.0rc6\Z")
+        self.assertRegex(NPM_VERSION, r"\A1\.3\.0-rc\.6\Z")
         major_minor_patch, candidate = VERSION.split("rc")
         self.assertEqual(NPM_VERSION, f"{major_minor_patch}-rc.{candidate}")
         self.assertNotEqual(VERSION, NPM_VERSION)
@@ -134,11 +136,12 @@ class ReleaseVersionContractTests(unittest.TestCase):
         for path in customer[:2] + customer[4:]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        # The CHANGELOG is the publication record: the real date and release URL, recorded after the
-        # release owner's anonymous verify-public passed, with no remaining candidate wording.
-        self.assertIn(f"## [{VERSION}]: 2026-11-13", changelog)
-        self.assertIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
-        self.assertNotIn("unpublished candidate", changelog)
+        # The CHANGELOG names exactly one unpublished candidate, rc6, and keeps the rc5 publication
+        # record: its real date and release URL.
+        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
+        self.assertEqual(changelog.count("unpublished candidate"), 1)
+        self.assertIn(f"## [{RC5_VERSION}]: 2026-11-13", changelog)
+        self.assertIn(RC5_RELEASE_URL, changelog)
         # The rc5 entry no longer says customer copy stays on rc4.
         self.assertNotIn("keeps the published, hash-pinned 1.3.0rc4 install", " ".join(changelog.split()))
         self.assertIn(f"## [{RC4_VERSION}]: 2026-11-11", changelog)

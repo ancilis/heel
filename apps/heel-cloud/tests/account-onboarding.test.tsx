@@ -2330,13 +2330,13 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     const { ws } = verifiedOwner();
     render(<Dashboard />);
     const card = await pairCard();
-    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc5\/heel_sim-1\.3\.0rc5-py3-none-any\.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && \.\/heel-rc5\/bin\/heel --version$/)).toBeTruthy();
-    expect((within(card).getByRole("link", { name: "Heel 1.3.0rc5 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc5");
+    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && \.\/heel-rc6\/bin\/heel --version$/)).toBeTruthy();
+    expect((within(card).getByRole("link", { name: "Heel 1.3.0rc6 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc6");
     expect(within(card).queryByRole("textbox", { name: /credential|secret|password|token/i })).toBeNull();
     const mark = server.calls.length;
 
     const token = await createInvitation();
-    expect(within(card).getByText(`./heel-rc5/bin/heel runner pair --origin https://heel.example --invite ${token}`)).toBeTruthy();
+    expect(within(card).getByText(`./heel-rc6/bin/heel runner pair --origin https://heel.example --invite ${token}`)).toBeTruthy();
     expect(card.textContent).not.toContain("<dashboard-origin>");
     expect(within(card).getByText(/before \d{1,2}:\d{2}/)).toBeTruthy();
     expectTokenOnlyOnScreen(token);
