@@ -294,8 +294,9 @@ must hold, and must state that they hold:
 1. **Authorized Cloudflare access**: Wrangler logged in (`wrangler login`) to a Cloudflare
    account the operator is authorized to deploy to, with a `workers.dev` subdomain. The Workers
    Free plan is sufficient.
-2. **Node.js and Wrangler**: Node.js with `npx`; the steps below run Wrangler 4.154.0 (the
-   version the Heel repository pins) through `npx`, which downloads it from npm.
+2. **Node.js, Wrangler and jq**: Node.js with `npx`; the steps below run Wrangler 4.154.0 (the
+   version the Heel repository pins) through `npx`, which downloads it from npm. Step 5 also
+   needs `jq` on `PATH` (for example `brew install jq`).
 3. **Local synthetic credentials**: the two fake free and pro canary tokens generated in step 1,
    kept in the operator's macOS Keychain. They never appear in these files, argv, chat or logs.
    A reviewer receives them out of band through the Keychain and secret-fd flow only.
@@ -382,12 +383,21 @@ line `401 0`. In `error_envelope` mode free `/api/export` and free `/api/profile
 
 ### 5. Receipts during the journey (bounded fields only)
 
-`wrangler tail` events also carry request metadata, so keep only the logged receipt lines:
+`wrangler tail` events also carry request metadata, so keep only the logged receipt lines. Run
+this in the same shell as the setup block (it uses `wr`), and stop it with Ctrl-C after the
+journey. `EVIDENCE_DIR` is a local directory of your choice; it is created here, and nothing in
+it is uploaded:
 
 ```sh
-wr tail heel-customer-staging-target --format json \
-  | jq -c --unbuffered '.logs[]?.message[]? | fromjson? | select(type == "object" and has("receipt"))' \
-  > "$EVIDENCE_DIR/target-receipts.jsonl"
+EVIDENCE_DIR="$PWD/evidence"                 # local only; any operator-owned path works
+(umask 077 && mkdir -p "$EVIDENCE_DIR")
+if command -v jq >/dev/null; then
+  wr tail heel-customer-staging-target --format json \
+    | jq -c --unbuffered '.logs[]?.message[]? | fromjson? | select(type == "object" and has("receipt"))' \
+    > "$EVIDENCE_DIR/target-receipts.jsonl"
+else
+  echo "jq is required for receipts; install it first (see Prerequisites)" >&2
+fi
 ```
 
 ### 6. Patch, error-envelope check, rollback, removal
