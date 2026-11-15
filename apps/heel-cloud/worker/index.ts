@@ -668,6 +668,18 @@ async function proxyControlPlane(
 // dangerouslyAllowSVG: true in next.config.js and uncomment below:
 // const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
 
+// The published 1.3.0rc5 Agent files that the deployed rc5 site served at exactly these paths.
+// /downloads/ now holds the current release only; these two names answer with a permanent redirect
+// to the immutable v1.3.0rc5 GitHub release assets, whose bytes equal the files the site served
+// (sizes and SHA-256 in docs/RUNNER_PREVIEW_RELEASE_RC6.md, "Legacy rc5 bytes and links"). No other
+// path, method or query is aliased; the rc5 manifest name is the current index and is not aliased.
+const LEGACY_RC5_RELEASE = "https://github.com/ancilis/heel/releases/download/v1.3.0rc5/";
+const LEGACY_DOWNLOADS = new Map<string, string>([
+  ["/downloads/heel_sim-1.3.0rc5-py3-none-any.whl", `${LEGACY_RC5_RELEASE}heel_sim-1.3.0rc5-py3-none-any.whl`],
+  ["/downloads/heel_sim-1.3.0rc5.tar.gz", `${LEGACY_RC5_RELEASE}heel_sim-1.3.0rc5.tar.gz`],
+]);
+
+
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const nonce = crypto.randomUUID().replaceAll("-", "");
@@ -679,6 +691,14 @@ const worker = {
     if (upstreamPath !== null) {
       if (requestUrl.search !== "") return proxyError(400, "invalid control plane request", csp);
       return proxyControlPlane(request, env, csp, upstreamPath);
+    }
+    const legacyDownload = LEGACY_DOWNLOADS.get(requestUrl.pathname);
+    if (legacyDownload !== undefined && (request.method === "GET" || request.method === "HEAD")
+        && requestUrl.search === "") {
+      return withSecurityHeaders(
+        new Response(null, { status: 308, headers: { Location: legacyDownload } }),
+        csp,
+      );
     }
     const requestHeaders = new Headers(request.headers);
     // Vinext/Next reads the request CSP nonce and applies it to framework scripts.
