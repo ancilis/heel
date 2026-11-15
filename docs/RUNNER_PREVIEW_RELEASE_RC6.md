@@ -6,13 +6,15 @@ standalone synthetic staging fixture, with
 `scripts/publish_runner_preview_release_rc6.py`.
 
 Status: **final pins in place (`PIN_STATUS = "FINAL"`); not yet performed.** The pins
-below are the rc6 artifacts built once at source `db34fafe4ac892e4c2361bd0cd96c78b5278b9d2`
-(tree `19902b10f3cfd6b4d3f82643e709f09b91e0910e`). That source is the E3 SOURCE/UX-accepted candidate
+below are the rc6 artifacts built once at source `49e813ef0eb80da53a3af7fcd01558a13ce89f93`
+(tree `0367a50a4cb43d9620336a27d17d8adbb2984ccb`). That source is the E3 SOURCE/UX-accepted candidate
 `72a1e049598af8aec3d8b4698ceaf743eaebb7b1` (descendant of `origin/main` `b7e00b3b`) plus the rc5
 publisher test's move to the historical rc5 fixture, the version-bound tests, the rc6 re-version
-with the single artifact build, the H2 runtime-lock refresh and the staging-fixture publication
-inputs. The later commits that add this tool, its test and this runbook, and the Worker's legacy rc5
-download alias, change none of the pinned bytes. No `v1.3.0rc6` tag, draft or release exists. Only
+with the single artifact build, the H2 runtime-lock refresh, the staging-fixture publication
+inputs, the reviewed recovered-claim correction (`ab3a112`..`d3639829f24fe7f09d39d200d05e104d7d036df6`)
+and the one artifact rebuild and install re-pin after it. The commits that add this tool, its
+test and this runbook, and the Worker's legacy rc5 download alias, change none of the pinned bytes.
+No `v1.3.0rc6` tag, draft or release exists. Only
 the release owner runs the steps below, after an independent review of this tool and green
 exact-tree CI, and only under a separate publication decision. The tool's author does not run them.
 The tool refuses every mode (exit `3`, before any credential read, gate or request) if `PIN_STATUS`
@@ -81,16 +83,16 @@ not establish any of these:
 | --- | --- |
 | Repository | `ancilis/heel` (the only one the tool accepts) |
 | Tag / release | `v1.3.0rc6`, `prerelease: true`, `make_latest: "false"`, never `latest` |
-| Wheel | `heel_sim-1.3.0rc6-py3-none-any.whl`, 2991367 bytes, SHA-256 `bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e` |
-| Source archive | `heel_sim-1.3.0rc6.tar.gz`, 635213 bytes, SHA-256 `2abee106f96b6c32cc77eb7e774f87b97ba7d9d465b8efccdb0f333a973e519b` |
-| Manifest | `heel-open-core-manifest.json`, 347 bytes, SHA-256 `ce710dc0081c8e9a84d7662804367abfd22211847ac06f986b2573ad81d04aa8` |
-| Fixture README | `heel-staging-fixture-README.md`, 30273 bytes, SHA-256 `7848ccc9c6aec7326e54e8d90aa299caceb494d69f62aba4671d83a377ffa004` |
+| Wheel | `heel_sim-1.3.0rc6-py3-none-any.whl`, 3021024 bytes, SHA-256 `40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0` |
+| Source archive | `heel_sim-1.3.0rc6.tar.gz`, 640955 bytes, SHA-256 `7087bcad6cdd73838aedeeb70c7f214816222cb3f052f969a0c93c29421b5fe9` |
+| Manifest | `heel-open-core-manifest.json`, 347 bytes, SHA-256 `34b33d78708ba1161e4efbc4c3fce0e6a7459a48ae4d4f6f71e1bc96d47c9930` |
+| Fixture README | `heel-staging-fixture-README.md`, 30273 bytes, SHA-256 `1e5538eb0a9ac5e1326d37200bda2f10f2182a875a96367b34da73dc4bd99a20` |
 | Fixture OpenAPI | `heel-staging-fixture-openapi.json`, 2282 bytes, SHA-256 `520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19` |
 | Fixture Worker | `heel-staging-fixture-worker.mjs`, 13120 bytes, SHA-256 `b0d8c1f426986ab613c1f4ca46302607c249cf4a7bcb47c415ac747b552d3bf3` |
 | Fixture config | `heel-staging-fixture-wrangler.jsonc`, 765 bytes, SHA-256 `9c33fbf3092722dbfde0f09d6ff68557a07e6cb7379c9e2d72509faaf46b988a` |
-| Fixture manifest | `heel-staging-fixture-manifest.json`, 786 bytes, SHA-256 `ac52bd5d0520f279cb136c9523ff6102148002b6e6ee7755e86aafe6347bf434` |
+| Fixture manifest | `heel-staging-fixture-manifest.json`, 786 bytes, SHA-256 `b51eb0e385633dafeec3f1f7c97f6706d0a1e23466049576d9f91a662827ab74` |
 | Source of fixture bytes | `tests/fixtures/customer_staging/{README.md,openapi.json,worker.mjs,wrangler.jsonc}` and `release/heel-staging-fixture-manifest.json` at the expected commit; `target.test.mjs` stays repository-only |
-| Source of bytes | the committed files in `apps/heel-cloud/public/downloads/` at the expected commit (blobs `89ffd94bf8571e9ea5f981ad77ced3ebbf69ed35`, `f32cd5a3958dfd4d0291d70dd290f045baa179a6`, `6f759c743a22af99a18248096cba9075c564c33e` at `db34fafe4ac892e4c2361bd0cd96c78b5278b9d2`) |
+| Source of bytes | the committed files in `apps/heel-cloud/public/downloads/` at the expected commit (blobs `f47a369506999ddfe48f0583f3271a32548496f7`, `b4ef1d45b4a6a0b5e7cce9a6af0bef64bd796790`, `14707f4a0d68de642fb3522160bedb5624d93a3d` at `49e813ef0eb80da53a3af7fcd01558a13ce89f93`) |
 | Runner extra | `cryptography==50.0.1`; Python 3.11 or newer |
 | PyPI | not used; `publish.yml` keeps its stable-only condition `draft == false && prerelease == false` |
 
@@ -261,8 +263,18 @@ published.
 
 ## 3. Read-only public verification and recovery
 
+Run it from the checkout root with the interpreter used for the local checks (Python 3.11 or
+newer). Resolve that interpreter to its absolute path into `PY` **before** clearing the
+environment, so `env -i` keeps it while dropping every credential, token, netrc and pip setting,
+and run the tool from a new empty directory outside the checkout:
+
 ```sh
-python -I scripts/publish_runner_preview_release_rc6.py verify-public \
+PY="$(python3 -c 'import sys; print(sys.executable)')"
+"$PY" -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+TOOL="$PWD/scripts/publish_runner_preview_release_rc6.py"
+SCRATCH="$(mktemp -d)"
+cd "$SCRATCH" && env -i HOME="$HOME" PATH=/usr/bin:/bin TMPDIR="$SCRATCH" NETRC="$SCRATCH/no-netrc" \
+  "$PY" -I "$TOOL" verify-public \
   --repository ancilis/heel --tag v1.3.0rc6 --expected-sha "$SHA" \
   --expected-manifest-sha256 "<pinned manifest SHA-256 from Fixed identity>"
 ```
@@ -310,7 +322,7 @@ installs the hash-pinned wheel with its `[runner]` extra, and prints the install
 the CLI is then `./heel-rc6/bin/heel`:
 
 ```sh
-python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e' && ./heel-rc6/bin/heel --version
+python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version
 ```
 
 pip refuses to install the wheel unless its SHA-256 equals the pinned digest. The
@@ -351,7 +363,7 @@ the site and allows no other name.
 `apps/heel-cloud/public/downloads/*`, the four staging fixture files, the fixture manifest and the
 four version sources and requires them to equal the pinned rc6 blob ids, digests and sizes; it
 fails at import on purpose if any of them changes. E3 carries the rc6 digests and sizes for all
-eight assets, E4 keeps `PIN_STATUS = "FINAL"`, the test pins `PINNED_COMMIT` (`db34fafe4ac892e4c2361bd0cd96c78b5278b9d2`) and the rc6
+eight assets, E4 keeps `PIN_STATUS = "FINAL"`, the test pins `PINNED_COMMIT` (`49e813ef0eb80da53a3af7fcd01558a13ce89f93`) and the rc6
 blobs, and `INTERIM_SHA256` keeps the published rc5 runner digests so the rc6 ones must differ from
 them. The E5 release-note text describes the accepted scope and matches the rc6 CHANGELOG entry at
 that source.

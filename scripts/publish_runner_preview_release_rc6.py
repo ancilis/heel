@@ -82,19 +82,19 @@ FIXTURE_MANIFEST_PATH = f"release/{FIXTURE_MANIFEST}"
 FIXTURE_MANIFEST_SCHEMA = "heel.staging-fixture-files.v1"
 ASSET_NAMES = (*RUNNER_ASSET_NAMES, *FIXTURE_FILES, FIXTURE_MANIFEST)
 MANIFEST_SCHEMA = "heel.open-core-artifacts.v1"
-# The exact reviewed 1.3.0rc6 bytes (source db34fafe); the only artifacts this tool will publish.
+# The exact reviewed 1.3.0rc6 bytes (source 49e813ef); the only artifacts this tool will publish.
 PIN_STATUS = "FINAL"
 EXPECTED_SHA256 = MappingProxyType({
-    WHEEL: "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e",
-    SDIST: "2abee106f96b6c32cc77eb7e774f87b97ba7d9d465b8efccdb0f333a973e519b",
-    MANIFEST: "ce710dc0081c8e9a84d7662804367abfd22211847ac06f986b2573ad81d04aa8",
-    "heel-staging-fixture-README.md": "7848ccc9c6aec7326e54e8d90aa299caceb494d69f62aba4671d83a377ffa004",
+    WHEEL: "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0",
+    SDIST: "7087bcad6cdd73838aedeeb70c7f214816222cb3f052f969a0c93c29421b5fe9",
+    MANIFEST: "34b33d78708ba1161e4efbc4c3fce0e6a7459a48ae4d4f6f71e1bc96d47c9930",
+    "heel-staging-fixture-README.md": "1e5538eb0a9ac5e1326d37200bda2f10f2182a875a96367b34da73dc4bd99a20",
     "heel-staging-fixture-openapi.json": "520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19",
     "heel-staging-fixture-worker.mjs": "b0d8c1f426986ab613c1f4ca46302607c249cf4a7bcb47c415ac747b552d3bf3",
     "heel-staging-fixture-wrangler.jsonc": "9c33fbf3092722dbfde0f09d6ff68557a07e6cb7379c9e2d72509faaf46b988a",
-    FIXTURE_MANIFEST: "ac52bd5d0520f279cb136c9523ff6102148002b6e6ee7755e86aafe6347bf434",
+    FIXTURE_MANIFEST: "b51eb0e385633dafeec3f1f7c97f6706d0a1e23466049576d9f91a662827ab74",
 })
-EXPECTED_SIZES = MappingProxyType({WHEEL: 2991367, SDIST: 635213, MANIFEST: 347,
+EXPECTED_SIZES = MappingProxyType({WHEEL: 3021024, SDIST: 640955, MANIFEST: 347,
                                   "heel-staging-fixture-README.md": 30273,
                                   "heel-staging-fixture-openapi.json": 2282,
                                   "heel-staging-fixture-worker.mjs": 13120,

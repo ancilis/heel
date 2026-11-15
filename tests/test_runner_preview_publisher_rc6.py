@@ -13,7 +13,7 @@ named, pinned ``heel-staging-fixture-*`` assets of the same prerelease.  Its can
 runner bytes and fixture files this checkout carries, bound below by git blob id, SHA-256 and size;
 this module fails at import on purpose if they differ.
 
-The pins below are the rc6 candidate built once at source db34fafe and the tool's PIN_STATUS is FINAL.
+The pins below are the rc6 candidate built once at source 49e813ef and the tool's PIN_STATUS is FINAL.
 InterimPinTests keeps proving that any other status refuses every mode; FinalizationTests requires the
 rc6 runner digests to differ from the published rc5 digests recorded here, which the tool therefore
 refuses.
@@ -58,36 +58,36 @@ FIXTURE_FILES = {
     "heel-staging-fixture-worker.mjs": "worker.mjs",
     "heel-staging-fixture-wrangler.jsonc": "wrangler.jsonc"
 ,}
-# The rc6 candidate at db34fafe4ac892e4c2361bd0cd96c78b5278b9d2
-# (tree 19902b10f3cfd6b4d3f82643e709f09b91e0910e), written out here independently of the tool.
-PINNED_COMMIT = "db34fafe4ac892e4c2361bd0cd96c78b5278b9d2"
+# The rc6 candidate at 49e813ef0eb80da53a3af7fcd01558a13ce89f93
+# (tree 0367a50a4cb43d9620336a27d17d8adbb2984ccb), written out here independently of the tool.
+PINNED_COMMIT = "49e813ef0eb80da53a3af7fcd01558a13ce89f93"
 PINNED_BLOBS = {
-    "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc6-py3-none-any.whl": "89ffd94bf8571e9ea5f981ad77ced3ebbf69ed35",
-    "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc6.tar.gz": "f32cd5a3958dfd4d0291d70dd290f045baa179a6",
-    "apps/heel-cloud/public/downloads/heel-open-core-manifest.json": "6f759c743a22af99a18248096cba9075c564c33e",
-    "tests/fixtures/customer_staging/README.md": "2985faf85c5116a21fbaf10b032a70a28dc787cb",
+    "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc6-py3-none-any.whl": "f47a369506999ddfe48f0583f3271a32548496f7",
+    "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc6.tar.gz": "b4ef1d45b4a6a0b5e7cce9a6af0bef64bd796790",
+    "apps/heel-cloud/public/downloads/heel-open-core-manifest.json": "14707f4a0d68de642fb3522160bedb5624d93a3d",
+    "tests/fixtures/customer_staging/README.md": "9d24ccd46f6fb656a44b5dbcfc3a78159af353de",
     "tests/fixtures/customer_staging/openapi.json": "410239ae5d60f53c5054660a4fa1a2e20170c200",
     "tests/fixtures/customer_staging/worker.mjs": "cd8508c21766f747edb68ca0d68cfd0bc37d6522",
     "tests/fixtures/customer_staging/wrangler.jsonc": "0d7bb8c15f0486a68f52d49d3e2a21c63e11f818",
-    "release/heel-staging-fixture-manifest.json": "7256beed31e8748606d766ece5213a48d8009ee3",
+    "release/heel-staging-fixture-manifest.json": "9c6bff3a822be87055611e9dc98ca47743572432",
     "pyproject.toml": "fbd8f395212007c317659efdd6ab06e8488ecfaa",
     "release/open-core-v1.json": "e5a81c1149b9004955e89ccbf1f6b35f24bdea73",
     "heel/__init__.py": "e0c2a87faa6c37af134c6c84f524353aeb4cec60",
     "scripts/build_open_core_release.py": "f0ed8a9eead64aa29fb02277db61dccebd5fe387",
 }
 ACCEPTED_SHA256 = {
-    "heel_sim-1.3.0rc6-py3-none-any.whl": "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e",
-    "heel_sim-1.3.0rc6.tar.gz": "2abee106f96b6c32cc77eb7e774f87b97ba7d9d465b8efccdb0f333a973e519b",
-    "heel-open-core-manifest.json": "ce710dc0081c8e9a84d7662804367abfd22211847ac06f986b2573ad81d04aa8",
-    "heel-staging-fixture-README.md": "7848ccc9c6aec7326e54e8d90aa299caceb494d69f62aba4671d83a377ffa004",
+    "heel_sim-1.3.0rc6-py3-none-any.whl": "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0",
+    "heel_sim-1.3.0rc6.tar.gz": "7087bcad6cdd73838aedeeb70c7f214816222cb3f052f969a0c93c29421b5fe9",
+    "heel-open-core-manifest.json": "34b33d78708ba1161e4efbc4c3fce0e6a7459a48ae4d4f6f71e1bc96d47c9930",
+    "heel-staging-fixture-README.md": "1e5538eb0a9ac5e1326d37200bda2f10f2182a875a96367b34da73dc4bd99a20",
     "heel-staging-fixture-openapi.json": "520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19",
     "heel-staging-fixture-worker.mjs": "b0d8c1f426986ab613c1f4ca46302607c249cf4a7bcb47c415ac747b552d3bf3",
     "heel-staging-fixture-wrangler.jsonc": "9c33fbf3092722dbfde0f09d6ff68557a07e6cb7379c9e2d72509faaf46b988a",
-    "heel-staging-fixture-manifest.json": "ac52bd5d0520f279cb136c9523ff6102148002b6e6ee7755e86aafe6347bf434",
+    "heel-staging-fixture-manifest.json": "b51eb0e385633dafeec3f1f7c97f6706d0a1e23466049576d9f91a662827ab74",
 }
 ACCEPTED_SIZES = {
-    "heel_sim-1.3.0rc6-py3-none-any.whl": 2991367,
-    "heel_sim-1.3.0rc6.tar.gz": 635213,
+    "heel_sim-1.3.0rc6-py3-none-any.whl": 3021024,
+    "heel_sim-1.3.0rc6.tar.gz": 640955,
     "heel-open-core-manifest.json": 347,
     "heel-staging-fixture-README.md": 30273,
     "heel-staging-fixture-openapi.json": 2282,
@@ -1862,16 +1862,16 @@ DIFF_ADDED = {
         _E('VERSION = "1.3.0rc6"'),
     ],
     "E3": [
-        _E('# The exact reviewed 1.3.0rc6 bytes (source db34fafe); the only artifacts this tool will publish.'),
-        _E('    WHEEL: "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e",'),
-        _E('    SDIST: "2abee106f96b6c32cc77eb7e774f87b97ba7d9d465b8efccdb0f333a973e519b",'),
-        _E('    MANIFEST: "ce710dc0081c8e9a84d7662804367abfd22211847ac06f986b2573ad81d04aa8",'),
-        _E('    "heel-staging-fixture-README.md": "7848ccc9c6aec7326e54e8d90aa299caceb494d69f62aba4671d83a377ffa004",'),
+        _E('# The exact reviewed 1.3.0rc6 bytes (source 49e813ef); the only artifacts this tool will publish.'),
+        _E('    WHEEL: "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0",'),
+        _E('    SDIST: "7087bcad6cdd73838aedeeb70c7f214816222cb3f052f969a0c93c29421b5fe9",'),
+        _E('    MANIFEST: "34b33d78708ba1161e4efbc4c3fce0e6a7459a48ae4d4f6f71e1bc96d47c9930",'),
+        _E('    "heel-staging-fixture-README.md": "1e5538eb0a9ac5e1326d37200bda2f10f2182a875a96367b34da73dc4bd99a20",'),
         _E('    "heel-staging-fixture-openapi.json": "520288872cee2480168063427ce616e7ee15aa9931c8d0ec40029899f7c13f19",'),
         _E('    "heel-staging-fixture-worker.mjs": "b0d8c1f426986ab613c1f4ca46302607c249cf4a7bcb47c415ac747b552d3bf3",'),
         _E('    "heel-staging-fixture-wrangler.jsonc": "9c33fbf3092722dbfde0f09d6ff68557a07e6cb7379c9e2d72509faaf46b988a",'),
-        _E('    FIXTURE_MANIFEST: "ac52bd5d0520f279cb136c9523ff6102148002b6e6ee7755e86aafe6347bf434",'),
-        _E('EXPECTED_SIZES = MappingProxyType({WHEEL: 2991367, SDIST: 635213, MANIFEST: 347,'),
+        _E('    FIXTURE_MANIFEST: "b51eb0e385633dafeec3f1f7c97f6706d0a1e23466049576d9f91a662827ab74",'),
+        _E('EXPECTED_SIZES = MappingProxyType({WHEEL: 3021024, SDIST: 640955, MANIFEST: 347,'),
         _E('                                  "heel-staging-fixture-README.md": 30273,'),
         _E('                                  "heel-staging-fixture-openapi.json": 2282,'),
         _E('                                  "heel-staging-fixture-worker.mjs": 13120,'),
