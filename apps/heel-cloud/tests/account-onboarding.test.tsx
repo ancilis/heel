@@ -2330,7 +2330,7 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     const { ws } = verifiedOwner();
     render(<Dashboard />);
     const card = await pairCard();
-    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && \.\/heel-rc6\/bin\/heel --version$/)).toBeTruthy();
+    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e' && \.\/heel-rc6\/bin\/heel --version$/)).toBeTruthy();
     expect((within(card).getByRole("link", { name: "Heel 1.3.0rc6 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc6");
     expect(within(card).queryByRole("textbox", { name: /credential|secret|password|token/i })).toBeNull();
     const mark = server.calls.length;

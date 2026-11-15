@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 import unittest
 
@@ -22,7 +23,7 @@ MANIFEST = "heel-open-core-manifest.json"
 # are checked, this pin is provisional.
 PUBLIC_VERSION = "1.3.0rc6"
 PUBLIC_WHEEL = f"heel_sim-{PUBLIC_VERSION}-py3-none-any.whl"
-PUBLIC_WHEEL_SHA256 = "a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226"
+PUBLIC_WHEEL_SHA256 = "bf1bf975fd970bc79c2fdf711d5113f852fa72549fbc0117f47e12e205e5403e"
 PUBLIC_INSTALL = (
     "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install "
     "'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/"
@@ -256,6 +257,22 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertIn("https://github.com/ancilis/heel/releases/tag/v1.3.0rc2", launch)
         self.assertNotIn("later work", launch)
         self.assertIn("not publicly deployed", launch)
+
+    def test_guide_and_staging_fixture_readme_name_the_current_release_and_its_fixture_assets(self):
+        guide = (ROOT / "apps/heel-cloud/app/guide/page.tsx").read_text(encoding="utf-8")
+        self.assertIn('const RELEASE = "' + PUBLIC_VERSION + '";', guide)
+        self.assertIn("<code>heel-staging-fixture-</code> assets", guide)
+        self.assertIn("<a href={RUNNER_RC6_RELEASE_URL}>{RELEASE} release</a>, with a manifest", guide)
+        readme = (ROOT / "tests/fixtures/customer_staging/README.md").read_text(encoding="utf-8")
+        self.assertIn(PUBLIC_RELEASE, readme)
+        self.assertIn(f"https://github.com/ancilis/heel/releases/download/v{PUBLIC_VERSION}", readme)
+        self.assertIn(PUBLIC_INSTALL, readme)
+        self.assertIn(PUBLIC_CLI.strip(), readme)
+        self.assertNotRegex(readme, r"heel-rc[1-5]/|releases/(?:tag|download)/v1\.3\.0rc[1-5]\b")
+        manifest = json.loads((ROOT / "release/heel-staging-fixture-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], PUBLIC_VERSION)
+        self.assertEqual([record["name"] for record in manifest["files"]],
+                         ["README.md", "openapi.json", "worker.mjs", "wrangler.jsonc"])
 
 if __name__ == "__main__":
     unittest.main()
