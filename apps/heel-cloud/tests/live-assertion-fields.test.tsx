@@ -9,7 +9,9 @@
  */
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { useState } from "react";
+import { act, useState } from "react";
+import { hydrateRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
@@ -129,6 +131,11 @@ describe("helpers mirror the closed E1 schema", () => {
     ["key", "😀".repeat(64), true],
     ["key", "😀".repeat(60) + "x".repeat(10), true],
     ["key", "é".repeat(128), true],
+    ["key", "\u00e9", true],
+    ["key", "e\u0301", false],
+    ["key", "\u1100\u1161", false],
+    ["key", "\u212b", false],
+    ["key", "👩\u200d💻", true],
     ["key", "😀".repeat(65), false],
     ["key", "ab\u0000", false],
     ["key", "tab\there", false],
@@ -283,6 +290,25 @@ describe("guided assertion editor", () => {
     expect(lastValidation()).toEqual({ ok: false, errors: { "witness.reference": expect.any(String) } });
   });
 
+  test("a decomposed (non-NFC) key keeps its exact text and gets a clear field error; the composed key is accepted", () => {
+    const { lastValidation, lastDraft } = mount(hydrateLiveAssertion(PRESENCE)!);
+    const key = textField(group("Condition field path"), 3);
+    type(key, "caf" + "e\u0301");
+    expect(key.value).toBe("cafe\u0301");
+    expect(lastDraft().conditionPath[2]!.text).toBe("cafe\u0301");
+    expect(key.getAttribute("aria-invalid")).toBe("true");
+    expect(describedText(key)).toMatch(/composed \(NFC\) form/);
+    const rejected = lastValidation();
+    expect(rejected.ok).toBe(false);
+    expect(Object.keys(rejected.ok ? {} : rejected.errors)).toEqual([`condition.segment.${lastDraft().conditionPath[2]!.id}`]);
+    expect(hydrateLiveAssertion({ ...PRESENCE, condition: { kind: "json_field_present", path: ["cafe\u0301"] } })).toBeNull();
+
+    type(key, "caf\u00e9");
+    expect(key.getAttribute("aria-invalid")).toBeNull();
+    const accepted = lastValidation();
+    expect(accepted.ok && accepted.assertion.condition.path).toEqual(["data", 0, "caf\u00e9"]);
+  });
+
   test("key text is kept exactly: no trimming, truncation or coercion", () => {
     const { lastValidation } = mount(hydrateLiveAssertion(PRESENCE)!);
     const key = textField(group("Condition field path"), 3);
@@ -380,5 +406,107 @@ describe("guided assertion editor", () => {
     expect(textField(group("Success field path"), 1).getAttribute("aria-invalid")).toBe("true");
     expect(describedText(textField(group("Condition field path"), 1))).toMatch(/exact object key/);
     expect(describedText(screen.getByLabelText("Expected value reference"))).toMatch(/Enter a local reference name/);
+  });
+});
+
+
+describe("stable DOM identity", () => {
+  function ids(root: ParentNode): string[] {
+    return Array.from(root.querySelectorAll("[id]"), (element) => element.id);
+  }
+
+  function expectLabelsResolve(root: ParentNode) {
+    const all = ids(document);
+    expect(new Set(all).size).toBe(all.length);
+    const labels = root.querySelectorAll("label[for]");
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) {
+      const target = document.getElementById(label.getAttribute("for")!);
+      expect(target).not.toBeNull();
+      expect(root.contains(target)).toBe(true);
+    }
+  }
+
+  test("initial and hydrated drafts get deterministic row ids, whatever was built before", () => {
+    const first = emptyLiveAssertionDraft();
+    for (let count = 0; count < 5; count += 1) { emptyLiveAssertionDraft(); hydrateLiveAssertion(PRESENCE); newLivePathRow("key"); }
+    expect(emptyLiveAssertionDraft()).toEqual(first);
+    expect(hydrateLiveAssertion(PRESENCE)).toEqual(hydrateLiveAssertion(PRESENCE));
+    const hydrated = hydrateLiveAssertion(PRESENCE)!;
+    const rowIds = [...hydrated.witnessPath, ...hydrated.conditionPath].map((row) => row.id);
+    expect(new Set(rowIds).size).toBe(rowIds.length);
+  });
+
+  test.each([["an empty draft", () => emptyLiveAssertionDraft()], ["a hydrated draft", () => hydrateLiveAssertion(EQUALITY)!]])(
+    "%s renders identical server HTML repeatedly and hydrates on the client with the same ids and labels", async (_, build) => {
+      const noop = () => undefined;
+      // A warmed server process: builders have already run for earlier requests.
+      for (let count = 0; count < 3; count += 1) renderToString(<LiveAssertionFields draft={build()} onChange={noop} />);
+      const serverHtml = renderToString(<LiveAssertionFields draft={build()} onChange={noop} />);
+      expect(renderToString(<LiveAssertionFields draft={build()} onChange={noop} />)).toBe(serverHtml);
+
+      const container = document.createElement("div");
+      container.innerHTML = serverHtml;
+      document.body.appendChild(container);
+      const serverIds = ids(container);
+      const serverLabels = Array.from(container.querySelectorAll("label[for]"), (label) => [label.textContent, label.getAttribute("for")]);
+      const serverFirstInput = container.querySelector("input");
+      const recoverable: unknown[] = [];
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const root = await act(async () => hydrateRoot(container, <Harness initial={build()} />, {
+        onRecoverableError: (error) => { recoverable.push(error); },
+      }));
+      try {
+        expect(recoverable).toEqual([]);
+        expect(consoleError).not.toHaveBeenCalled();
+        expect(ids(container)).toEqual(serverIds);
+        expect(Array.from(container.querySelectorAll("label[for]"), (label) => [label.textContent, label.getAttribute("for")])).toEqual(serverLabels);
+        expect(container.querySelector("input")).toBe(serverFirstInput);
+        expectLabelsResolve(container);
+      } finally {
+        consoleError.mockRestore();
+        act(() => root.unmount());
+        container.remove();
+      }
+    });
+
+  test("two editors on one page keep distinct ids and labels resolve inside their own editor", () => {
+    render(<>
+      <section aria-label="first editor"><Harness initial={emptyLiveAssertionDraft()} /></section>
+      <section aria-label="second editor"><Harness initial={hydrateLiveAssertion(PRESENCE)!} /></section>
+    </>);
+    const first = screen.getByRole("region", { name: "first editor" });
+    const second = screen.getByRole("region", { name: "second editor" });
+    expectLabelsResolve(first);
+    expectLabelsResolve(second);
+    fireEvent.click(within(second).getByRole("button", { name: "Add array index to success field path" }));
+    expect(document.activeElement).toBe(textField(within(second).getByRole("group", { name: "Success field path" }), 4));
+    expectLabelsResolve(first);
+    expectLabelsResolve(second);
+  });
+
+  test("user-added rows never collide with existing or removed-then-readded rows", () => {
+    const { lastDraft } = mount(hydrateLiveAssertion(PRESENCE)!);
+    const witnessPath = group("Success field path");
+    const addKey = within(witnessPath).getByRole("button", { name: "Add object key to success field path" });
+    fireEvent.click(within(witnessPath).getByRole("button", { name: "Remove segment 1" }));
+    fireEvent.click(addKey);
+    fireEvent.click(addKey);
+    fireEvent.click(within(witnessPath).getByRole("button", { name: "Remove segment 2" }));
+    fireEvent.click(addKey);
+    const rowIds = [...lastDraft().witnessPath, ...lastDraft().conditionPath].map((row) => row.id);
+    expect(new Set(rowIds).size).toBe(rowIds.length);
+    expect(document.activeElement).toBe(textField(witnessPath, lastDraft().witnessPath.length));
+    expectLabelsResolve(document);
+  });
+
+  test("path type selects reuse the existing account-field styling with explicit labels", () => {
+    mount();
+    const selects = document.querySelectorAll("select");
+    expect(selects.length).toBe(3);
+    for (const select of selects) {
+      expect(select.parentElement?.classList.contains("account-field")).toBe(true);
+      expect(select.parentElement?.querySelector(`label[for="${select.id}"]`)).not.toBeNull();
+    }
   });
 });

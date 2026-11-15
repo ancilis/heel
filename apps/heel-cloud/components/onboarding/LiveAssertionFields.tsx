@@ -35,7 +35,11 @@ const ENCODER = new TextEncoder();
 export type LivePathSegmentKind = "key" | "index";
 export type LiveConditionKind = "json_field_present" | "json_scalar_equals_fixture";
 
-/** One ordered path row. `text` is exactly what was typed; `id` only keeps controls stable and is never serialized. */
+/**
+ * One ordered path row. `text` is exactly what was typed; `id` only keeps controls stable and is never serialized.
+ * Ids must be unique within one draft. Drafts from `emptyLiveAssertionDraft` and `hydrateLiveAssertion` use
+ * deterministic ids (`witness-1`, `condition-1`, ...), so server-rendered and hydrated labels and controls match.
+ */
 export interface LivePathRowDraft {
   readonly id: string;
   readonly kind: LivePathSegmentKind;
@@ -85,17 +89,38 @@ export type LiveAssertionValidation =
 
 let rowSequence = 0;
 
-/** A new path row with a fresh stable id. */
+/**
+ * A new path row with a fresh process-unique id, for rows built outside a draft builder. Do not use it while building
+ * the initial draft of server-rendered markup: the counter differs between server and client processes.
+ */
 export function newLivePathRow(kind: LivePathSegmentKind, text = ""): LivePathRowDraft {
   rowSequence += 1;
   return { id: `live-path-row-${rowSequence}`, kind, text };
 }
 
+type Side = "witness" | "condition";
+
+/** Deterministic row ids scoped to one path of one draft: `<side>-1`, `<side>-2`, ... */
+function pathRows(side: Side, segments: readonly (readonly [LivePathSegmentKind, string])[]): LivePathRowDraft[] {
+  return segments.map(([kind, text], index) => ({ id: `${side}-${index + 1}`, kind, text }));
+}
+
+/** A row id for `side` that no row already in `rows` uses: one past the highest `<side>-<n>` present. */
+function nextRowId(side: Side, rows: readonly LivePathRowDraft[]): string {
+  const prefix = `${side}-`;
+  let highest = 0;
+  for (const row of rows) {
+    const suffix = row.id.startsWith(prefix) ? row.id.slice(prefix.length) : "";
+    if (INDEX_SHAPE.test(suffix)) highest = Math.max(highest, Number(suffix));
+  }
+  return `${prefix}${highest + 1}`;
+}
+
 /** One empty key row per path, presence condition, no references. It is not yet valid. */
 export function emptyLiveAssertionDraft(): LiveAssertionDraft {
   return {
-    witnessPath: [newLivePathRow("key")], witnessReference: "",
-    conditionKind: "json_field_present", conditionPath: [newLivePathRow("key")], conditionReference: "",
+    witnessPath: pathRows("witness", [["key", ""]]), witnessReference: "",
+    conditionKind: "json_field_present", conditionPath: pathRows("condition", [["key", ""]]), conditionReference: "",
   };
 }
 
@@ -107,6 +132,11 @@ function segmentError(row: LivePathRowDraft): string | null {
   }
   if (row.text === "") return "Enter the exact object key.";
   if (CONTROL_OR_SURROGATE.test(row.text)) return "Remove control characters or unpaired surrogates from the key.";
+  // Saved checks are canonicalized as NFC and must never rename a real JSON key, so only keys already in NFC are
+  // supported here. The typed text is kept exactly as entered; it is not normalized for the customer.
+  if (row.text !== row.text.normalize("NFC")) {
+    return "This key uses decomposed Unicode (for example e followed by a combining accent). Saved checks support keys in composed (NFC) form only; type the key with composed characters, matching the response exactly.";
+  }
   if ([...row.text].length > LIVE_KEY_MAX_CHARS) return "Use at most 128 characters in one key.";
   if (ENCODER.encode(row.text).length > LIVE_KEY_MAX_BYTES) return "Use at most 256 bytes (UTF-8) in one key.";
   if (RESERVED_KEYS.has(row.text)) return `“${row.text}” is reserved: Heel paths have no wildcards or JSONPath syntax. Use the real key.`;
@@ -177,15 +207,15 @@ function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<
   return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
 
-function hydratePath(value: unknown): LivePathRowDraft[] | null {
+function hydratePath(side: Side, value: unknown): LivePathRowDraft[] | null {
   if (!Array.isArray(value)) return null;
-  const rows: LivePathRowDraft[] = [];
+  const segments: [LivePathSegmentKind, string][] = [];
   for (const segment of value) {
-    if (typeof segment === "string") rows.push(newLivePathRow("key", segment));
-    else if (typeof segment === "number" && Number.isSafeInteger(segment) && !Object.is(segment, -0)) rows.push(newLivePathRow("index", String(segment)));
+    if (typeof segment === "string") segments.push(["key", segment]);
+    else if (typeof segment === "number" && Number.isSafeInteger(segment) && !Object.is(segment, -0)) segments.push(["index", String(segment)]);
     else return null;
   }
-  return rows;
+  return pathRows(side, segments);
 }
 
 /**
@@ -210,8 +240,8 @@ export function hydrateLiveAssertion(value: unknown): LiveAssertionDraft | null 
   } else {
     return null;
   }
-  const witnessPath = hydratePath(witness.path);
-  const conditionPath = hydratePath(condition.path);
+  const witnessPath = hydratePath("witness", witness.path);
+  const conditionPath = hydratePath("condition", condition.path);
   if (witnessPath === null || conditionPath === null) return null;
   const draft: LiveAssertionDraft = {
     witnessPath, witnessReference: witness.expected_fixture, conditionKind, conditionPath, conditionReference,
@@ -230,8 +260,6 @@ export interface LiveAssertionFieldsProps {
 }
 
 const REFERENCE_HINT = "Enter the reference name, not the expected value; values stay on your runner.";
-
-type Side = "witness" | "condition";
 
 export function LiveAssertionFields({ draft, onChange, disabled = false, showErrors = true }: LiveAssertionFieldsProps) {
   const base = useId();
@@ -264,19 +292,21 @@ export function LiveAssertionFields({ draft, onChange, disabled = false, showErr
   }
 
   function pathEditor(side: Side, legend: string, rows: readonly LivePathRowDraft[]): ReactNode {
+    // DOM ids carry the editor's useId prefix and the side, so two editors or two paths never share an id.
+    const rowFieldId = (row: LivePathRowDraft, part: "kind" | "text") => fieldId(`${side}-row-${row.id}-${part}`);
     const setRows = (next: readonly LivePathRowDraft[]) =>
       update(side === "witness" ? { ...draft, witnessPath: next } : { ...draft, conditionPath: next });
     const pathError = errors[`${side}.path`];
     const hintId = fieldId(`${side}-path-hint`);
     const full = rows.length >= LIVE_PATH_MAX_SEGMENTS;
     const add = (kind: LivePathSegmentKind) => {
-      const row = newLivePathRow(kind);
-      pendingFocus.current = fieldId(`${row.id}-text`);
+      const row: LivePathRowDraft = { id: nextRowId(side, rows), kind, text: "" };
+      pendingFocus.current = rowFieldId(row, "text");
       setRows([...rows, row]);
     };
     const remove = (index: number) => {
       const neighbour = rows[index + 1] ?? rows[index - 1];
-      pendingFocus.current = neighbour ? fieldId(`${neighbour.id}-kind`) : fieldId(`${side}-add-key`);
+      pendingFocus.current = neighbour ? rowFieldId(neighbour, "kind") : fieldId(`${side}-add-key`);
       setRows(rows.filter((_, position) => position !== index));
     };
     return (
@@ -286,18 +316,20 @@ export function LiveAssertionFields({ draft, onChange, disabled = false, showErr
         <ol>
           {rows.map((row, index) => {
             const number = index + 1;
-            const kindId = fieldId(`${row.id}-kind`);
-            const textId = fieldId(`${row.id}-text`);
+            const kindId = rowFieldId(row, "kind");
+            const textId = rowFieldId(row, "text");
             const error = errors[`${side}.segment.${row.id}`];
             const errorId = `${textId}-error`;
             return (
               <li key={row.id}>
-                <label htmlFor={kindId}>Segment {number} type</label>
-                <select disabled={disabled} id={kindId} value={row.kind}
-                  onChange={(event) => setRows(rows.map((item) => item.id === row.id ? { ...item, kind: event.target.value as LivePathSegmentKind } : item))}>
-                  <option value="key">Object key</option>
-                  <option value="index">Array index</option>
-                </select>
+                <div className="account-field">
+                  <label htmlFor={kindId}>Segment {number} type</label>
+                  <select disabled={disabled} id={kindId} value={row.kind}
+                    onChange={(event) => setRows(rows.map((item) => item.id === row.id ? { ...item, kind: event.target.value as LivePathSegmentKind } : item))}>
+                    <option value="key">Object key</option>
+                    <option value="index">Array index</option>
+                  </select>
+                </div>
                 <label htmlFor={textId}>Segment {number} {row.kind === "index" ? "array index" : "object key"}</label>
                 <input aria-describedby={error ? errorId : undefined} aria-invalid={error ? true : undefined} autoCapitalize="off"
                   autoComplete="off" disabled={disabled} id={textId} inputMode={row.kind === "index" ? "numeric" : "text"}
@@ -335,12 +367,14 @@ export function LiveAssertionFields({ draft, onChange, disabled = false, showErr
       </fieldset>
       <fieldset>
         <legend>Condition to test</legend>
-        <label htmlFor={conditionKindId}>Condition</label>
-        <select aria-describedby={`${conditionKindId}-hint`} disabled={disabled} id={conditionKindId} value={draft.conditionKind}
-          onChange={(event) => update({ ...draft, conditionKind: event.target.value as LiveConditionKind })}>
-          <option value="json_field_present">Field is present</option>
-          <option value="json_scalar_equals_fixture">Scalar equals local input</option>
-        </select>
+        <div className="account-field">
+          <label htmlFor={conditionKindId}>Condition</label>
+          <select aria-describedby={`${conditionKindId}-hint`} disabled={disabled} id={conditionKindId} value={draft.conditionKind}
+            onChange={(event) => update({ ...draft, conditionKind: event.target.value as LiveConditionKind })}>
+            <option value="json_field_present">Field is present</option>
+            <option value="json_scalar_equals_fixture">Scalar equals local input</option>
+          </select>
+        </div>
         <p id={`${conditionKindId}-hint`}>{equality
           ? "The field must hold a scalar equal to a local input on your runner."
           : "The field counts as present whatever its value, including null, false or 0."}</p>
