@@ -123,7 +123,14 @@ export function readinessAdvice(
       note: TYPE_NOTE,
     };
   }
-  return { text: "The original run is not on this runner. Replay it from the runner that executed it, or request a new dry run of the test.", commands: [] };
+  // frozen_run: the runner found no ELIGIBLE source. The run may be absent from this runner, or present but not
+  // replayable (only a completed run whose signed result observed this test can be), so never claim it is absent.
+  return {
+    text: "This runner has no eligible original run for this replay: the run is not stored on this runner, or its result "
+      + "for this test cannot be replayed (only a completed run in which this test was observed can be). "
+      + "Cancel this request, then request a new dry run of the test and approve that instead.",
+    commands: [],
+  };
 }
 
 export const STATE_WORDS: Readonly<Record<ConfiguredReadinessRequirement["state"], string>> = Object.freeze({
@@ -134,7 +141,7 @@ export function requirementLabel(item: ConfiguredReadinessRequirement): string {
   if (item.kind === "route") return "Imported route";
   if (item.kind === "role_credential") return `Credential: ${item.subject?.replace("_", " ")}`;
   if (item.kind === "local_input") return `Local value: ${item.subject}`;
-  return "Original run on this runner";
+  return "Eligible original run on this runner";
 }
 
 /** Closed result reasons in plain language. An inconclusive reason never implies pass or failure. */

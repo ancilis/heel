@@ -338,6 +338,18 @@ describe("setup and replay advice", () => {
     expect(fresh?.commands[0]).toContain("runner input add --name secret_hint");
   });
 
+  test("an unavailable frozen run is described as not eligible, never as certainly absent", async () => {
+    const { readinessAdvice, requirementLabel } = await import("../lib/live-test-text");
+    const item = { kind: "frozen_run", subject: null, state: "missing" } as const;
+    const advice = readinessAdvice(item, "GET /x", "configured_regression");
+    expect(advice?.commands).toEqual([]);
+    expect(advice?.text).toMatch(/no eligible original run for this replay/);
+    expect(advice?.text).toMatch(/not stored on this runner, or its result for this test cannot be replayed/);
+    expect(advice?.text).toMatch(/request a new dry run of the test and approve that instead/);
+    expect(advice?.text).not.toMatch(/^The original run is not on this runner/);
+    expect(requirementLabel(item)).toBe("Eligible original run on this runner");
+  });
+
   test("the replay panel shows the replay-specific advice for a revoked original value", async () => {
     const api = panelApi([view({ planKind: "configured_regression", sourceRunId: "crun_" + "9".repeat(32), runnerSeenAtMs: 5,
       readiness: { reportedAtMs: 5, instances: [{ testInstanceId: "lti_" + "e".repeat(32), requirements: [

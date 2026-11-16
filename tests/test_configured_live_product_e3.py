@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 
 import pytest
 
@@ -491,3 +492,111 @@ def test_a_runner_signed_condition_that_differs_from_the_frozen_request_is_refus
     assert view["status"] == "open" and view["run_id"] is None
     assert c.browser("GET", f"{c.base}/canary-approval-requests")[1]["requests"] == []
     assert c.target.requests == []
+
+
+def _readiness(view):
+    readiness = view.get("readiness")
+    if readiness is None:
+        return None
+    return {(item["kind"], item["subject"], item["state"]) for entry in readiness["instances"]
+            for item in entry["requirements"]}
+
+
+def test_an_ineligible_replay_source_is_reported_unavailable_and_one_serve_keeps_running(customer):
+    """A replay of a terminal instance that was NOT observed (here: blocked) cannot be saved as a
+    regression. The runner reports its frozen run as not ready for that request (no compile, no
+    submission, no target request) and the same long-lived serve stays online; an eligible
+    frozen replay requested next in that process still runs under a fresh approval."""
+    from tests.test_runner_daemon import _daemon, _serve_in_thread, _serve_state, _wait_serve_state
+
+    c = customer
+    assert c.save_test("export-hint", HINT_EQUALS)[0] == 201
+    assert c.save_test("export-plan", PLAN_EQUALS)[0] == 201
+    c.setup_runner()
+    for name, value in (("export_ok", "ok"), ("secret_hint", SECRET_HINT), ("pro_plan", "pro")):
+        c.add_input(name, value)
+    labels = [{"role": "higher_plan", "plan_label": "Pro"}, {"role": "lower_plan", "plan_label": "Free"}]
+    status, _created = c.request_plan({
+        "schema_version": "heel.configured-plan-request.v1", "plan_kind": "configured_live_read",
+        "tests": [{"source_scenario_id": "sc.internal.export-hint", "source_revision": 1},
+                  {"source_scenario_id": "sc.internal.export-plan", "source_revision": 1}],
+        "plan_labels": labels})
+    assert status == 201
+    assert not isinstance(c.serve(), BaseException)
+    request = c.approval_request()
+    assert c.approve_configured(request)[0] == 201
+    assert not isinstance(c.serve(), BaseException)
+    run_id = request["run_id"]
+    local = c.store.load_final_projections(run_id)["local_view"]["findings_projection"]
+    outcomes = {item["source"]["source_scenario_id"]: item for item in local["test_results"]}
+    assert outcomes["sc.internal.export-hint"]["assessment_outcome"] == "observed"
+    assert outcomes["sc.internal.export-plan"]["assessment_outcome"] == "blocked"
+    blocked = outcomes["sc.internal.export-plan"]["test_instance_id"]
+    observed = outcomes["sc.internal.export-hint"]["test_instance_id"]
+    assert len(c.target.requests) == 4
+
+    daemon = _daemon(c.home, c.harness, c.backend, vault_factory=lambda backend: c.vault,
+                     target_network=c.target.network())
+    thread, events, outcome = _serve_in_thread(daemon)
+    try:
+        _wait_serve_state(c.home, lambda state: state["state"] == "online")
+        c.target.mode = "patched"
+        status, ineligible = c.request_plan({"schema_version": "heel.configured-plan-request.v1",
+                                             "plan_kind": "configured_regression", "source_run_id": run_id,
+                                             "test_instance_id": blocked})
+        assert status == 201, ineligible
+        deadline = time.monotonic() + 30
+        view = c.plan_view(ineligible["plan_request_id"])
+        while _readiness(view) is None and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
+            view = c.plan_view(ineligible["plan_request_id"])
+        assert thread.is_alive(), outcome
+        # The run is present but not an eligible source: frozen_run is not ready, nothing else is
+        # claimed about the run, nothing is compiled, submitted or sent to the target.
+        assert _readiness(view) == {("route", None, "ready"), ("role_credential", "lower_plan", "ready"),
+                                    ("role_credential", "higher_plan", "ready"),
+                                    ("frozen_run", None, "missing")}, view
+        assert view["status"] == "open" and view["run_id"] is None, view
+        time.sleep(2.5)  # one more idle cycle of the same process sees the same open request
+        assert thread.is_alive(), outcome
+        assert _serve_state(c.home)["state"] == "online"
+        assert c.browser("GET", f"{c.base}/canary-approval-requests")[1]["requests"] == []
+        assert len(c.target.requests) == 4
+        status, cancelled = c.browser(
+            "POST", f"{c.base}/configured-plan-requests/{ineligible['plan_request_id']}/cancel",
+            {"schema_version": "heel.configured-plan-request-cancel.v1"})
+        assert status == 200 and cancelled["status"] == "cancelled", cancelled
+
+        # The ordinary eligible frozen replay, requested next in the SAME serve, still runs.
+        status, eligible = c.request_plan({"schema_version": "heel.configured-plan-request.v1",
+                                           "plan_kind": "configured_regression", "source_run_id": run_id,
+                                           "test_instance_id": observed})
+        assert status == 201, eligible
+        deadline = time.monotonic() + 30
+        listed: list = []
+        while not listed and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
+            listed = c.browser("GET", f"{c.base}/canary-approval-requests")[1]["requests"]
+        (replay,) = listed
+        assert replay["configured"]["plan_kind"] == "configured_regression"
+        assert [item["test_instance_id"] for item in replay["configured"]["instances"]] == [observed]
+        assert c.approve_configured(replay)[0] == 201
+        deadline = time.monotonic() + 30
+        while thread.is_alive() and time.monotonic() < deadline:
+            try:
+                if c.store.load_run(replay["run_id"])["state"] == "terminal":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        assert thread.is_alive(), outcome
+        replayed = c.store.load_final_projections(replay["run_id"])["local_view"]["findings_projection"]
+        (result,) = replayed["test_results"]
+        assert result["test_instance_id"] == observed
+        assert (result["assessment_outcome"], result["reason"]) == ("blocked", "restricted_empty_denial")
+        assert len(c.target.requests) == 6  # exactly the replay's two approved reads
+    finally:
+        daemon.request_stop()
+        thread.join(15)
+    assert outcome.get("result", {}).get("state") == "stopped", outcome
+    assert "failed" not in [event["state"] for event in events if event.get("event") == "serve_state"]

@@ -49,6 +49,11 @@ from heel.runner.store import RunReservationProbe, RunnerContext, RunnerStore, R
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
 
 
+def _configured_replay_name(instance: Mapping[str, Any]) -> str:
+    """The saved-regression name of one browser-requested configured replay instance."""
+    return f"replay {instance['source']['source_scenario_id']} r{instance['source']['source_revision']}"[:64]
+
+
 def _signed_projection(unsigned: dict[str, Any], signer: SecureSigner) -> dict[str, Any]:
     signature = signer.sign(canonical_bytes(unsigned))
     if not isinstance(signature, bytes) or len(signature) != 64:
@@ -936,17 +941,24 @@ class RunnerCoordinator:
         frozen_handles: dict[str, list[str]] | None = None
         if request["plan_kind"] == "configured_regression":
             frozen_handles = {}
-            from heel.runner.regressions import SavedRegressionError, _verified_terminal_run
+            from heel.runner.regressions import SavedRegressionError, derive_configured_saved_regression
 
-            try:
-                manifest = _verified_terminal_run(self.store, request["source_run_id"])["manifest"]
-            except (RunnerStoreError, SavedRegressionError, ValueError, KeyError, TypeError):
-                manifest = None
-            if isinstance(manifest, Mapping) and manifest.get("schema_version") == "heel.test-manifest.v2":
-                for instance in manifest["test_instances"]:
-                    frozen_handles[instance["test_instance_id"]] = [
-                        item["input_handle_id"] for item in instance["local_inputs"]
-                    ]
+            # The frozen run is ready only when it is an eligible replay source: the exact
+            # derivation ``add_saved_regression`` performs (verified terminal finals bound to this
+            # context and runner, an ``observed`` result with a finding for this instance). A run
+            # that is present but ineligible is reported like an absent one, never compiled.
+            for instance in request["instances"]:
+                try:
+                    record = derive_configured_saved_regression(
+                        self.store, run_id=request["source_run_id"],
+                        test_instance_id=instance["test_instance_id"],
+                        name=_configured_replay_name(instance), now_ms=self._now_ms(),
+                    )
+                except (RunnerStoreError, SavedRegressionError, ValueError, KeyError, TypeError):
+                    continue
+                frozen_handles[instance["test_instance_id"]] = [
+                    item["input_handle_id"] for item in record["local_inputs"]
+                ]
         report = []
         for instance in request["instances"]:
             requirements: list[dict[str, Any]] = []
@@ -1029,8 +1041,7 @@ class RunnerCoordinator:
             instance = request["instances"][0]
             regression, _created = self.store.add_saved_regression(
                 run_id=request["source_run_id"], test_instance_id=instance["test_instance_id"],
-                name=f"replay {instance['source']['source_scenario_id']} r{instance['source']['source_revision']}"[:64],
-                now_ms=self._now_ms(),
+                name=_configured_replay_name(instance), now_ms=self._now_ms(),
             )
             result = compiler.compile_configured_replay(regression)
             queued, _replay = self.store.queue_regression_replay(
