@@ -282,7 +282,17 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         readme = (ROOT / "tests/fixtures/customer_staging/README.md").read_text(encoding="utf-8")
         self.assertIn(PUBLIC_RELEASE, readme)
         self.assertIn(f"https://github.com/ancilis/heel/releases/download/v{PUBLIC_VERSION}", readme)
-        self.assertIn(PUBLIC_INSTALL, readme)
+        # The fixture README shows the one guarded installer: it picks an installed Python 3.11+ or stops before
+        # creating anything, then runs exactly the runbook command's pinned tail (current URL, SHA-256 and flags).
+        tail = PUBLIC_INSTALL.removeprefix("python3 ")
+        self.assertIn(f"releases/download/v{PUBLIC_VERSION}/{PUBLIC_WHEEL}#sha256={PUBLIC_WHEEL_SHA256}'", tail)
+        guarded = re.findall(r"^HEEL_PY=; for py in .*$", readme, re.M)
+        self.assertEqual(len(guarded), 1)
+        self.assertTrue(guarded[0].startswith('HEEL_PY=; for py in "${HEEL_PYTHON:-python3}" python3 python3.14 '))
+        self.assertIn("sys.exit(sys.version_info < (3, 11))", guarded[0])
+        self.assertIn("Nothing was installed.", guarded[0])
+        self.assertTrue(guarded[0].endswith(f'"$HEEL_PY" {tail}; fi'))
+        self.assertNotIn(PUBLIC_INSTALL, readme)
         self.assertIn(PUBLIC_CLI.strip(), readme)
         self.assertNotRegex(readme, r"heel-rc[1-6]/|releases/(?:tag|download)/v1\.3\.0rc[1-6]\b")
         manifest = json.loads((ROOT / "release/heel-staging-fixture-manifest.json").read_text(encoding="utf-8"))
