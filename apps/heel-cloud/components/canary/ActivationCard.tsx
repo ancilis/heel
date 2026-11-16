@@ -19,10 +19,12 @@ export interface ActivationCardProps {
   environmentOrigin?: string;
   scenarioCount?: number;
   onReviewApproval?: () => void;
+  /** Why a terminal rehearsal is not complete, from the runner-signed operational status only. */
+  rehearsalRecovery?: string;
 }
 
 
-export function ActivationCard({ snapshot, completedSteps, environmentOrigin, scenarioCount = 0, onReviewApproval }: ActivationCardProps) {
+export function ActivationCard({ snapshot, completedSteps, environmentOrigin, scenarioCount = 0, onReviewApproval, rehearsalRecovery }: ActivationCardProps) {
   // A paired runner is never sent back to pairing: the cloud holds its active key even when it cannot see it running.
   const runnerPaired = snapshot.runner === "paired" || snapshot.runner === "online" || snapshot.runner === "offline";
   const firstIncomplete = snapshot.environment !== "verified"
@@ -37,7 +39,9 @@ export function ActivationCard({ snapshot, completedSteps, environmentOrigin, sc
             ? "review the result below and choose whether to share its redacted summary"
             : snapshot.rehearsal === "running"
               ? "follow the approved rehearsal or stop it"
-              : "review the exact rehearsal";
+              : snapshot.rehearsal === "error"
+                ? "check the paired runner, then request a fresh dry run"
+                : "review the exact rehearsal";
 
   return (
     <section aria-label="Launch activation" className="activation-card">
@@ -61,7 +65,7 @@ export function ActivationCard({ snapshot, completedSteps, environmentOrigin, sc
         <EnvironmentStep origin={environmentOrigin} state={snapshot.environment} />
         <RunnerStep state={snapshot.runner} />
         <CanaryAccessStep state={snapshot.canaryAccess} />
-        <RehearsalStep onReviewApproval={onReviewApproval} scenarioCount={scenarioCount} state={snapshot.rehearsal} />
+        <RehearsalStep onReviewApproval={onReviewApproval} recovery={rehearsalRecovery} scenarioCount={scenarioCount} state={snapshot.rehearsal} />
       </ol>
     </section>
   );

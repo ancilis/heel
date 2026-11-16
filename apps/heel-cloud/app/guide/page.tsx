@@ -9,6 +9,14 @@ const CLI = RUNNER_RC6_CLI;
 /** The release named next to the shared install constants above; it changes with them. */
 const RELEASE = "1.3.0rc6";
 
+// Picks the first interpreter (an optional HEEL_PYTHON path, then PATH) that is 3.11 or newer and can create a venv
+// with pip; it only runs version checks and downloads or installs nothing.
+const PYTHON_PREFLIGHT = `for py in "\${HEEL_PYTHON:-python3}" python3 python3.14 python3.13 python3.12 python3.11; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys, venv, ensurepip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+    echo "use: $py ($("$py" --version 2>&1), $(command -v "$py"))"; break
+  fi
+done; python3 --version`;
+
 const LINUX_VAULT = `sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
 dbus-run-session -- bash                                   # headless only: private session bus
 IFS= read -rs pw && printf '%s' "$pw" \\
@@ -154,6 +162,24 @@ export default function Guide() {
               checkout is needed. Every command below starts with the installed path{" "}
               <code>{CLI}</code>, not a bare <code>heel</code>. Where the dashboard shows a command
               starting with <code>heel</code>, run it with that same path.
+            </p>
+            <p>
+              First check your interpreter. On some Macs the default <code>python3</code> is 3.9, which is
+              too old. This read-only check prints a <code>use:</code> line naming the first Python 3.11 or
+              newer that has <code>venv</code> and <code>ensurepip</code>, then the version of plain{" "}
+              <code>python3</code>. It looks on your PATH; to check an interpreter installed at another
+              absolute path, first run <code>HEEL_PYTHON=/path/to/python3</code> in the same shell.
+            </p>
+            <pre><code>{PYTHON_PREFLIGHT}</code></pre>
+            <p>
+              If it prints <code>use: python3</code>, run the install command as shown. If it names another
+              interpreter or path, such as <code>use: python3.13</code>, run the install command with that
+              name or path in place of its first word <code>python3</code>; everything after{" "}
+              <code>-m venv</code> stays the same. If it prints no <code>use:</code> line, no compatible
+              interpreter was found on your PATH or at <code>HEEL_PYTHON</code>: point{" "}
+              <code>HEEL_PYTHON</code> at one you have, or install Python 3.11 or newer with its{" "}
+              <code>venv</code> module (for example from python.org, Homebrew, or your Linux package
+              manager), then check again. Heel never downloads Python for you.
             </p>
             <pre><code>{RUNNER_RC6_INSTALL}</code></pre>
             <p>

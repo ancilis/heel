@@ -330,7 +330,9 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
                 <div><dt>Evidence</dt><dd>{row.evidenceState === "customer_declared" ? "customer declared definition" : "inferred"}</dd></div>
                 <div><dt>Execution</dt><dd>{row.executionSupport === "runner_supported"
                   ? `Runner-supported check: ${row.catalogScenarioId}`
-                  : "Static analysis only"}</dd></div>
+                  : row.source === "custom" && row.liveTest !== null
+                    ? `Configured live test on your paired runner: ${COMPARISON_LABELS[row.liveTest.scenarioId]}`
+                    : "Static analysis only"}</dd></div>
               </dl>
               {row.source === "custom" ? (row.liveTest !== null ? <>
                 <p>Configured live test: {COMPARISON_LABELS[row.liveTest.scenarioId]} · <code>{row.liveTest.method} {row.liveTest.routeTemplate}</code></p>

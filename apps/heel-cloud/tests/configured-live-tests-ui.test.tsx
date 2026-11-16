@@ -111,6 +111,17 @@ describe("guided private live test authoring", () => {
     expect(screen.getByText(/Saving creates revision 2; revision 1 and every run that used it stay unchanged/)).toBeTruthy();
     expect((screen.getByLabelText(/^Imported route/) as HTMLInputElement).value).toBe("/billing/features");
   });
+
+  test("a configured custom revision names its live execution mode; static rows keep the static label", async () => {
+    const api: ScenarioLibraryApi = { listScenarioLibrary: vi.fn(async () => LIBRARY), createCustomScenario: vi.fn() };
+    render(<ScenarioLibraryCard api={api} canManage createAssessor={vi.fn()} workspaceRef={WS} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open scenario library" }));
+    const configured = await screen.findByTestId("scenario-row-sc.internal.export-hint");
+    expect(configured.textContent).toContain("ExecutionConfigured live test on your paired runner: Lower plan vs higher plan read");
+    expect(configured.textContent).not.toContain("Static analysis only");
+    expect(screen.getByTestId("scenario-row-sc.internal.static-only").textContent).toContain("ExecutionStatic analysis only");
+    expect(screen.getByTestId("scenario-row-sc.flag.tiergate").textContent).toContain("ExecutionStatic analysis only");
+  });
 });
 
 function view(overrides: Partial<ConfiguredPlanRequestView> = {}): ConfiguredPlanRequestView {

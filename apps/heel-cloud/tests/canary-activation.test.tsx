@@ -11,7 +11,7 @@ import { ActivationCard, type ActivationSnapshot } from "../components/canary/Ac
 import { ApprovalDialog } from "../components/canary/ApprovalDialog";
 import { DisclosureDialog } from "../components/canary/DisclosureDialog";
 import { FindingsCard } from "../components/canary/FindingsCard";
-import { RunProgress } from "../components/canary/RunProgress";
+import { RunProgress, incompleteRunExplanation, terminalRunPhase } from "../components/canary/RunProgress";
 import type { CanaryFindingsProjection } from "../lib/canary-api";
 
 
@@ -282,7 +282,11 @@ describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual pair
     expect(activation.textContent).not.toMatch(/pair (it )?again|re-pair/i);
     expect(activation.textContent).toMatch(/Heel Cloud never receives them and cannot confirm them here/);
     expect(activation.textContent).toMatch(/If the runner submits a valid signed plan, it appears here for review; nothing runs unless you approve it\./);
-    for (const command of [`${CLI} runner serve`, `${CLI} runner credential add --role lower_plan`, `${CLI} runner credential add --role higher_plan`,
+    // Credential guidance is per role of the selected tests, not hardcoded to a plan comparison.
+    expect(activation.textContent).toMatch(/An anonymous vs signed-in read needs only the signed-in role/);
+    expect(activation.textContent).toMatch(/the runner lists exactly what those tests still need/);
+    for (const command of [`${CLI} runner serve`, `${CLI} runner credential add --role authenticated --profile bearer`,
+      `${CLI} runner credential add --role lower_plan`, `${CLI} runner credential add --role higher_plan`,
       `${CLI} runner import-openapi`, `${CLI} runner status`]) expect(activation.textContent).toContain(command);
     expect(within(activation).getByText(/first useful run · 15-minute target/i)).toBeTruthy();
     expectNoDeadGuidance();
@@ -377,5 +381,49 @@ describe("CUSTOMER-RESULT-HANDOFF-B: result sharing and the shared finding rende
     render(<ActivationCard completedSteps={4} snapshot={{ environment: "verified", runner: "paired", canaryAccess: "ready", rehearsal: "complete" }} />);
     const next = screen.getByText(/next action: review the result below and choose whether to share its redacted summary/i);
     expect(next.closest("[role=status]")?.textContent).not.toMatch(/runner machine|load local summary|upload/i);
+  });
+});
+
+
+describe("CUSTOMER-ACTIVATION-POLISH: a terminal run is complete only when signed completed", () => {
+  const CLI_PATH = "./heel-rc6/bin/heel";
+
+  test("only completed is complete; stopped stays stopped; anything else, including unknown, is incomplete", () => {
+    expect(terminalRunPhase("completed")).toBe("complete");
+    expect(terminalRunPhase("stopped")).toBe("stopped");
+    for (const value of ["incomplete", "failed", null]) expect(terminalRunPhase(value)).toBe("incomplete");
+  });
+
+  test("a connection loss advises one restart, then report, never a loop", () => {
+    const text = incompleteRunExplanation("incomplete", "cloud_disconnected", CLI_PATH);
+    expect(text).toMatch(/^The runner signed this rehearsal as incomplete \(cloud_disconnected: /);
+    expect(text).toMatch(/start it once more with the same HEEL_HOME; if it stops again, do not loop: keep this run and report it/);
+    expect(text).toMatch(/do not rely on its test outcomes either way/);
+    expect(text).not.toMatch(/\b(passed|clean|no findings)\b/i);
+  });
+
+  test("other causes point to status and the guide's recovery, not to a restart cure", () => {
+    for (const category of ["proof_expired", "credential_unavailable", "budget_exhausted"]) {
+      const text = incompleteRunExplanation("failed", category, CLI_PATH);
+      expect(text).toContain(`run ${CLI_PATH} runner status and follow the guide's recovery`);
+      expect(text).toMatch(/restarting serve alone does not fix every cause/);
+      expect(text).not.toMatch(/start it once more/);
+    }
+  });
+
+  test("an unknown disposition is never presented as runner-signed", () => {
+    const text = incompleteRunExplanation(null, "none", CLI_PATH);
+    expect(text).toMatch(/^Heel Cloud has no runner-signed disposition for this ended rehearsal\./);
+    expect(text).not.toMatch(/runner signed this rehearsal/);
+  });
+
+  test("the rehearsal step shows the explanation and the next action asks for a fresh dry run", () => {
+    render(<ActivationCard completedSteps={3} rehearsalRecovery={incompleteRunExplanation("incomplete", "cloud_disconnected", CLI_PATH)}
+      snapshot={{ environment: "verified", runner: "paired", canaryAccess: "ready", rehearsal: "error" }} />);
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    const step = within(activation).getAllByRole("listitem").find((item) => item.querySelector("h2")?.textContent === "Run first rehearsal");
+    expect(step?.querySelector(".step-state")?.textContent).toBe("Needs attention");
+    expect(within(activation).getByRole("status").textContent).toMatch(/next action: check the paired runner, then request a fresh dry run/i);
+    expect(within(activation).getByRole("alert").textContent).toMatch(/signed this rehearsal as incomplete/);
   });
 });
