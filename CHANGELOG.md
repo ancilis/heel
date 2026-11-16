@@ -33,6 +33,40 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
+## [1.3.0rc7]: unpublished candidate
+
+Runner preview candidate after the 1.3.0rc6 public review, whose full acceptance failed. It is not
+published, not a stable release and not on PyPI; customer copy names the hash-pinned 1.3.0rc7
+install from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc7> and may be deployed only after
+the release owner's anonymous verify-public for v1.3.0rc7 has checked the exact published bytes.
+1.3.0rc1 through 1.3.0rc6 stay published, unchanged, and are named only as history.
+
+- Version identity 1.3.0rc7 (npm 1.3.0-rc.7) across the package, release contract, review engine,
+  MCP server info, `server.json` and browser engine; 1.3.0rc6 stays an accepted saved-review and
+  findings-sync engine version. Wheel, source archive, manifest, browser wheel/manifest, browser
+  sample and review golden are regenerated with the unchanged builders. The published 1.3.0rc6
+  runner and staging-fixture bytes are kept byte for byte as the historical fixture
+  `tests/fixtures/runner_preview_rc6/`, and the Worker answers the two rc6 `/downloads/` names with a
+  permanent redirect to the immutable v1.3.0rc6 release assets.
+- Runner reliability (proven with local test fixtures and reproduced red witnesses only): after each
+  synchronous progress call `heel runner serve` takes one fresh authenticated heartbeat, so a slow
+  progress round trip no longer ages the unchanged 0.5 s freshness bound into an `incomplete` run
+  with `cloud_disconnected`; a configured test whose frozen replay source is not eligible is
+  reported as not ready instead of ending `serve`; and a cycle failure that ends `serve` records a
+  closed local diagnostic (operation, stage and HTTP status only). The cause of the public rc6
+  `response_rejected` exits remains unknown. Freshness, scopes, grants, targets and error-envelope
+  rules are unchanged.
+- The paired-runner install shown by the dashboard, `/guide`, `/runner`, `/agent` and the staging
+  fixture README is one guarded command: it picks an installed Python 3.11 or newer with venv and
+  ensurepip, or stops before creating anything, then runs the runbook's exact pinned install.
+  Activation copy states configured-test, incomplete-run and Python state honestly, and `/runner`
+  describes the browser-configured read tests instead of two fixed checks.
+- The standalone synthetic staging target is published again as the `heel-staging-fixture-*`
+  assets of this prerelease with its manifest; it is a test fixture, not inside the wheel or source
+  archive, and not product code. Its behaviour files are unchanged from 1.3.0rc6.
+- No public, hosted or customer run is recorded for 1.3.0rc7. This is not a launch or
+  complete-coverage claim.
+
 ## [1.3.0rc6]: 2026-11-16
 
 Runner preview prerelease for browser-configured live read tests, published as a GitHub prerelease
