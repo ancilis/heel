@@ -139,7 +139,7 @@ beforeEach(() => {
 // deployed only after the release owner's anonymous verify-public for v1.3.0rc7 passes. 1.3.0rc1, rc2, rc3, rc4, rc5
 // and rc6 remain published and are named only as history.
 const PUBLIC_RELEASE = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc7";
-const PUBLIC_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
+const PUBLIC_WHEEL_SHA256 = "da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21";
 const PUBLIC_INSTALL =
   "python3 -m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install " +
   `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/heel_sim-1.3.0rc7-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'` +

@@ -32,13 +32,13 @@ widen or re-sign a scope.
 
 Run these in order. Replace the values in capitals.
 
-Install the 1.3.0rc6 runner preview, a public GitHub prerelease at
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, with the same one command the
+Install the 1.3.0rc7 runner preview, a public GitHub prerelease at
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc7>, with the same one command the
 [README](../README.md) gives. It is not a stable release and is not published to PyPI. You need
 Python 3.11 or newer as `python3` with its standard `venv` module, on Apple silicon macOS or
 Linux x86_64/aarch64; Intel macOS is unsupported by this preview. No source checkout or manual download is needed: in an empty private
-directory the command creates `./heel-rc6`, installs the hash-pinned public wheel with its
-`runner` extra, and prints `heel 1.3.0rc6`. pip refuses the wheel unless its SHA-256 matches;
+directory the command creates `./heel-rc7`, installs the hash-pinned public wheel with its
+`runner` extra, and prints `heel 1.3.0rc7`. pip refuses the wheel unless its SHA-256 matches;
 the `cryptography` dependency comes from the package index and is not hash-pinned by this
 command. Activating the environment puts `heel` on `PATH` for the steps below. This journey is
 the standalone CLI. It does not use Heel Cloud pairing and is not a prerequisite for it; the paired
@@ -46,8 +46,8 @@ customer workflow, with its recorded controlled-staging evidence and limits, is 
 [SELF_SERVE_PREVIEW.md](SELF_SERVE_PREVIEW.md).
 
 ```sh
-python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version
-. ./heel-rc6/bin/activate
+python3 -m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/heel_sim-1.3.0rc7-py3-none-any.whl#sha256=da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21' && ./heel-rc7/bin/heel --version
+. ./heel-rc7/bin/activate
 export HEEL_HOME="$(pwd -P)/.heel"
 ```
 
@@ -425,7 +425,7 @@ pair with a new invitation).
   before this change (commit `b426fc2`, sha256
   `4dd9eec27ee57df187ccb5664a816cc3fdc17f6f132c166ab8d27bb1b6c428bf`). Whether anyone
   installed it is unknown; this path is tested, not assumed unused. The current checked-in
-  artifact is the 1.3.0rc6 runner preview wheel. It reports `1.3.0rc6` and,
+  artifact is the 1.3.0rc7 runner preview wheel. It reports `1.3.0rc7` and,
   like the later 1.2.0 wheel, accepts only a `v4` activation.
 - Control traffic goes only to the `--origin` given at pairing: `https://` only, exact
   pathless lowercase origin, system trust with TLS 1.2 or newer and hostname checks, no

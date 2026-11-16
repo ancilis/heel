@@ -14,7 +14,7 @@ import { ConfiguredTestsPanel } from "../../components/canary/ConfiguredTestsPan
 import { DisclosureDialog } from "../../components/canary/DisclosureDialog";
 import { FindingsCard } from "../../components/canary/FindingsCard";
 import { RunProgress, incompleteRunExplanation, terminalRunPhase, type RunPhase } from "../../components/canary/RunProgress";
-import { RUNNER_RC6_CLI, RunnerPairingCard, pairingPhraseMatches } from "../../components/canary/RunnerPairingCard";
+import { RUNNER_RC7_CLI, RunnerPairingCard, pairingPhraseMatches } from "../../components/canary/RunnerPairingCard";
 import { ScenarioLibraryCard } from "../../components/library/ScenarioLibraryCard";
 import { BrowserReviewClient } from "../../lib/browser-review-client";
 import { TargetRegistrationCard, type OwnershipProofMethod, type PendingTarget } from "../../components/onboarding/TargetRegistrationCard";
@@ -721,7 +721,7 @@ export default function Dashboard() {
   const rehearsalIncomplete = historyIsCurrent && executedStatus === "terminal"
     && observedRun?.run.executionDisposition !== "completed" && observedRun?.run.executionDisposition !== "stopped";
   const rehearsalRecovery = rehearsalIncomplete && observedRun !== null
-    ? incompleteRunExplanation(observedRun.run.executionDisposition, observedRun.run.errorCategory, RUNNER_RC6_CLI) : undefined;
+    ? incompleteRunExplanation(observedRun.run.executionDisposition, observedRun.run.errorCategory, RUNNER_RC7_CLI) : undefined;
   const snapshot: ActivationSnapshot = {
     environment: executable ? "verified" : proofChallenge ? "checking" : "unverified",
     runner: executable ? (hasPlan ? "online" : pairedRunners.length > 0 ? "paired" : "unpaired") : "locked",
@@ -1223,7 +1223,7 @@ export default function Dashboard() {
         {showActivation ? <><h2>The paired runner owns target traffic.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Methods</dt><dd>GET + HEAD</dd></div><div><dt>Egress</dt><dd>Staging :443 only</dd></div><div><dt>Cloud view</dt><dd>Operational status; a redacted summary only if you share it</dd></div></dl></>
           : <><h2>Heel Cloud only verifies ownership; rehearsals run on your machine.</h2><dl><div><dt>Origin</dt><dd>{executable?.origin ?? "One verified host"}</dd></div><div><dt>Ownership check</dt><dd>One proof file or DNS record</dd></div><div><dt>Cloud view</dt><dd>Operational status only</dd></div></dl></>}</section>
          <div aria-label="Opened run status" ref={statusLandingRef} tabIndex={-1}>
-         {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} recovery={runPhase === "incomplete" && observedRun !== null ? incompleteRunExplanation(observedRun.run.executionDisposition, observedRun.run.errorCategory, RUNNER_RC6_CLI) : undefined} onStop={runPhase === "running" ? () => void stopRun() : undefined} /> : null}
+         {runPhase && progress?.available ? <RunProgress phase={runPhase} completedScenarios={progress.scenariosCompleted ?? 0} totalScenarios={progress.scenariosTotal ?? 0} requestsUsed={progress.requestsStarted ?? 0} requestBudget={(progress.requestsStarted ?? 0) + (progress.remainingRequests ?? 0)} secondsRemaining={Math.ceil((progress.remainingWallMs ?? 0) / 1000)} recovery={runPhase === "incomplete" && observedRun !== null ? incompleteRunExplanation(observedRun.run.executionDisposition, observedRun.run.errorCategory, RUNNER_RC7_CLI) : undefined} onStop={runPhase === "running" ? () => void stopRun() : undefined} /> : null}
          {observedRun && !observedRun.progress.available ? <p className="run-recovery" role="alert">Signed progress is unavailable. The cloud will not invent metrics; inspect the local runner and retry status.</p> : null}
         {disclosureRunId !== null ? <section aria-label="Result sharing" aria-live="polite" className="disclosure-entry"><span>Result sharing</span>{disclosureStatusCopy}
           {disclosureDecisionOpen ? <> <button className="text-button" disabled={working} onClick={() => setDisclosureOpen(true)} type="button">Review sharing</button></> : null}</section> : null}</div>

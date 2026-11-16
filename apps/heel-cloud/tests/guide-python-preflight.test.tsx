@@ -16,7 +16,7 @@ import { RUNNER_RC7_INSTALL, RUNNER_RC7_VENV_INSTALL_TAIL } from "../components/
 afterEach(cleanup);
 
 const WHEEL_SPEC = "heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/"
-  + "heel_sim-1.3.0rc7-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
+  + "heel_sim-1.3.0rc7-py3-none-any.whl#sha256=da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21";
 
 /**
  * A stub interpreter. `--version` prints its version; `-c` (the installer's check) succeeds only for >= 3.11 with venv;

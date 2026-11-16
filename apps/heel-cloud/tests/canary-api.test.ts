@@ -112,7 +112,7 @@ it("rejects a runner revoke result outside the typed contract and names the refu
 // command"), pinned here rather than read from the runbook. It may be deployed only after the release owner's anonymous
 // verify-public for v1.3.0rc7 passes. Every public UI install surface shows one shared guarded command that runs exactly
 // this line's wheel pin and flags with a selected Python 3.11+ in place of the leading `python3`.
-const RC7_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
+const RC7_WHEEL_SHA256 = "da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21";
 const RC7_RUNBOOK_INSTALL = "python3 -m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install "
   + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/heel_sim-1.3.0rc7-py3-none-any.whl#sha256=${RC7_WHEEL_SHA256}'`
   + " && ./heel-rc7/bin/heel --version";

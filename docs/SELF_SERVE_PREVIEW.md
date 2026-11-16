@@ -25,7 +25,7 @@ not executed coverage.
 Preview constraints:
 
 - Sign-up is public but rate-limited; if it is refused with "try again later", wait and retry.
-- Version 1.3.0rc6 is a public preview prerelease: not stable, and not on PyPI.
+- Version 1.3.0rc7 is a public preview prerelease: not stable, and not on PyPI.
 - Only the `bearer` credential profile has been exercised end to end. `x_api_key` and
   `cookie_jar` are implemented, with no recorded acceptance.
 
@@ -39,7 +39,7 @@ This differs from the standalone `heel runner run` command ([runner doc](PLAN_DI
 
 ## Steps
 
-`CLI` below is `./heel-rc6/bin/heel`. Owners and admins pair runners, approve plans, share
+`CLI` below is `./heel-rc7/bin/heel`. Owners and admins pair runners, approve plans, share
 results and revoke access. Each of these actions requires a sign-in from the last 15 minutes.
 If your sign-in is older, the action is refused and nothing changes; sign in again and repeat
 it.
@@ -56,10 +56,10 @@ it.
    but was not part of that journey.
 3. **Install.** You need Python 3.11 or newer as `python3` with `venv`, on Apple silicon macOS or
    Linux x86_64/aarch64. Intel macOS is unsupported. The command below installs the hash-pinned
-   wheel from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>:
+   wheel from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc7>:
 
    ```sh
-   python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version
+   python3 -m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/heel_sim-1.3.0rc7-py3-none-any.whl#sha256=da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21' && ./heel-rc7/bin/heel --version
    ```
 
    The signing key and credentials live only in macOS Keychain or the Linux Secret Service. There
