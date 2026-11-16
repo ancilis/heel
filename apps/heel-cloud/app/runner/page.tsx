@@ -83,7 +83,7 @@ export HEEL_HOME="$(pwd -P)/.heel"
     </section>
     <aside className="runner-recovery"><h2>What this establishes</h2>
       <p>Only the two synthetic reads are validated. Trial eligibility, cumulative usage, scraping limits, plan-change sequences, and other access paths remain untested. No findings does not establish launch safety.</p>
-      <p>This page is an optional local reference and contacts no product target. To rehearse your own verified staging target, use the paired workflow in the <Link href="/guide">paired runner guide</Link>: it runs two fixed read checks from a runner on your machine after you approve each plan in the browser. It is not general execution against arbitrary customer targets, and the browser does not send target requests.</p>
+      <p>This page is an optional local reference and contacts no product target. To rehearse your own verified staging target, use the paired workflow in the <Link href="/guide">paired runner guide</Link>: it runs the private read tests you configure in the browser, each comparing anonymous with signed-in or lower-plan with higher-plan access on one of your imported read routes, from a runner on your machine after you approve each plan in the browser. It is not general execution against arbitrary customer targets, and the browser does not send target requests.</p>
     </aside>
   </main>;
 }
