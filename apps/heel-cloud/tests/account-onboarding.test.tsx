@@ -2330,7 +2330,9 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     const { ws } = verifiedOwner();
     render(<Dashboard />);
     const card = await pairCard();
-    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && \.\/heel-rc6\/bin\/heel --version$/)).toBeTruthy();
+    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && \.\/heel-rc6\/bin\/heel --version; fi$/)).toBeTruthy();
+    // The card shows the shared guarded installer: a Python 3.11+ is selected before any venv exists.
+    expect(within(card).getByText(/^HEEL_PY=; for py in "\$\{HEEL_PYTHON:-python3\}" .* "\$HEEL_PY" -m venv heel-rc6 && /)).toBeTruthy();
     expect((within(card).getByRole("link", { name: "Heel 1.3.0rc6 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc6");
     expect(within(card).queryByRole("textbox", { name: /credential|secret|password|token/i })).toBeNull();
     const mark = server.calls.length;

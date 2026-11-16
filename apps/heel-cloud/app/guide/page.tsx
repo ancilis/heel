@@ -9,14 +9,6 @@ const CLI = RUNNER_RC6_CLI;
 /** The release named next to the shared install constants above; it changes with them. */
 const RELEASE = "1.3.0rc6";
 
-// Picks the first interpreter (an optional HEEL_PYTHON path, then PATH) that is 3.11 or newer and can create a venv
-// with pip; it only runs version checks and downloads or installs nothing.
-const PYTHON_PREFLIGHT = `for py in "\${HEEL_PYTHON:-python3}" python3 python3.14 python3.13 python3.12 python3.11; do
-  if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys, venv, ensurepip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
-    echo "use: $py ($("$py" --version 2>&1), $(command -v "$py"))"; break
-  fi
-done; python3 --version`;
-
 const LINUX_VAULT = `sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
 dbus-run-session -- bash                                   # headless only: private session bus
 IFS= read -rs pw && printf '%s' "$pw" \\
@@ -153,8 +145,8 @@ export default function Guide() {
             <p className="step-number">03 · Install</p>
             <h2>Install the released runner</h2>
             <p>
-              You need Python 3.11 or newer as <code>python3</code> with its <code>venv</code> module, on
-              Apple silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview.
+              You need an installed Python 3.11 or newer with its <code>venv</code> module, on Apple
+              silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview.
               In an empty private directory, the command below installs the public{" "}
               <a href={RUNNER_RC6_RELEASE_URL}>{RELEASE} release</a> wheel and prints its version. pip
               refuses the wheel unless its SHA-256 matches. The pinned <code>cryptography</code>{" "}
@@ -164,22 +156,14 @@ export default function Guide() {
               starting with <code>heel</code>, run it with that same path.
             </p>
             <p>
-              First check your interpreter. On some Macs the default <code>python3</code> is 3.9, which is
-              too old. This read-only check prints a <code>use:</code> line naming the first Python 3.11 or
-              newer that has <code>venv</code> and <code>ensurepip</code>, then the version of plain{" "}
-              <code>python3</code>. It looks on your PATH; to check an interpreter installed at another
-              absolute path, first run <code>HEEL_PYTHON=/path/to/python3</code> in the same shell.
-            </p>
-            <pre><code>{PYTHON_PREFLIGHT}</code></pre>
-            <p>
-              If it prints <code>use: python3</code>, run the install command as shown. If it names another
-              interpreter or path, such as <code>use: python3.13</code>, run the install command with that
-              name or path in place of its first word <code>python3</code>; everything after{" "}
-              <code>-m venv</code> stays the same. If it prints no <code>use:</code> line, no compatible
-              interpreter was found on your PATH or at <code>HEEL_PYTHON</code>: point{" "}
-              <code>HEEL_PYTHON</code> at one you have, or install Python 3.11 or newer with its{" "}
-              <code>venv</code> module (for example from python.org, Homebrew, or your Linux package
-              manager), then check again. Heel never downloads Python for you.
+              On some Macs the default <code>python3</code> is 3.9, which is too old. The command
+              therefore first picks the first Python 3.11 or newer with <code>venv</code> and{" "}
+              <code>ensurepip</code> on your PATH, and prints which one it uses. To use one installed at
+              another absolute path, first run <code>HEEL_PYTHON=/path/to/python3</code> in the same
+              shell. If none is found, it says so and stops before creating anything; install Python 3.11
+              or newer (for example from python.org, Homebrew, or your Linux package manager) and run it
+              again. Heel never downloads Python for you. If an earlier attempt already created{" "}
+              <code>./heel-rc6</code> with an older Python, start again in a new empty private directory.
             </p>
             <pre><code>{RUNNER_RC6_INSTALL}</code></pre>
             <p>

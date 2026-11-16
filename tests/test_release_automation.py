@@ -210,10 +210,20 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertIn(f"releases/download/v{PUBLIC_VERSION}/{PUBLIC_WHEEL}#sha256={bundled_sha}'", command)
         self.assertTrue(command.startswith("python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install "))
         self.assertTrue(command.endswith(" && ./heel-rc6/bin/heel --version"))
+        # The paired-runner UI shows one shared guarded installer instead: it selects an installed Python 3.11+ (or
+        # stops before any venv) and then runs exactly this command's pin and flags with that interpreter.
+        tail = command.removeprefix("python3 ")
+        card = (ROOT / PAIRED_RUNNER_SURFACES[1]).read_text(encoding="utf-8")
+        self.assertIn(f"export const RUNNER_RC6_VENV_INSTALL_TAIL = {json.dumps(tail)};", card)
+        self.assertIn('\\"$HEEL_PY\\" " + RUNNER_RC6_VENV_INSTALL_TAIL + "; fi"', card)
+        self.assertIn("<pre><code>{`${RUNNER_RC6_INSTALL}\n", (ROOT / PAIRED_RUNNER_SURFACES[0]).read_text(encoding="utf-8"))
         for path in INSTALL_DOCS + PAIRED_RUNNER_SURFACES:
             source = (ROOT / path).read_text(encoding="utf-8")
             unwrapped = " ".join(source.split())
-            self.assertIn(command, source, path)
+            if path in PAIRED_RUNNER_SURFACES:
+                self.assertNotIn(command, source, path)
+            else:
+                self.assertIn(command, source, path)
             self.assertIn(PUBLIC_RELEASE, source, path)
             self.assertIn("./heel-rc6/bin/", source, path)
             self.assertNotRegex(unwrapped, STALE_RC6, path)
@@ -221,7 +231,8 @@ class ReleaseAutomationContractTests(unittest.TestCase):
             self.assertNotRegex(source, r"releases/download/v1\.3\.0rc[12345]/|heel-rc[12345]/", path)
             self.assertEqual(
                 set(re.findall(r"heel_sim-1\.3\.0rc\d-py3-none-any\.whl#sha256=([0-9a-f]{64})", source)),
-                {PUBLIC_WHEEL_SHA256},
+                # /runner names no digest of its own; it renders the shared installer that pins this one.
+                set() if path == PAIRED_RUNNER_SURFACES[0] else {PUBLIC_WHEEL_SHA256},
                 path,
             )
             self.assertNotIn("/downloads/heel_sim-1.3.0rc2", source, path)
@@ -247,8 +258,11 @@ class ReleaseAutomationContractTests(unittest.TestCase):
         self.assertIn("no component is a symbolic link", " ".join(journey.split()))
         page = (ROOT / "apps/heel-cloud/app/agent/page.tsx").read_text(encoding="utf-8")
         digest = re.search(r'const PUBLIC_WHEEL_SHA256 = "([0-9a-f]{64})";', page).group(1)
-        template = re.search(r"const INSTALL_PUBLIC_AGENT = `([^`]*)`;", page).group(1)
-        self.assertEqual(template.replace("${PUBLIC_WHEEL_SHA256}", digest), command)
+        # /agent shows the shared guarded installer and refuses to build unless it pins this digest.
+        self.assertIn("const INSTALL_PUBLIC_AGENT = RUNNER_RC6_INSTALL;", page)
+        guard = re.search(r"if \(!INSTALL_PUBLIC_AGENT\.includes\(`([^`]*)`\)\) \{", page).group(1)
+        self.assertEqual(guard.replace("${PUBLIC_WHEEL_SHA256}", digest), f"releases/download/v{PUBLIC_VERSION}/{PUBLIC_WHEEL}#sha256={digest}'")
+        self.assertEqual(digest, PUBLIC_WHEEL_SHA256)
         # /agent refuses to build unless the public pin equals the bundled manifest's wheel digest.
         self.assertIn("if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {", page)
         self.assertNotRegex(page, r"releases/(?:tag|download)/v1\.3\.0rc[12345]|heel-rc[12345]\b")

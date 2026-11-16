@@ -57,6 +57,7 @@ vi.mock("../lib/local-reviews", async (importOriginal) => {
 import Home from "../app/page";
 import McpQuickstart from "../app/agent/page";
 import Runner from "../app/runner/page";
+import { RUNNER_RC6_INSTALL, RUNNER_RC6_VENV_INSTALL_TAIL } from "../components/canary/RunnerPairingCard";
 import { OpenApiInput } from "../components/review/OpenApiInput";
 import { ReviewWorkspace } from "../components/review/ReviewWorkspace";
 
@@ -268,7 +269,10 @@ describe("Heel anonymous launch review", () => {
       "./heel-rc6/bin/python -m pip install ./heel_sim-1.3.0rc6-py3-none-any.whl",
     );
     expect(RUNBOOK_INSTALL).toBe(PUBLIC_INSTALL);
-    expect(document.body.textContent).toContain(PUBLIC_INSTALL);
+    // The page shows the shared guarded installer: the runbook's exact pin and flags after a selected Python 3.11+.
+    expect(PUBLIC_INSTALL).toBe(`python3 ${RUNNER_RC6_VENV_INSTALL_TAIL}`);
+    expect(document.body.textContent).toContain(RUNNER_RC6_INSTALL);
+    expect(document.body.textContent).not.toContain(PUBLIC_INSTALL);
     // The public command and the same-origin download name the same wheel bytes.
     expect(PUBLIC_RELEASE.split("/v").pop()).toBe(manifest.version);
     expect(PUBLIC_WHEEL_SHA256).toBe(wheelArtifact?.sha256);
@@ -281,7 +285,7 @@ describe("Heel anonymous launch review", () => {
     expect(document.body.textContent).toContain("./heel-rc6/bin/heel-mcp");
     // Both install variants create the one environment that every later command runs from.
     const commands = Array.from(document.querySelectorAll("pre"), (block) => block.textContent ?? "");
-    expect(commands.flatMap((command) => [...command.matchAll(/python3 -m venv (\S+)/g)].map((m) => m[1])))
+    expect(commands.flatMap((command) => [...command.matchAll(/(?:python3|"\$HEEL_PY") -m venv (\S+)/g)].map((m) => m[1])))
       .toEqual(["heel-rc6", "heel-rc6"]);
     const executables = commands.flatMap((command) =>
       [...command.matchAll(/([\w.-]+)\/bin\/(heel-mcp|heel|python)\b/g)].map((m) => m[1]));
@@ -315,7 +319,8 @@ describe("Heel anonymous launch review", () => {
     render(<Runner />);
     const text = document.body.textContent ?? "";
 
-    expect(text).toContain(PUBLIC_INSTALL);
+    expect(text).toContain(RUNNER_RC6_INSTALL);
+    expect(text).not.toContain(PUBLIC_INSTALL);
     expect(text).not.toMatch(EARLIER_INSTALLS);
     expect(text).toContain('export HEEL_HOME="$(pwd -P)/.heel"');
     expect(text).not.toContain('"$PWD/.heel"');
@@ -447,7 +452,8 @@ describe("Heel anonymous launch review", () => {
 
     expect(screen.getByText(/base mcp core is apache-2\.0 licensed and free/i)).toBeTruthy();
     expect(screen.getByText(/pypi publication is not yet available/i)).toBeTruthy();
-    expect(screen.getByText(/python 3\.11 or newer/i)).toBeTruthy();
+    // The prose states the prerequisite; the guarded installer's own failure message repeats it inside the command.
+    expect(screen.getAllByText(/python 3\.11 or newer/i).filter((element) => element.tagName === "P")).toHaveLength(1);
     expect(screen.getByText(/posix filesystem/i)).toBeTruthy();
     expect(screen.getByText(/windows is not currently supported/i)).toBeTruthy();
     expect(screen.getByText(/client or model provider may receive or upload/i)).toBeTruthy();

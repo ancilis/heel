@@ -1,75 +1,127 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
 import { cleanup, render } from "@testing-library/react";
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
+import McpQuickstart from "../app/agent/page";
 import Guide from "../app/guide/page";
-import { RUNNER_RC6_INSTALL } from "../components/canary/RunnerPairingCard";
+import Runner from "../app/runner/page";
+import { RUNNER_RC6_INSTALL, RUNNER_RC6_VENV_INSTALL_TAIL } from "../components/canary/RunnerPairingCard";
 
 
 afterEach(cleanup);
 
-function commands(): string[] {
-  render(<Guide />);
-  return Array.from(document.querySelectorAll("pre"), (block) => block.textContent ?? "");
-}
+const WHEEL_SPEC = "heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/"
+  + "heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
 
-/** A stub interpreter: `--version` prints its version; `-c` exits as the preflight's own check would for it. */
-function stub(dir: string, name: string, version: string, hasVenv = true, sub = "bin"): void {
+/**
+ * A stub interpreter. `--version` prints its version; `-c` (the installer's check) succeeds only for >= 3.11 with venv;
+ * `-m venv DIR` is recorded and creates DIR/bin/python (records its pip arguments) and DIR/bin/heel (prints a version).
+ */
+function stub(path: string, version: string, hasVenv = true): void {
   const [major, minor] = version.split(".").map(Number);
   const ok = hasVenv && (major > 3 || (major === 3 && minor >= 11));
-  writeFileSync(join(dir, sub, name), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "Python ${version}"; exit 0; fi\nexit ${ok ? 0 : 1}\n`);
-  chmodSync(join(dir, sub, name), 0o755);
+  writeFileSync(path, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "Python ${version}"; exit 0; fi
+if [ "$1" = "-c" ]; then exit ${ok ? 0 : 1}; fi
+echo "venv $0 $*" >> "$LOG"
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  mkdir -p "$3/bin"
+  printf '#!/bin/sh\\nfor a in "$@"; do echo "pip-arg $a" >> "$LOG"; done\\n' > "$3/bin/python"
+  printf '#!/bin/sh\\necho heel 1.3.0rc6\\n' > "$3/bin/heel"
+  chmod +x "$3/bin/python" "$3/bin/heel"
+fi
+`);
+  chmodSync(path, 0o755);
 }
 
-function runPreflight(script: string, setup: (dir: string) => void, heelPython?: (dir: string) => string): string {
-  const dir = mkdtempSync(join(tmpdir(), "heel-preflight-"));
+interface Outcome { status: number | null; stdout: string; stderr: string; log: string; created: boolean }
+
+/** Runs the exact public install command in a fresh empty directory with only stub interpreters reachable. */
+function install(setup: (bin: string, other: string) => void, heelPython?: (other: string) => string): Outcome {
+  const dir = mkdtempSync(join(tmpdir(), "heel-install-"));
   try {
-    mkdirSync(join(dir, "bin"));
-    setup(dir);
-    // Only the stubs and the shell's own utilities are reachable; nothing is downloaded or installed.
-    const prefix = heelPython ? `HEEL_PYTHON=${heelPython(dir)}\n` : "";
-    return execFileSync("/bin/sh", ["-c", prefix + script], { env: { PATH: `${dir}/bin:/bin` } as unknown as NodeJS.ProcessEnv, encoding: "utf8" });
+    const bin = join(dir, "bin"); const other = join(dir, "opt"); const work = join(dir, "work");
+    for (const path of [bin, other, work]) mkdirSync(path);
+    setup(bin, other);
+    const log = join(dir, "log");
+    const prefix = heelPython ? `HEEL_PYTHON=${heelPython(other)}\n` : "";
+    const run = spawnSync("/bin/sh", ["-c", prefix + RUNNER_RC6_INSTALL],
+      { cwd: work, env: { PATH: `${bin}:/bin:/usr/bin`, LOG: log } as unknown as NodeJS.ProcessEnv, encoding: "utf8" });
+    const strip = (text: string) => text.replaceAll(dir, "<dir>");
+    return { status: run.status, stdout: strip(run.stdout), stderr: run.stderr,
+      log: existsSync(log) ? strip(readFileSync(log, "utf8")) : "", created: existsSync(join(work, "heel-rc6")) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
 
-describe("guide install: interpreter preflight before the venv", () => {
-  test("the preflight comes before the unchanged rc6 install command", () => {
-    const blocks = commands();
-    const install = blocks.indexOf(RUNNER_RC6_INSTALL);
-    const preflight = blocks.findIndex((block) => block.includes("sys.version_info < (3, 11)"));
-    expect(install).toBeGreaterThan(-1);
-    expect(preflight).toBeGreaterThan(-1);
-    expect(preflight).toBeLessThan(install);
-    expect(blocks[preflight]).not.toMatch(/curl|wget|brew install|\bpip\b|venv heel/);
-    expect(document.body.textContent).toMatch(/On some Macs the default python3 is 3\.9, which is\s+too old/);
-    expect(document.body.textContent).toMatch(/no compatible\s+interpreter was found on your PATH or at HEEL_PYTHON/);
-    expect(document.body.textContent).toMatch(/Heel never downloads Python for you\./);
+describe("the one public rc6 installer selects a compatible Python or fails before any venv", () => {
+  test("it keeps the exact runbook wheel pin and flags after the selected interpreter", () => {
+    expect(RUNNER_RC6_VENV_INSTALL_TAIL).toBe(`-m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install '${WHEEL_SPEC}' && ./heel-rc6/bin/heel --version`);
+    expect(RUNNER_RC6_INSTALL.split(RUNNER_RC6_VENV_INSTALL_TAIL)).toHaveLength(2);
+    expect(RUNNER_RC6_INSTALL).toContain(`"$HEEL_PY" ${RUNNER_RC6_VENV_INSTALL_TAIL}; fi`);
+    expect(RUNNER_RC6_INSTALL).not.toMatch(/python3 -m venv|(^|; )exit\b|curl|wget|brew install/);
+    expect(RUNNER_RC6_INSTALL).not.toContain("\n");  // one copy/paste line, safe in an inline code element
   });
 
-  test("it selects an installed compatible interpreter, prefers python3, and names the absent prerequisite", () => {
-    const script = commands().find((block) => block.includes("sys.version_info < (3, 11)")) as string;
-    // Default macOS: python3 is 3.9, a Homebrew python3.13 is installed.
-    expect(runPreflight(script, (dir) => { stub(dir, "python3", "3.9.6"); stub(dir, "python3.13", "3.13.1"); }))
-      .toMatch(/^use: python3\.13 \(Python 3\.13\.1, .*python3\.13\)\nPython 3\.9\.6\n$/);
-    // A compatible python3 is used as shown.
-    expect(runPreflight(script, (dir) => { stub(dir, "python3", "3.12.4"); stub(dir, "python3.13", "3.13.1"); }))
-      .toMatch(/^use: python3 \(Python 3\.12\.4, /);
-    // A new enough interpreter without venv/ensurepip is skipped.
-    expect(runPreflight(script, (dir) => { stub(dir, "python3", "3.9.6"); stub(dir, "python3.12", "3.12.1", false); }))
-      .toBe("Python 3.9.6\n");
-    // No compatible interpreter at all: no use: line, only the old version.
-    expect(runPreflight(script, (dir) => stub(dir, "python3", "3.9.6"))).toBe("Python 3.9.6\n");
-    // A compatible interpreter at a custom absolute path, off PATH, is selected only through the same check.
-    const custom = (dir: string) => { stub(dir, "python3", "3.9.6"); mkdirSync(join(dir, "opt")); stub(dir, "py", "3.13.2", true, "opt"); };
-    expect(runPreflight(script, custom, (dir) => join(dir, "opt", "py"))).toMatch(/^use: \/.*\/opt\/py \(Python 3\.13\.2, \/.*\/opt\/py\)\nPython 3\.9\.6\n$/);
-    const old = (dir: string) => { stub(dir, "python3", "3.9.6"); mkdirSync(join(dir, "opt")); stub(dir, "py", "3.10.9", true, "opt"); };
-    expect(runPreflight(script, old, (dir) => join(dir, "opt", "py"))).toBe("Python 3.9.6\n");
+  test("default python3 3.9 with python3.13 installed: python3.13 builds the venv and pip gets the exact wheel", () => {
+    const out = install((bin) => { stub(join(bin, "python3"), "3.9.6"); stub(join(bin, "python3.13"), "3.13.1"); });
+    expect(out.status).toBe(0);
+    expect(out.stdout).toBe("Using <dir>/bin/python3.13: Python 3.13.1\nheel 1.3.0rc6\n");
+    expect(out.log.split("\n")[0]).toBe("venv <dir>/bin/python3.13 -m venv heel-rc6");
+    expect(out.log).toContain(`pip-arg ${WHEEL_SPEC}\n`);
+    expect(out.log).toContain("pip-arg --isolated\n");
+  });
+
+  test("a compatible python3 is used first; one without venv/ensurepip is skipped", () => {
+    expect(install((bin) => { stub(join(bin, "python3"), "3.12.4"); stub(join(bin, "python3.13"), "3.13.1"); }).log)
+      .toMatch(/^venv <dir>\/bin\/python3 -m venv heel-rc6\n/);
+    expect(install((bin) => { stub(join(bin, "python3"), "3.12.4", false); stub(join(bin, "python3.11"), "3.11.9"); }).log)
+      .toMatch(/^venv <dir>\/bin\/python3\.11 -m venv heel-rc6\n/);
+  });
+
+  test("HEEL_PYTHON selects an installed absolute path off PATH only after the same check", () => {
+    const good = install((bin, other) => { stub(join(bin, "python3"), "3.9.6"); stub(join(other, "py"), "3.13.2"); }, (other) => join(other, "py"));
+    expect(good.status).toBe(0);
+    expect(good.log.split("\n")[0]).toBe("venv <dir>/opt/py -m venv heel-rc6");
+    const old = install((bin, other) => { stub(join(bin, "python3"), "3.9.6"); stub(join(other, "py"), "3.10.9"); }, (other) => join(other, "py"));
+    expect(old.status).not.toBe(0);
+    expect(old.created).toBe(false);
+  });
+
+  test("no compatible interpreter: a clear message, a failing status, and nothing created", () => {
+    const out = install((bin) => { stub(join(bin, "python3"), "3.9.6"); stub(join(bin, "python3.12"), "3.12.1", false); });
+    expect(out.status).toBe(1);
+    expect(out.stderr).toMatch(/^Heel needs Python 3\.11 or newer with venv and ensurepip; none was found on PATH or at HEEL_PYTHON\. Nothing was installed\./);
+    expect(out.stdout).toBe("");
+    expect(out.log).toBe("");
+    expect(out.created).toBe(false);
+  });
+});
+
+describe("every public rc6 install surface shows that one guarded command", () => {
+  for (const [name, Page] of [["/guide", Guide], ["/runner", Runner], ["/agent", McpQuickstart]] as const) {
+    test(`${name} renders the shared installer and no unguarded default-python3 install`, () => {
+      render(<Page />);
+      const text = (document.body.textContent ?? "").replace(/\s+/g, " ");
+      const blocks = Array.from(document.querySelectorAll("pre"), (block) => block.textContent ?? "");
+      expect(blocks.some((block) => block.split("\n")[0] === RUNNER_RC6_INSTALL)).toBe(true);
+      expect(document.body.textContent).not.toContain(`python3 ${RUNNER_RC6_VENV_INSTALL_TAIL}`);
+      expect(text).toMatch(/on some Macs the default python3 is 3\.9/i);
+      expect(text).toMatch(/HEEL_PYTHON=\/path\/to\/python3/);
+    });
+  }
+
+  test("the guide has no separate advisory preflight and keeps the no-download promise", () => {
+    render(<Guide />);
+    const text = (document.body.textContent ?? "").replace(/\s+/g, " ");
+    expect(text).not.toMatch(/use: python3/);
+    expect(text).toMatch(/Heel never downloads Python for you\./);
+    expect(text).toMatch(/stops before creating anything/);
   });
 });

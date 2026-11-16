@@ -2,6 +2,7 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
+import { RUNNER_RC6_INSTALL } from "../../components/canary/RunnerPairingCard";
 import releaseManifest from "../../public/downloads/heel-open-core-manifest.json";
 
 
@@ -25,7 +26,12 @@ if (PUBLIC_WHEEL_SHA256 !== WHEEL_SHA256) {
   throw new Error("the public Heel Agent wheel digest does not match the bundled release manifest");
 }
 
-const INSTALL_PUBLIC_AGENT = `python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}' && ./heel-rc6/bin/heel --version`;
+// The public command is the one shared guarded rc6 installer; the build refuses to render it unless it pins this digest.
+const INSTALL_PUBLIC_AGENT = RUNNER_RC6_INSTALL;
+
+if (!INSTALL_PUBLIC_AGENT.includes(`releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=${PUBLIC_WHEEL_SHA256}'`)) {
+  throw new Error("the shared rc6 install command does not pin the public Heel Agent wheel digest");
+}
 
 const MCP_CONFIGURATION = `{
   "mcpServers": {
@@ -107,11 +113,14 @@ export default function AgentQuickstart() {
               </a>
               . It is not a stable release, its GitHub release record is not immutable, it is not
               published to PyPI, and it does not indicate customer acceptance. Python 3.11 or newer
-              is required as <code>python3</code> with its standard <code>venv</code> module, on Apple
+              with its standard <code>venv</code> module is required, on Apple
               silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview: its
               pinned <code>cryptography</code> dependency ships no Intel macOS wheel, and a source
               build needs an additional toolchain and is untested. In an empty private directory, this
-              one command creates <code>./heel-rc6</code>, installs the hash-pinned public wheel with
+              one command first picks an installed Python 3.11 or newer (on some Macs the default{" "}
+              <code>python3</code> is 3.9, which it skips; set <code>HEEL_PYTHON=/path/to/python3</code>{" "}
+              first to use one off your PATH) and stops before creating anything if none is found. It
+              then creates <code>./heel-rc6</code>, installs the hash-pinned public wheel with
               its <code>runner</code> extra, and prints <code>heel 1.3.0rc6</code>. pip refuses the
               wheel unless its SHA-256 matches; <code>--isolated</code> ignores pip environment
               variables and user configuration, and the <code>runner</code> extra downloads the pinned{" "}
@@ -156,7 +165,10 @@ export default function AgentQuickstart() {
             </p>
             <p>
               The digest above comes from this build&apos;s manifest. To use the downloaded file,
-              install it from the folder where you saved it with the command below.
+              install it from the folder where you saved it with the command below. This offline
+              variant runs plain <code>python3</code>, which must itself be version 3.11 or later: check{" "}
+              <code>python3 --version</code> first, and if it is older, use the public command above or
+              put the interpreter that command reports in place of <code>python3</code>.
               PyPI publication is not yet available.
               Secure project storage requires a POSIX filesystem with descriptor-relative operations
               and no-follow support. Windows is not currently supported for MCP local project storage.

@@ -7,11 +7,25 @@ import type { RunnerPairingView } from "../../lib/canary-api";
 
 
 /**
- * The 1.3.0rc6 runner install line, verbatim from the rc6 release-owner runbook (docs/RUNNER_PREVIEW_RELEASE_RC6.md,
- * "Customer install command"). Deploy it only after the release owner's anonymous `verify-public` for v1.3.0rc6 has
- * passed; the wheel digest is the rc6 wheel bundled byte for byte under public/downloads.
+ * Everything after the interpreter in the 1.3.0rc6 runbook install line (docs/RUNNER_PREVIEW_RELEASE_RC6.md, "Customer
+ * install command", which is `python3 ` followed by exactly this). The wheel URI, its SHA-256 and the pip flags are the
+ * published rc6 pin and never change here; the wheel is the one bundled byte for byte under public/downloads.
  */
-export const RUNNER_RC6_INSTALL = "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version";
+export const RUNNER_RC6_VENV_INSTALL_TAIL = "-m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version";
+
+/**
+ * The one public rc6 install command every customer surface shows. Before any venv exists it selects an installed
+ * interpreter (an optional HEEL_PYTHON path first, then PATH) that is 3.11 or newer and has venv and ensurepip, and
+ * prints which one it uses; if none qualifies it stops with a clear message and a failing status, without closing the
+ * shell (`false`, never `exit`) and without creating anything. It downloads no Python and adds no dependency. Deploy
+ * it only after the release owner's anonymous `verify-public` for v1.3.0rc6 has passed.
+ */
+export const RUNNER_RC6_INSTALL = "HEEL_PY=; for py in \"${HEEL_PYTHON:-python3}\" python3 python3.14 python3.13 python3.12 python3.11; do "
+  + "if command -v \"$py\" >/dev/null 2>&1 && \"$py\" -c 'import sys, venv, ensurepip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; "
+  + "then HEEL_PY=\"$(command -v \"$py\")\"; break; fi; done; "
+  + "if [ -z \"$HEEL_PY\" ]; then echo \"Heel needs Python 3.11 or newer with venv and ensurepip; none was found on PATH or at HEEL_PYTHON. "
+  + "Nothing was installed. Install one, or set HEEL_PYTHON to its path, then run this again.\" >&2; false; "
+  + "else echo \"Using $HEEL_PY: $(\"$HEEL_PY\" --version 2>&1)\" && \"$HEEL_PY\" " + RUNNER_RC6_VENV_INSTALL_TAIL + "; fi";
 export const RUNNER_RC6_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc6";
 /** The CLI that {@link RUNNER_RC6_INSTALL} creates; every runner command the dashboard shows starts with it. */
 export const RUNNER_RC6_CLI = "./heel-rc6/bin/heel";

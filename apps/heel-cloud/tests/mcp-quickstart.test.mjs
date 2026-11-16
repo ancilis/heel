@@ -22,7 +22,11 @@ const executableReferences = (source) =>
 
 test("both install variants and every later step use one environment", async () => {
   const source = await readFile(pageUrl, "utf8");
-  const created = createdEnvironments(source);
+  // The public install is the shared guarded installer; its environment comes from the shared runbook tail.
+  assert.ok(source.includes("const INSTALL_PUBLIC_AGENT = RUNNER_RC6_INSTALL;"));
+  const card = await readFile(new URL("../components/canary/RunnerPairingCard.tsx", import.meta.url), "utf8");
+  const created = [...createdEnvironments(source),
+    ...[...card.matchAll(/RUNNER_RC6_VENV_INSTALL_TAIL = "-m venv (\S+)/g)].map((match) => match[1])];
   assert.equal(created.length, 2, "the public and bundled installs each create an environment");
   assert.deepEqual(new Set(created), new Set(["heel-rc6"]));
   const references = executableReferences(source);

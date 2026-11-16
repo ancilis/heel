@@ -4,6 +4,8 @@
 import { useState } from "react";
 import Link from "next/link";
 
+import { RUNNER_RC6_INSTALL } from "../../components/canary/RunnerPairingCard";
+
 export default function Runner() {
   const [summary, setSummary] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -54,8 +56,8 @@ export default function Runner() {
       <div className="runner-command-number" aria-hidden="true">01</div>
       <div><h2>1. Review the rule and authorize the reference product</h2>
       <p>This optional local preview is not a step in the default Heel journey; for your own staging target, follow the <Link href="/guide">paired runner guide</Link>. Heel 1.3.0rc6 is a public preview prerelease at <a href="https://github.com/ancilis/heel/releases/tag/v1.3.0rc6">github.com/ancilis/heel/releases/tag/v1.3.0rc6</a>. It is not a stable release, PyPI publication is not yet available, and it does not indicate live-target support or launch readiness. No source checkout or manual wheel download is needed; pip fetches the pinned wheel directly from the public release.</p>
-      <p>In an empty private directory, with Python 3.11 or newer as python3 and its standard venv module, on Apple silicon macOS or Linux x86_64/aarch64 (Intel macOS is unsupported by this preview), one command creates ./heel-rc6, installs the hash-pinned public wheel with the local runner extra, and prints heel 1.3.0rc6. Then inspect the bounded plan and create a signed scope with the CLI at ./heel-rc6/bin/heel. pip refuses the wheel unless its SHA-256 matches, and --isolated ignores pip environment variables and user configuration. Installing the extra fetches the pinned cryptography package from your Python package index, which this command does not hash-pin; these commands contact no product target.</p>
-      <pre><code>{`python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version
+      <p>In an empty private directory, with an installed Python 3.11 or newer that has its standard venv module, on Apple silicon macOS or Linux x86_64/aarch64 (Intel macOS is unsupported by this preview), one command first picks that Python (on some Macs the default python3 is 3.9, which it skips; set HEEL_PYTHON=/path/to/python3 first to use one off your PATH) and stops before creating anything if none is found, then creates ./heel-rc6, installs the hash-pinned public wheel with the local runner extra, and prints heel 1.3.0rc6. Then inspect the bounded plan and create a signed scope with the CLI at ./heel-rc6/bin/heel. pip refuses the wheel unless its SHA-256 matches, and --isolated ignores pip environment variables and user configuration. Installing the extra fetches the pinned cryptography package from your Python package index, which this command does not hash-pin; these commands contact no product target.</p>
+      <pre><code>{`${RUNNER_RC6_INSTALL}
 export HEEL_HOME="$(pwd -P)/.heel"
 ./heel-rc6/bin/heel reference prepare
 ./heel-rc6/bin/heel scope create --target reference:export --operator "your name" --confirm`}</code></pre>

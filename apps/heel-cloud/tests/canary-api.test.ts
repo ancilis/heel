@@ -110,23 +110,29 @@ it("rejects a runner revoke result outside the typed contract and names the refu
 
 // The 1.3.0rc6 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC6.md ("Customer install
 // command"), pinned here rather than read from the runbook. It may be deployed only after the release owner's anonymous
-// verify-public for v1.3.0rc6 passes. Every self-serve install surface shows this one command.
+// verify-public for v1.3.0rc6 passes. Every public UI install surface shows one shared guarded command that runs exactly
+// this line's wheel pin and flags with a selected Python 3.11+ in place of the leading `python3`.
 const RC6_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
 const RC6_RUNBOOK_INSTALL = "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install "
   + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=${RC6_WHEEL_SHA256}'`
   + " && ./heel-rc6/bin/heel --version";
 
-it("the dashboard pairing card, /runner and /agent show the exact rc6 runbook install line", async () => {
-  const { RUNNER_RC6_INSTALL, RUNNER_RC6_CLI, RUNNER_RC6_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
-  assert.equal(RUNNER_RC6_INSTALL, RC6_RUNBOOK_INSTALL);
+it("the dashboard pairing card, /runner and /agent share one guarded install with the exact rc6 runbook pin", async () => {
+  const { RUNNER_RC6_INSTALL, RUNNER_RC6_VENV_INSTALL_TAIL, RUNNER_RC6_CLI, RUNNER_RC6_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
+  assert.equal(`python3 ${RUNNER_RC6_VENV_INSTALL_TAIL}`, RC6_RUNBOOK_INSTALL);
+  assert.ok(RUNNER_RC6_INSTALL.endsWith(`"$HEEL_PY" ${RUNNER_RC6_VENV_INSTALL_TAIL}; fi`));
+  assert.equal(RUNNER_RC6_INSTALL.split(`#sha256=${RC6_WHEEL_SHA256}'`).length, 2);
+  assert.ok(!RUNNER_RC6_INSTALL.includes("python3 -m venv"));
   assert.equal(RUNNER_RC6_CLI, "./heel-rc6/bin/heel");
   assert.equal(RUNNER_RC6_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc6");
   const runner = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
-  assert.ok(runner.includes(RC6_RUNBOOK_INSTALL));
+  assert.ok(runner.includes("<pre><code>{`${RUNNER_RC6_INSTALL}\n"));
+  assert.ok(!runner.includes(RC6_RUNBOOK_INSTALL));
   assert.doesNotMatch(runner, /heel-rc[1234]\/|releases\/(tag|download)\/v1\.3\.0rc[234]/);
   const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
   assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc[1234]|heel-rc[1234]\b/);
   assert.ok(agent.includes(`const PUBLIC_WHEEL_SHA256 = "${RC6_WHEEL_SHA256}";`));
+  assert.ok(agent.includes("const INSTALL_PUBLIC_AGENT = RUNNER_RC6_INSTALL;"));
   assert.match(agent, /releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=\$\{PUBLIC_WHEEL_SHA256\}/);
 });
 

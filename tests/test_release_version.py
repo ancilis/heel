@@ -133,8 +133,12 @@ class ReleaseVersionContractTests(unittest.TestCase):
                 self.assertNotIn(f"releases/download/v{earlier}", text, path)
             self.assertNotRegex(text, rf"{PUBLIC_VERSION}[^.]*not yet published as a GitHub release", path)
             self.assertNotRegex(text, rf"{PUBLIC_VERSION} candidate", path)
-        for path in customer[:2] + customer[4:]:
+        for path in customer[:2] + customer[4:-1]:
             self.assertIn(PUBLIC_WHEEL_URL, path.read_text(encoding="utf-8"), path)
+        # /runner renders the shared guarded installer, whose source pins the current wheel URL.
+        self.assertIn("${RUNNER_RC6_INSTALL}", customer[-1].read_text(encoding="utf-8"))
+        card = ROOT / "apps/heel-cloud/components/canary/RunnerPairingCard.tsx"
+        self.assertIn(PUBLIC_WHEEL_URL, card.read_text(encoding="utf-8"), card)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         # The CHANGELOG names exactly one unpublished candidate, rc6, and keeps the rc5 publication
         # record: its real date and release URL.
