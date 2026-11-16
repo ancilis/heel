@@ -23,15 +23,15 @@ const executableReferences = (source) =>
 test("both install variants and every later step use one environment", async () => {
   const source = await readFile(pageUrl, "utf8");
   // The public install is the shared guarded installer; its environment comes from the shared runbook tail.
-  assert.ok(source.includes("const INSTALL_PUBLIC_AGENT = RUNNER_RC6_INSTALL;"));
+  assert.ok(source.includes("const INSTALL_PUBLIC_AGENT = RUNNER_RC7_INSTALL;"));
   const card = await readFile(new URL("../components/canary/RunnerPairingCard.tsx", import.meta.url), "utf8");
   const created = [...createdEnvironments(source),
-    ...[...card.matchAll(/RUNNER_RC6_VENV_INSTALL_TAIL = "-m venv (\S+)/g)].map((match) => match[1])];
+    ...[...card.matchAll(/RUNNER_RC7_VENV_INSTALL_TAIL = "-m venv (\S+)/g)].map((match) => match[1])];
   assert.equal(created.length, 2, "the public and bundled installs each create an environment");
-  assert.deepEqual(new Set(created), new Set(["heel-rc6"]));
+  assert.deepEqual(new Set(created), new Set(["heel-rc7"]));
   const references = executableReferences(source);
   assert.ok(references.length >= 7, JSON.stringify(references));
-  for (const reference of references) assert.equal(reference.environment, "heel-rc6", JSON.stringify(reference));
+  for (const reference of references) assert.equal(reference.environment, "heel-rc7", JSON.stringify(reference));
   assert.doesNotMatch(source, /\.venv\b/);
 });
 
@@ -46,13 +46,13 @@ test("the displayed install and verification perform a real handshake against th
   const displayedVerify = verifyMatch[1].replaceAll("\\\\", "\\");
   assert.equal(
     displayedInstall,
-    "python3 -m venv heel-rc6\n./heel-rc6/bin/python -m pip install ./heel_sim-1.3.0rc6-py3-none-any.whl",
+    "python3 -m venv heel-rc7\n./heel-rc7/bin/python -m pip install ./heel_sim-1.3.0rc7-py3-none-any.whl",
   );
-  assert.match(displayedVerify, /\| \.\/heel-rc6\/bin\/heel-mcp$/);
-  const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc6-py3-none-any.whl");
+  assert.match(displayedVerify, /\| \.\/heel-rc7\/bin\/heel-mcp$/);
+  const wheel = join(repoRoot, "apps/heel-cloud/public/downloads/heel_sim-1.3.0rc7-py3-none-any.whl");
   const workingDirectory = await mkdtemp(join(await realpath(repoRoot), ".heel-mcp-quickstart-"));
   const currentInstall = displayedInstall.replace(
-    "./heel_sim-1.3.0rc6-py3-none-any.whl",
+    "./heel_sim-1.3.0rc7-py3-none-any.whl",
     shellQuote(wheel),
   );
 

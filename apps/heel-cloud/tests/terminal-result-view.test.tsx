@@ -230,7 +230,7 @@ describe("CUSTOMER-TERMINAL-RESULT-VIEW: an approved run is followed to its term
     expect(within(progress).getByRole("alert").textContent).toMatch(
       /signed this rehearsal as incomplete \(cloud_disconnected: the runner could not keep confirming this run with Heel Cloud while it ran\)/);
     expect(progress.textContent).toMatch(/do not rely on its test outcomes either way/);
-    expect(progress.textContent).toContain("./heel-rc6/bin/heel runner status");
+    expect(progress.textContent).toContain("./heel-rc7/bin/heel runner status");
     // Completion stays distinct from any finding outcome: nothing here reads as a pass, a clean result or a finding.
     expect(progress.textContent).not.toMatch(/\b(passed|clean|no findings|observed|blocked)\b/i);
     // The run proves its signed plan (step 3) but not a completed rehearsal (step 4).

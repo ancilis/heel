@@ -286,19 +286,19 @@ class LocalAgentJourneyTests(unittest.TestCase):
 
         self.assertIn("heel review openapi", readme)
         self.assertIn(
-            ".venv/bin/python -m pip install ./heel_sim-1.3.0rc6-py3-none-any.whl",
+            ".venv/bin/python -m pip install ./heel_sim-1.3.0rc7-py3-none-any.whl",
             readme,
         )
-        self.assertIn("/downloads/heel_sim-1.3.0rc6-py3-none-any.whl", readme)
-        # The same-origin files are the bundled 1.3.0rc6 artifacts, whose wheel digest the public command pins.
-        self.assertRegex(" ".join(readme.split()), r"bundled 1\.3\.0rc6 artifacts")
+        self.assertIn("/downloads/heel_sim-1.3.0rc7-py3-none-any.whl", readme)
+        # The same-origin files are the bundled 1.3.0rc7 artifacts, whose wheel digest the public command pins.
+        self.assertRegex(" ".join(readme.split()), r"bundled 1\.3\.0rc7 artifacts")
         self.assertNotIn("/downloads/heel_sim-1.3.0rc4", readme)
         self.assertNotIn("/downloads/heel_sim-1.3.0rc2", readme)
         self.assertIn("not yet published to pypi", readme.lower())
         # The recommended install is the one public command, then the CLI it creates.
-        self.assertIn("python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install", readme)
-        self.assertIn("./heel-rc6/bin/heel review openapi ./sanitized-openapi.json", readme)
-        self.assertIn("./heel-rc6/bin/heel review openapi ./sanitized-openapi.json", quickstart)
+        self.assertIn("python3 -m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install", readme)
+        self.assertIn("./heel-rc7/bin/heel review openapi ./sanitized-openapi.json", readme)
+        self.assertIn("./heel-rc7/bin/heel review openapi ./sanitized-openapi.json", quickstart)
         self.assertNotIn("git clone https://github.com/ancilis/heel", readme)
         self.assertIn("python3 -m pip install heel-sim", quickstart)
         self.assertIn("only after an actual pypi release", quickstart.lower())

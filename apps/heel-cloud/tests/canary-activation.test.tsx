@@ -250,7 +250,7 @@ describe("active rehearsal controls", () => {
 // CUSTOMER-ONBOARDING-STATE: the observed journey had an active paired runner and an exact target authorization, yet
 // the card read "1/4 ready · Next action: pair runner · Ready to pair" and pointed at a runner companion that is not wired.
 describe("CUSTOMER-ONBOARDING-STATE: activation progress follows the actual paired runner and authorization", () => {
-  const CLI = "./heel-rc6/bin/heel";
+  const CLI = "./heel-rc7/bin/heel";
 
   function stepState(activation: HTMLElement, title: string): string {
     const step = within(activation).getAllByRole("listitem").find((item) => item.querySelector("h2")?.textContent === title);
@@ -386,7 +386,7 @@ describe("CUSTOMER-RESULT-HANDOFF-B: result sharing and the shared finding rende
 
 
 describe("CUSTOMER-ACTIVATION-POLISH: a terminal run is complete only when signed completed", () => {
-  const CLI_PATH = "./heel-rc6/bin/heel";
+  const CLI_PATH = "./heel-rc7/bin/heel";
 
   test("only completed is complete; stopped stays stopped; anything else, including unknown, is incomplete", () => {
     expect(terminalRunPhase("completed")).toBe("complete");
