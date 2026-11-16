@@ -1,0 +1,18 @@
+// Standalone synthetic acceptance target. No bindings, storage, routes or paid features.
+// Deployed only to its own workers.dev hostname after independent review; see README.md.
+{
+  "$schema": "https://unpkg.com/wrangler@4.83.0/config-schema.json",
+  "name": "heel-customer-staging-target",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-06-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "send_metrics": false,
+  "vars": {
+    // Fail closed until the operator deploys with an explicit --var HEEL_TARGET_MODE:<mode>.
+    "HEEL_TARGET_MODE": "unset",
+    "HEEL_TARGET_REVISION": "unknown"
+  }
+  // Secrets, set only with `wrangler secret put` from stdin (never stored here):
+  //   HEEL_VERIFY_TOKEN, HEEL_FREE_TOKEN_SHA256, HEEL_PRO_TOKEN_SHA256
+}
