@@ -61,7 +61,7 @@ the release owner's anonymous verify-public for v1.3.0rc7 has checked the exact 
   ensurepip, or stops before creating anything, then runs the runbook's exact pinned install.
   Activation copy states configured-test, incomplete-run and Python state honestly, and `/runner`
   describes the browser-configured read tests instead of two fixed checks.
-- The standalone synthetic staging target is published again as the `heel-staging-fixture-*`
+- The standalone synthetic staging target is prepared for publication as the `heel-staging-fixture-*`
   assets of this prerelease with its manifest; it is a test fixture, not inside the wheel or source
   archive, and not product code. Its behaviour files are unchanged from 1.3.0rc6.
 - No public, hosted or customer run is recorded for 1.3.0rc7. This is not a launch or
