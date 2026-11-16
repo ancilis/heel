@@ -2,7 +2,7 @@
 
 import { cleanup, render } from "@testing-library/react";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -41,17 +41,29 @@ fi
 
 interface Outcome { status: number | null; stdout: string; stderr: string; log: string; created: boolean }
 
-/** Runs the exact public install command in a fresh empty directory with only stub interpreters reachable. */
+/** The only external commands the installer and the stubs need; shell builtins cover the rest. */
+const TOOLS = ["mkdir", "chmod"];
+
+/**
+ * Runs the exact public install command in a fresh empty directory with only stub interpreters reachable: PATH is the
+ * stub directory plus a private directory holding just {@link TOOLS}, never /bin or /usr/bin, so no real Python on the
+ * host (for example a CI runner's) can be selected.
+ */
 function install(setup: (bin: string, other: string) => void, heelPython?: (other: string) => string): Outcome {
   const dir = mkdtempSync(join(tmpdir(), "heel-install-"));
   try {
-    const bin = join(dir, "bin"); const other = join(dir, "opt"); const work = join(dir, "work");
-    for (const path of [bin, other, work]) mkdirSync(path);
+    const bin = join(dir, "bin"); const other = join(dir, "opt"); const work = join(dir, "work"); const tools = join(dir, "tools");
+    for (const path of [bin, other, work, tools]) mkdirSync(path);
+    for (const name of TOOLS) {
+      const real = ["/bin", "/usr/bin"].map((root) => join(root, name)).find((candidate) => existsSync(candidate));
+      if (!real) throw new Error(`${name} not found in /bin or /usr/bin`);
+      symlinkSync(real, join(tools, name));
+    }
     setup(bin, other);
     const log = join(dir, "log");
     const prefix = heelPython ? `HEEL_PYTHON=${heelPython(other)}\n` : "";
     const run = spawnSync("/bin/sh", ["-c", prefix + RUNNER_RC7_INSTALL],
-      { cwd: work, env: { PATH: `${bin}:/bin:/usr/bin`, LOG: log } as unknown as NodeJS.ProcessEnv, encoding: "utf8" });
+      { cwd: work, env: { PATH: `${bin}:${tools}`, LOG: log } as unknown as NodeJS.ProcessEnv, encoding: "utf8" });
     const strip = (text: string) => text.replaceAll(dir, "<dir>");
     return { status: run.status, stdout: strip(run.stdout), stderr: run.stderr,
       log: existsSync(log) ? strip(readFileSync(log, "utf8")) : "", created: existsSync(join(work, "heel-rc7")) };
