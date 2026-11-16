@@ -7,8 +7,13 @@ and ``TargetHTTPSClient``, signed findings, and both disclosure choices (share a
 
 Seams (as ``tests/test_configured_live_product_e3.py``): secret backend/CA, in-memory OS vault,
 scripted target socket, browser-equivalent owner calls.  The ONE added seam is
-SEAM-CONTROL-LATENCY: every runner->Cloud POST waits a fixed delay before reaching the real edge,
+SEAM-CONTROL-LATENCY: runner->Cloud POSTs wait a fixed delay before reaching the real edge,
 standing in for a public internet round trip to a hosted control plane.  It never alters bytes.
+
+The primary reproducer delays ONLY the synchronous progress call (0.8 s) and leaves heartbeats
+fast, so it isolates the defect (the executor's own progress round trip ages the cached gate past
+the unchanged 0.5 s bound) from any heartbeat-latency exposure, with a wide margin on both sides.
+A uniform 0.45 s delay on every POST is kept as a secondary, closer-to-the-bound check.
 """
 from __future__ import annotations
 
@@ -31,6 +36,9 @@ ORIGINAL_FIELD = _assertion({"kind": "json_field_present", "path": ["export", "r
 # Measured threshold: the post-progress gate age equals that progress call's own round trip;
 # 0.45 s per control call (a plausible public RTT to the hosted edge) crosses the 0.5 s bound.
 CONTROL_DELAY_SECONDS = 0.45
+# Progress-only delay of the primary reproducer: far above the 0.5 s gate bound, while every
+# heartbeat stays fast, so neither the red nor the green outcome depends on scheduling jitter.
+PROGRESS_DELAY_SECONDS = 0.8
 
 
 class _LatentTransport:
@@ -49,6 +57,28 @@ class _LatentTransport:
 
     def __getattr__(self, name):
         return getattr(self._transport, name)
+
+
+class _ProgressOnlyLatency(_LatentTransport):
+    """SEAM-CONTROL-LATENCY on the run's progress call only; every other POST is undelayed."""
+
+    def __init__(self, transport, delay):
+        super().__init__(transport, 0.0)
+        self._progress_delay = delay
+        self.progress_calls = 0
+
+    def _maybe_delay(self, path):
+        if path.endswith("/progress"):
+            self.progress_calls += 1
+            time.sleep(self._progress_delay)
+
+    def post(self, path, *, headers=None, body=b""):
+        self._maybe_delay(path)
+        return self._transport.post(path, headers=headers, body=body)
+
+    def post_bounded(self, path, **kwargs):
+        self._maybe_delay(path)
+        return self._transport.post_bounded(path, **kwargs)
 
 
 class _Target:
@@ -83,6 +113,7 @@ class LatentCustomer(E3Customer):
         self.target = _Target()
         self.delay = delay
         self.transport_class = _LatentTransport
+        self.transports: list[_LatentTransport] = []
 
     def serve(self, faults=None):
         from tests.test_runner_daemon import _daemon, _serve_once
@@ -90,8 +121,17 @@ class LatentCustomer(E3Customer):
                          vault_factory=lambda backend: self.vault, target_network=self.target.network())
         if self.delay:
             real = daemon._transport
-            daemon._transport = lambda origin: self.transport_class(real(origin), self.delay)
+
+            def latent(origin):
+                transport = self.transport_class(real(origin), self.delay)
+                self.transports.append(transport)
+                return transport
+
+            daemon._transport = latent
         return _serve_once(daemon)
+
+    def progress_calls(self):
+        return sum(getattr(item, "progress_calls", 0) for item in self.transports)
 
     def keep_local(self, run_id):
         assert not isinstance(self.serve(), BaseException)  # the runner registers the metadata
@@ -111,14 +151,26 @@ def _local_operational(c, run_id):
     return c.store.load_final_projections(run_id)["local_view"]["operational_projection"]
 
 
-@pytest.fixture
-def customer(tmp_path, serve_harness, monkeypatch):
-    c = LatentCustomer(tmp_path, serve_harness, monkeypatch, "rc6", CONTROL_DELAY_SECONDS)
+def _customer(tmp_path, serve_harness, monkeypatch, name, delay, transport_class):
+    c = LatentCustomer(tmp_path, serve_harness, monkeypatch, name, delay)
+    c.transport_class = transport_class
     c.spec.write_text(json.dumps(OPENAPI))
     c.setup_runner()
     c.add_input("export_ok", "ok")
     c.add_input("expected_total", "42")
     return c
+
+
+@pytest.fixture
+def customer(tmp_path, serve_harness, monkeypatch):
+    """Primary: only the progress call is slow (0.8 s); heartbeats stay fast."""
+    return _customer(tmp_path, serve_harness, monkeypatch, "rc6", PROGRESS_DELAY_SECONDS, _ProgressOnlyLatency)
+
+
+@pytest.fixture
+def uniform_customer(tmp_path, serve_harness, monkeypatch):
+    """Secondary: every runner->Cloud POST waits 0.45 s (close to the 0.5 s bound)."""
+    return _customer(tmp_path, serve_harness, monkeypatch, "rc6u", CONTROL_DELAY_SECONDS, _LatentTransport)
 
 
 LABELS = [{"role": "higher_plan", "plan_label": "Pro"}, {"role": "lower_plan", "plan_label": "Free"}]
@@ -138,7 +190,8 @@ def _run(c, tests):
     return request["run_id"], len(c.target.requests) - before
 
 
-def test_mixed_edited_field_and_numeric_plan_completes_over_public_latency_and_survives_both_choices(customer):
+def test_mixed_edited_field_and_numeric_plan_completes_over_slow_progress_and_survives_both_choices(customer):
+    """Primary B1 reproducer: red on 50a60ea6 (1 of 4 reads, incomplete/cloud_disconnected)."""
     c = customer
     assert c.save_test("astra-record", ORIGINAL_FIELD)[0] == 201
     assert c.save_test("astra-record", EDITED_FIELD, supersedes=1)[0] == 201
@@ -165,6 +218,20 @@ def test_mixed_edited_field_and_numeric_plan_completes_over_public_latency_and_s
     assert results["sc.internal.astra-numeric"]["reason"] != "run_incomplete"
     assert results["sc.internal.astra-record"]["source"]["source_revision"] == 2
     assert not isinstance(c.serve(), BaseException)
+    assert c.progress_calls() >= 6  # the seam really delayed every progress of both runs
+
+
+def test_mixed_plan_completes_over_uniform_public_latency(uniform_customer):
+    """Secondary check: every control POST (heartbeats included) at 0.45 s, near the bound."""
+    c = uniform_customer
+    assert c.save_test("astra-record", EDITED_FIELD)[0] == 201
+    assert c.save_test("astra-numeric", NUMERIC_TOTAL)[0] == 201
+    tests = [{"source_scenario_id": "sc.internal.astra-record", "source_revision": 1},
+             {"source_scenario_id": "sc.internal.astra-numeric", "source_revision": 1}]
+    run_id, reads = _run(c, tests)
+    operational = _local_operational(c, run_id)
+    assert reads == 4, (reads, operational["execution_disposition"], operational["error_category"])
+    assert (operational["execution_disposition"], operational["error_category"]) == ("completed", "none"), operational
 
 
 class _OfflineAfterFirstProgress(_LatentTransport):
@@ -193,8 +260,8 @@ class _OfflineAfterFirstProgress(_LatentTransport):
         return answer
 
 
-def test_a_genuine_cloud_outage_after_progress_fails_closed_before_more_target_traffic(customer):
-    c = customer
+def test_a_genuine_cloud_outage_after_progress_fails_closed_before_more_target_traffic(uniform_customer):
+    c = uniform_customer
     assert c.save_test("astra-record", EDITED_FIELD)[0] == 201
     assert c.save_test("astra-numeric", NUMERIC_TOTAL)[0] == 201
     status, created = c.request_plan({
