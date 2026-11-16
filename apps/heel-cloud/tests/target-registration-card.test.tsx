@@ -54,21 +54,76 @@ describe("target registration card", () => {
 
   test.each([
     ["", true],
-    ["http://staging.example.test", true],
-    ["https://staging.example.test/login", true],
-    ["https://Staging.example.test", true],
     ["https://staging.example.test", false],
     ["  https://staging.example.test  ", false],
-  ])("the existing shape gate decides whether %j can be submitted", (origin, disabled) => {
+    ["https://staging.example.test/", false],
+    ["https://Staging.Example.TEST", false],
+    ["https://staging.example.test//", true],
+    ["http://staging.example.test", true],
+    ["https://staging.example.test/login", true],
+  ])("the origin gate decides whether %j can be submitted", (origin, disabled) => {
     render(<TargetRegistrationCard {...props({ origin })} />);
     expect(createButton().disabled).toBe(disabled);
+  });
+
+  test.each([
+    ["  https://Staging.Example.test/  ", "https://staging.example.test"],
+    ["https://STAGING.example.test/", "https://staging.example.test"],
+    ["https://staging.example.test", "https://staging.example.test"],
+  ])("pasted %j submits exactly the canonical origin %j, and shows it when it differs", (origin, canonical) => {
+    const onCreateProof = vi.fn();
+    render(<TargetRegistrationCard {...props({ origin, onCreateProof })} />);
+    const input = screen.getByLabelText("Target URL");
+    expect(input.getAttribute("aria-invalid")).toBeNull();
+    if (origin === canonical) {
+      expect(input.getAttribute("aria-describedby")).toBeNull();
+    } else {
+      expect(document.getElementById(input.getAttribute("aria-describedby") ?? "")?.textContent).toBe(`Heel will register ${canonical}.`);
+    }
+    fireEvent.click(createButton());
+    expect(onCreateProof).toHaveBeenCalledExactlyOnceWith(canonical);
+  });
+
+  test.each([
+    ["http://staging.example.test", /Use https:\/\//],
+    ["HTTPS://staging.example.test", /Start with lowercase https:\/\//],
+    ["staging.example.test", /Start with lowercase https:\/\//],
+    ["https://user:pass@staging.example.test", /Remove the user name or password/],
+    ["https://staging.example.test:8443", /Remove the port/],
+    ["https://staging.example.test/login", /Remove the path/],
+    ["https://staging.example.test//", /Remove the path/],
+    ["https://staging.example.test/?debug=1", /Remove the query/],
+    ["https://staging.example.test?debug=1", /Remove the query/],
+    ["https://staging.example.test#top", /Remove the fragment/],
+    ["https://staging.example.test/#top?x", /Remove the fragment/],
+    ["https://", /Add the host name/],
+    ["https://staging_example.test", /letters, digits, dots and hyphens/],
+    ["https://stäging.example.test", /letters, digits, dots and hyphens/],
+    ["https://staging .example.test", /letters, digits, dots and hyphens/],
+  ])("%j is refused with an explanation tied to the field, never trimmed into another origin", (origin, message) => {
+    const onCreateProof = vi.fn();
+    render(<TargetRegistrationCard {...props({ origin, onCreateProof })} />);
+    const input = screen.getByLabelText("Target URL");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    const described = document.getElementById(input.getAttribute("aria-describedby") ?? "");
+    expect(described?.textContent).toMatch(message);
+    expect(createButton().disabled).toBe(true);
+    fireEvent.click(createButton());
+    expect(onCreateProof).not.toHaveBeenCalled();
+  });
+
+  test("empty input is not marked invalid before the user types", () => {
+    render(<TargetRegistrationCard {...props({ origin: "" })} />);
+    const input = screen.getByLabelText("Target URL");
+    expect(input.getAttribute("aria-invalid")).toBeNull();
+    expect(input.getAttribute("aria-describedby")).toBeNull();
   });
 
   test("a valid target submits through the supplied action only, and busy blocks it", () => {
     const onCreateProof = vi.fn();
     const { rerender } = render(<TargetRegistrationCard {...props({ origin: "https://staging.example.test", onCreateProof })} />);
     fireEvent.click(createButton());
-    expect(onCreateProof).toHaveBeenCalledOnce();
+    expect(onCreateProof).toHaveBeenCalledExactlyOnceWith("https://staging.example.test");
 
     rerender(<TargetRegistrationCard {...props({ origin: "https://staging.example.test", onCreateProof, busy: true })} />);
     expect(createButton().disabled).toBe(true);

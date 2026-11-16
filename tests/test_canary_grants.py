@@ -31,7 +31,7 @@ from canary_test_support import (
 def test_context_migrations_preserve_binding_reaper_affinity_and_protocol_schema():
     from heel.saas.migrate import CONTROL_PLANE_MIGRATIONS
 
-    assert [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-19:]] == [
+    assert [(migration.version, migration.name) for migration in CONTROL_PLANE_MIGRATIONS[-21:]] == [
         (16, "runner_context_bindings"),
         (17, "runner_context_one_active_per_runner"),
         (18, "runner_context_reaper_indexes"),
@@ -51,6 +51,8 @@ def test_context_migrations_preserve_binding_reaper_affinity_and_protocol_schema
         (32, "stop_ack_signed_witness"),
         (33, "inactive_claim_attestation_audit"),
         (34, "scenario_library_and_run_bindings"),
+        (35, "configured_live_tests_and_plan_requests"),
+        (36, "configured_findings_disclosure"),
     ]
     conn = connect()
     assert "verification_record_digest" in {

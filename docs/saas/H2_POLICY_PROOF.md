@@ -31,6 +31,9 @@ tree 111 paths (closure 111 + 14 = 125), and the accepted plan-submit change re-
 `heel/browser_assess.py` and the private `heel/saas/scenario_library.py`, which makes the tree 113 paths
 (closure 113 + 14 = 127), and the 1.3.0-rc.5 npm root re-pins the runtime lock; the TLS harness is
 unchanged and that closure is **UNRUN**.
+
+**Runner rc6 re-version amendment:** the 1.3.0-rc.6 npm root re-pins only `app.lockfile_sha256` in
+the runtime lock; no closure path, TLS harness or policy source changes, and that closure is **UNRUN**.
 The new staged closure digest is **UNRUN**: no earlier run, including the cycles above and any H2-3
 run, covers it. It becomes evidence only after a fresh, unfiltered launcher run on the literal proof
 branch (all 18 cases, eight p0-p7 records, zero skips) and an independent runtime review. Earlier

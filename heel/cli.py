@@ -37,6 +37,7 @@ _SAFE_REVIEW_FAILURE = (
 _SAFE_CLOUD_FAILURE = "Heel Cloud could not complete the request safely."
 _SAFE_RUNNER_IMPORT_FAILURE = "Heel runner OpenAPI import failed."
 _SAFE_RUNNER_CREDENTIAL_FAILURE = "Heel runner credential could not be stored safely."
+_SAFE_RUNNER_INPUT_FAILURE = "Heel runner local input could not be changed safely."
 _SAFE_RUNNER_MAPPING_FAILURE = "Heel runner mapping could not be saved safely."
 _SAFE_RUNNER_LIVE_FAILURE = "Heel runner live preparation is unavailable."
 _SAFE_RUNNER_COMMAND_FAILURE = "Heel runner command was rejected."
@@ -225,6 +226,71 @@ def _runner_credential_add(args) -> int:
         # The plan label is the operator's own public name for this plan, unlike --label.
         printed["plan_label"] = record["plan_label"]
         printed["role"] = record["semantic_role"]
+    print(json.dumps(printed, sort_keys=True))
+    return 0
+
+
+def _runner_input(args) -> int:
+    """Local expected values for configured live tests: OS vault only, prompt or --secret-fd.
+
+    ``--type text`` (ordinary text, no JSON quoting), ``number``, ``boolean`` or ``null``
+    states the value's kind; the default ``json`` keeps the legacy one-JSON-scalar entry
+    (for example ``"abc"``, ``42``, ``true``). Every kind ends in the same strict decoder.
+    A value is never accepted from argv or the environment and is never printed; output
+    is handles only.
+    """
+    from .runner.store import decode_live_input_scalar
+    from .runner.vault import select_vault
+
+    try:
+        store = _runner_store()
+        if args.runnerinputcmd == "list":
+            printed = {"inputs": [
+                {key: item[key] for key in ("input_handle_id", "name", "state", "selection")}
+                for item in store.list_live_inputs()
+            ]}
+        elif args.runnerinputcmd == "revoke":
+            record = store.revoke_live_input(args.handle, vault=select_vault(args.backend))
+            printed = {"input_handle": record["input_handle_id"], "state": record["state"]}
+        else:
+            kind = getattr(args, "value_type", "json") or "json"
+            if kind == "null":
+                raw = b"null"
+            elif args.secret_fd is not None:
+                raw = _runner_secret_from_fd(args.secret_fd)
+                if kind == "text" and raw.endswith(b"\n"):
+                    # One line terminator from ``printf '%s\n'``/``echo`` is not part of text.
+                    raw = raw[:-2] if raw.endswith(b"\r\n") else raw[:-1]
+            else:
+                if not sys.stdin.isatty():
+                    raise ValueError("interactive input requires a TTY")
+                prompt = {
+                    "json": "Expected value (JSON scalar): ", "text": "Expected value (text): ",
+                    "number": "Expected value (number): ", "boolean": "Expected value (true or false): ",
+                }[kind]
+                raw = getpass.getpass(prompt).encode("utf-8")
+            try:
+                if kind == "text":
+                    # Ordinary text becomes exactly one JSON string; strict UTF-8 only.
+                    raw = json.dumps(raw.decode("utf-8"), ensure_ascii=False).encode("utf-8")
+                elif kind == "boolean" and raw.strip(b" \t\r\n") not in {b"true", b"false"}:
+                    raise ValueError("local input is invalid")
+                # Strict: an inexact, non-finite or out-of-bound token is refused here,
+                # before any handle or metadata record exists.
+                value = decode_live_input_scalar(raw)
+                if kind == "number" and (type(value) not in {int, float}):
+                    raise ValueError("local input is invalid")
+            finally:
+                raw = b""
+            record = store.create_live_input(
+                name=args.name, value=value, vault=select_vault(args.backend),
+            )
+            value = None
+            printed = {"input_handle": record["input_handle_id"], "name": record["name"],
+                       "selection": record["selection"]}
+    except Exception:
+        print(_SAFE_RUNNER_INPUT_FAILURE, file=sys.stderr)
+        return 2
     print(json.dumps(printed, sort_keys=True))
     return 0
 
@@ -1362,6 +1428,28 @@ def main(argv=None):
         choices=("keychain", "secret-service", "ephemeral-env", "ephemeral-fd"),
     )
     runner_credential_add.add_argument("--secret-fd", type=int)
+    runner_input = runner_sub.add_parser(
+        "input", help="manage local expected values for configured live tests (OS vault only)",
+    )
+    runner_input_sub = runner_input.add_subparsers(
+        dest="runnerinputcmd", required=True, parser_class=_RunnerArgumentParser,
+    )
+    runner_input_add = runner_input_sub.add_parser(
+        "add", help="store a new value under a new handle; it becomes the name's current value",
+    )
+    runner_input_add.add_argument("--name", required=True)
+    runner_input_add.add_argument("--backend", required=True, choices=("keychain", "secret-service"))
+    runner_input_add.add_argument("--secret-fd", type=int)
+    runner_input_add.add_argument(
+        "--type", dest="value_type", default="json", choices=("text", "number", "boolean", "null", "json"),
+        help="value kind: text needs no JSON quotes; json (default) keeps the legacy JSON-scalar entry",
+    )
+    runner_input_revoke = runner_input_sub.add_parser(
+        "revoke", help="revoke one handle explicitly; approvals that froze it stop resolving",
+    )
+    runner_input_revoke.add_argument("--handle", required=True)
+    runner_input_revoke.add_argument("--backend", required=True, choices=("keychain", "secret-service"))
+    runner_input_sub.add_parser("list", help="list handles, names and states (never values)")
     runner_map = runner_sub.add_parser(
         "map", help="bind one immutable scenario to one imported read route",
     )
@@ -1602,6 +1690,8 @@ def main(argv=None):
             return _runner_import_openapi(args.path)
         if args.runnercmd == "credential" and args.runnercredentialcmd == "add":
             return _runner_credential_add(args)
+        if args.runnercmd == "input":
+            return _runner_input(args)
         if args.runnercmd == "map":
             return _runner_map(args)
         if args.runnercmd == "prepare":

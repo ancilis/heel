@@ -40,6 +40,12 @@ from heel.findings_sync import (
     stable_json,
 )
 from heel.canary_contracts import (
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA,
+    RUNNER_CONFIGURED_SYNC_MAX_BYTES,
+    validate_runner_approval_projection,
+    validate_runner_configured_plan_sync,
+    validate_runner_projection_submission,
     RUNNER_DISCLOSURE_POLL_MAX_BYTES,
     canonical_bytes,
     parse_json,
@@ -71,6 +77,7 @@ from .billing import (
 )
 from .canary_store import CanaryStore
 from .canary_disclosure import (
+    findings_schema_for_approval,
     CANARY_FINDINGS_SCHEMA,
     MAX_UPLOAD_BYTES,
     CanaryDisclosureError,
@@ -80,7 +87,7 @@ from .canary_runs import (
     CanaryRunError, CanaryRunService, DiscoveryError, InactiveClaimAttestationRefused,
     ensure_discovery_plan_schema,
 )
-from .runner_contexts import RunnerContextBindingService, RunnerContextError
+from .runner_contexts import ConfiguredPlanService, RunnerContextBindingService, RunnerContextError
 from .runner_auth import (
     RunnerActivationAbortConflict,
     RunnerActivationAbortDeferred,
@@ -898,6 +905,7 @@ class _Handler(BaseHTTPRequestHandler):
             (len(p) == 7 and p[5] == "contexts" and p[6] == "list") or
             (len(p) == 8 and p[5] == "contexts" and p[7] in {"claim", "approval-projections"}) or
             (len(p) == 9 and p[5] == "contexts" and p[7] == "plan-requests" and p[8] == "claim") or
+            (len(p) == 9 and p[5] == "contexts" and p[7] == "configured-plan-requests" and p[8] == "sync") or
             (len(p) == 7 and p[5] == "resync" and p[6] in {"start", "complete"}) or
             (len(p) == 8 and p[5] == "runs" and p[7] in {
                 "heartbeat", "progress", "result", "stop-ack", "result-projection",
@@ -1039,6 +1047,9 @@ class _Handler(BaseHTTPRequestHandler):
             if (method == "POST" and len(tail) == 6 and tail[0] == "runners" and tail[2] == "contexts"
                     and tail[4:] == ("plan-requests", "claim")):
                 return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-plan-request-claim")
+            if (method == "POST" and len(tail) == 6 and tail[0] == "runners" and tail[2] == "contexts"
+                    and tail[4:] == ("configured-plan-requests", "sync")):
+                return lambda: self._runner_request(wid, tail[1], "runner_claim", tail[3], "context-configured-plan-sync")
             if method == "POST" and len(tail) == 4 and tail[0] == "runners" and tail[2] == "resync" and tail[3] in {"start", "complete"}:
                 return lambda: self._runner_resync(wid, tail[1], tail[3])
             if (method == "POST" and len(tail) == 5 and tail[0] == "runners" and tail[2] == "runs"
@@ -1119,6 +1130,16 @@ class _Handler(BaseHTTPRequestHandler):
                 if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
                         and tail[4] == "plan-requests"):
                     return lambda: self._ws_plan_request_create(wid, project_ref, tail[3])
+                if (method == "POST" and len(tail) == 5 and tail[2] == "runner-context-bindings"
+                        and tail[4] == "configured-plan-requests"):
+                    return lambda: self._ws_configured_plan_create(wid, project_ref, tail[3])
+                if len(tail) == 3 and tail[2] == "configured-plan-requests" and method == "GET":
+                    return lambda: self._ws_configured_plan_list(wid, project_ref)
+                if len(tail) == 4 and tail[2] == "configured-plan-requests" and method == "GET":
+                    return lambda: self._ws_configured_plan_view(wid, project_ref, tail[3])
+                if (len(tail) == 5 and tail[2] == "configured-plan-requests" and tail[4] == "cancel"
+                        and method == "POST"):
+                    return lambda: self._ws_configured_plan_cancel(wid, project_ref, tail[3])
                 if len(tail) == 3 and tail[2] == "canary-approval-projections" and method == "POST":
                     return lambda: self._ws_canary_projection_submit(wid, project_ref)
                 if len(tail) == 3 and tail[2] == "canary-approval-requests" and method == "GET":
@@ -1129,6 +1150,8 @@ class _Handler(BaseHTTPRequestHandler):
                         return lambda: self._ws_canary_status(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "approve" and method == "POST":
                         return lambda: self._ws_canary_approve(wid, project_ref, run_id)
+                    if len(tail) == 5 and tail[4] == "configured-plan" and method == "GET":
+                        return lambda: self._ws_configured_plan_for_run(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "events" and method == "GET":
                         return lambda: self._ws_canary_events(wid, project_ref, run_id)
                     if len(tail) == 5 and tail[4] == "stop" and method == "POST":
@@ -1471,6 +1494,7 @@ class _Handler(BaseHTTPRequestHandler):
                 128 if operation == "context-list"
                 else 256 if operation in {"claim", "context-claim"}
                 else 2048 if operation == "context-plan-request-claim"
+                else RUNNER_CONFIGURED_SYNC_MAX_BYTES if operation == "context-configured-plan-sync"
                 else 69632 if operation == "context-approval-projections"
                 else MAX_UPLOAD_BYTES if operation == "result-projection"
                 else RUNNER_DISCLOSURE_POLL_MAX_BYTES if operation == "disclosure-poll"
@@ -1481,15 +1505,16 @@ class _Handler(BaseHTTPRequestHandler):
             validators = {"claim": validate_runner_claim_request, "heartbeat": validate_runner_heartbeat_request,
                           "progress": validate_runner_progress_request, "result": validate_runner_result_request,
                           "stop-ack": validate_runner_stop_ack_request, "context-list": validate_runner_context_list,
-                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_approval_projection_submit,
+                          "context-claim": validate_runner_context_claim, "context-approval-projections": validate_runner_projection_submission,
                           "context-plan-request-claim": validate_runner_plan_request_claim,
+                          "context-configured-plan-sync": validate_runner_configured_plan_sync,
                           "disclosure-poll": validate_runner_disclosure_poll_request}
             if operation != "result-projection":
                 parsed = validators[operation](parsed)
             if (canonical_bytes(parsed) != self._raw_body()
                     or (run_id is not None and (parsed.get("run_id", parsed.get("binding_id", parsed.get("context_binding_id"))) != run_id))):
                 raise RunnerAuthError("invalid runner authentication")
-            if operation not in {"claim", "result-projection", "disclosure-poll", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"} and not self._operational_context_matches(
+            if operation not in {"claim", "result-projection", "disclosure-poll", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim", "context-configured-plan-sync"} and not self._operational_context_matches(
                     self._runner_store().conn, workspace_id=wid, runner_id=runner_id,
                     projection=parsed["operational_projection"]):
                 raise RunnerAuthError("invalid runner authentication")
@@ -1520,13 +1545,24 @@ class _Handler(BaseHTTPRequestHandler):
                 if operation == "context-plan-request-claim":
                     snapshot = context_service.claim_plan_request_in_transaction(wid, runner_id, key_id, run_id, parsed)
                     return RunnerHttpAction(200, snapshot) if snapshot is not None else RunnerHttpAction(204, None)
+                if operation == "context-configured-plan-sync":
+                    return RunnerHttpAction(200, ConfiguredPlanService(
+                        store.conn, signing=self.cp.grant_authority,
+                    ).sync_in_transaction(wid, runner_id, key_id, run_id, parsed))
                 if operation == "context-approval-projections":
+                    if parsed["context_binding_id"] != run_id:
+                        raise RunnerAuthError("invalid runner authentication")
                     binding = context_service.active_binding_for_projection_in_transaction(
                         wid, runner_id, key_id, run_id, parsed["context_binding_digest"],
                     )
-                    response = context_runs.submit_projection_from_runner_in_transaction(
-                        parsed["approval_projection"], binding, uploaded_by_runner_id=runner_id,
-                    )
+                    if parsed["schema_version"] == RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA:
+                        response = context_runs.submit_configured_projection_from_runner_in_transaction(
+                            parsed, binding, uploaded_by_runner_id=runner_id,
+                        )
+                    else:
+                        response = context_runs.submit_projection_from_runner_in_transaction(
+                            parsed["approval_projection"], binding, uploaded_by_runner_id=runner_id,
+                        )
                     if getattr(response, "created", False):
                         context_service._event(binding, "projection_submitted", "runner", runner_id)
                     return RunnerHttpAction(201, response)
@@ -1564,7 +1600,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raw_body=self._raw_body(), headers=all_headers,
                 action=action,
                 chain_name=(
-                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim"}
+                    "claim" if operation in {"claim", "context-list", "context-claim", "context-approval-projections", "context-plan-request-claim", "context-configured-plan-sync"}
                     else f"result:{run_id}" if operation in {"result-projection", "disclosure-poll"}
                     else f"{operation}:{run_id}"
                 ),
@@ -2548,6 +2584,43 @@ class _Handler(BaseHTTPRequestHandler):
             wid, project_ref, binding_id, body, actor=actor, role=role,
         ))
 
+    def _configured_plans(self) -> ConfiguredPlanService:
+        if self.cp.grant_authority is None or self.cp.runner_contexts is None:
+            raise DiscoveryError("discovery_unavailable")
+        return ConfiguredPlanService(self.cp.store.conn, signing=self.cp.grant_authority)
+
+    def _ws_configured_plan_create(self, wid: str, project_ref: str, binding_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        try:
+            body = parse_json(self._raw_body(), max_bytes=2048)
+        except ValueError:
+            raise DiscoveryError("invalid_configured_plan_request") from None
+        self._json(201, self._configured_plans().create(wid, project_ref, binding_id, body, actor=actor, role=role))
+
+    def _ws_configured_plan_list(self, wid: str, project_ref: str) -> None:
+        user_id = self._discovery_scope(wid, project_ref)
+        self._json(200, self._configured_plans().list_recent(wid, project_ref, actor=user_id))
+
+    def _ws_configured_plan_view(self, wid: str, project_ref: str, plan_request_id: str) -> None:
+        user_id = self._discovery_scope(wid, project_ref)
+        self._json(200, self._configured_plans().view(wid, project_ref, plan_request_id, actor=user_id))
+
+    def _ws_configured_plan_for_run(self, wid: str, project_ref: str, run_id: str) -> None:
+        user_id = self._discovery_scope(wid, project_ref)
+        self._json(200, self._configured_plans().view_for_run(wid, project_ref, run_id, actor=user_id))
+
+    def _ws_configured_plan_cancel(self, wid: str, project_ref: str, plan_request_id: str) -> None:
+        self._discovery_scope(wid, project_ref)
+        actor, role, _ = self._recent_owner_admin_context(wid)
+        try:
+            body = parse_json(self._raw_body(), max_bytes=256)
+        except ValueError:
+            raise DiscoveryError("invalid_configured_plan_request") from None
+        if body != {"schema_version": "heel.configured-plan-request-cancel.v1"}:
+            raise DiscoveryError("invalid_configured_plan_request")
+        self._json(200, self._configured_plans().cancel(wid, project_ref, plan_request_id, actor=actor, role=role))
+
     def _ws_runner_context_list(self, wid: str, project_ref: str) -> None:
         self._runner_context_human_path_exact()
         kind, user_id, _ = self._principal()
@@ -2572,15 +2645,21 @@ class _Handler(BaseHTTPRequestHandler):
         actor, role, recent_auth_at_ms = self._recent_owner_admin_context(wid)
         runs, _ = self._human_canary_services()
         body = self._body()
-        if (
+        review = None
+        if body.get("schema_version") == "heel.canary-execution-approval.v2":
+            if set(body) != {"schema_version", "projection_digest", "hostname_retype", "reason", "condition_review"}:
+                raise CanaryRunError("invalid_canary_approval")
+            review = body["condition_review"]
+            if type(review) is not dict:
+                raise CanaryRunError("configured_review_mismatch")
+        elif (
             set(body) != {
                 "schema_version", "projection_digest", "hostname_retype", "reason",
             }
             or body.get("schema_version") != "heel.canary-execution-approval.v1"
-            or not all(type(body.get(name)) is str for name in (
-                "projection_digest", "hostname_retype", "reason",
-            ))
         ):
+            raise CanaryRunError("invalid_canary_approval")
+        if not all(type(body.get(name)) is str for name in ("projection_digest", "hostname_retype", "reason")):
             raise CanaryRunError("invalid_canary_approval")
         idempotency = self._header_values("Idempotency-Key")
         if len(idempotency) != 1 or _CANARY_IDEMPOTENCY.fullmatch(idempotency[0]) is None:
@@ -2597,6 +2676,7 @@ class _Handler(BaseHTTPRequestHandler):
             recent_auth_at_ms=recent_auth_at_ms,
             idempotency_key=idempotency[0],
             expected_kill_switch_generation=self._expected_control_generation(),
+            condition_review=review,
         )
         self._json(201, result)
 
@@ -2684,7 +2764,7 @@ class _Handler(BaseHTTPRequestHandler):
             return unavailable
         try:
             approval = self._verified_stored_canary_contract(
-                row["projection_json"], validate_approval_projection,
+                row["projection_json"], validate_runner_approval_projection,
             )
             self._verify_stored_runner_signature(approval, row["public_key"])
             if (
@@ -2696,7 +2776,7 @@ class _Handler(BaseHTTPRequestHandler):
                 or approval["manifest_digest"] != row["manifest_digest"]
             ):
                 raise ValueError("stored canary approval binding mismatch")
-            scenarios = approval["scenarios"]
+            scenarios = approval["test_instances"] if approval["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA else approval["scenarios"]
             maximum_requests = approval["budgets"]["maximum_requests"]
             maximum_wall_ms = approval["budgets"]["wall_timeout_ms"]
             progress = {
@@ -2813,8 +2893,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _canary_run_binding(self, wid: str, project_ref: str, run_id: str) -> sqlite3.Row:
         row = self.cp.store.conn.execute(
-            "SELECT runner_id,runner_key_id FROM canary_runs WHERE workspace_id=? "
-            "AND project_ref=? AND run_id=?",
+            "SELECT r.runner_id,r.runner_key_id,a.projection_json FROM canary_runs r "
+            "JOIN canary_approval_projections a ON a.workspace_id=r.workspace_id "
+            "AND a.project_ref=r.project_ref AND a.approval_id=r.approval_id WHERE r.workspace_id=? "
+            "AND r.project_ref=? AND r.run_id=?",
             (wid, project_ref, run_id),
         ).fetchone()
         if row is None:
@@ -2836,7 +2918,7 @@ class _Handler(BaseHTTPRequestHandler):
             run_id,
             runner_id=binding["runner_id"],
             runner_key_id=binding["runner_key_id"],
-            projection_schema_version=CANARY_FINDINGS_SCHEMA,
+            projection_schema_version=findings_schema_for_approval(binding["projection_json"]),
             projection_digest=digest,
             byte_count=byte_count,
             scenario_count=scenario_count,
@@ -2847,7 +2929,7 @@ class _Handler(BaseHTTPRequestHandler):
             project_ref,
             run_id,
             request_id=preview["request_id"],
-            projection_schema_version=CANARY_FINDINGS_SCHEMA,
+            projection_schema_version=findings_schema_for_approval(binding["projection_json"]),
             projection_digest=digest,
             byte_count=byte_count,
             scenario_count=scenario_count,
@@ -2873,7 +2955,7 @@ class _Handler(BaseHTTPRequestHandler):
             run_id,
             runner_id=binding["runner_id"],
             runner_key_id=binding["runner_key_id"],
-            projection_schema_version=CANARY_FINDINGS_SCHEMA,
+            projection_schema_version=findings_schema_for_approval(binding["projection_json"]),
             projection_digest=digest,
             byte_count=byte_count,
             scenario_count=scenario_count,

@@ -108,26 +108,26 @@ it("rejects a runner revoke result outside the typed contract and names the refu
   await expect(refused.revokeRunner(workspace, "runner-a")).rejects.toMatchObject({ code: "invalid_runner_revocation", status: 400 });
 });
 
-// The 1.3.0rc5 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC5.md ("Customer install
+// The 1.3.0rc6 customer install command, verbatim from docs/RUNNER_PREVIEW_RELEASE_RC6.md ("Customer install
 // command"), pinned here rather than read from the runbook. It may be deployed only after the release owner's anonymous
-// verify-public for v1.3.0rc5 passes. Every self-serve install surface shows this one command.
-const RC5_WHEEL_SHA256 = "a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226";
-const RC5_RUNBOOK_INSTALL = "python3 -m venv heel-rc5 && ./heel-rc5/bin/python -m pip --isolated install "
-  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc5/heel_sim-1.3.0rc5-py3-none-any.whl#sha256=${RC5_WHEEL_SHA256}'`
-  + " && ./heel-rc5/bin/heel --version";
+// verify-public for v1.3.0rc6 passes. Every self-serve install surface shows this one command.
+const RC6_WHEEL_SHA256 = "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0";
+const RC6_RUNBOOK_INSTALL = "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install "
+  + `'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=${RC6_WHEEL_SHA256}'`
+  + " && ./heel-rc6/bin/heel --version";
 
-it("the dashboard pairing card, /runner and /agent show the exact rc5 runbook install line", async () => {
-  const { RUNNER_RC5_INSTALL, RUNNER_RC5_CLI, RUNNER_RC5_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
-  assert.equal(RUNNER_RC5_INSTALL, RC5_RUNBOOK_INSTALL);
-  assert.equal(RUNNER_RC5_CLI, "./heel-rc5/bin/heel");
-  assert.equal(RUNNER_RC5_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc5");
+it("the dashboard pairing card, /runner and /agent show the exact rc6 runbook install line", async () => {
+  const { RUNNER_RC6_INSTALL, RUNNER_RC6_CLI, RUNNER_RC6_RELEASE_URL } = await import("../components/canary/RunnerPairingCard");
+  assert.equal(RUNNER_RC6_INSTALL, RC6_RUNBOOK_INSTALL);
+  assert.equal(RUNNER_RC6_CLI, "./heel-rc6/bin/heel");
+  assert.equal(RUNNER_RC6_RELEASE_URL, "https://github.com/ancilis/heel/releases/tag/v1.3.0rc6");
   const runner = await readFile(join(process.cwd(), "app/runner/page.tsx"), "utf8");
-  assert.ok(runner.includes(RC5_RUNBOOK_INSTALL));
+  assert.ok(runner.includes(RC6_RUNBOOK_INSTALL));
   assert.doesNotMatch(runner, /heel-rc[1234]\/|releases\/(tag|download)\/v1\.3\.0rc[234]/);
   const agent = await readFile(join(process.cwd(), "app/agent/page.tsx"), "utf8");
   assert.doesNotMatch(agent, /releases\/(tag|download)\/v1\.3\.0rc[1234]|heel-rc[1234]\b/);
-  assert.ok(agent.includes(`const PUBLIC_WHEEL_SHA256 = "${RC5_WHEEL_SHA256}";`));
-  assert.match(agent, /releases\/download\/v1\.3\.0rc5\/heel_sim-1\.3\.0rc5-py3-none-any\.whl#sha256=\$\{PUBLIC_WHEEL_SHA256\}/);
+  assert.ok(agent.includes(`const PUBLIC_WHEEL_SHA256 = "${RC6_WHEEL_SHA256}";`));
+  assert.match(agent, /releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=\$\{PUBLIC_WHEEL_SHA256\}/);
 });
 
 it("discovers only a closed pending approval summary", async () => {
@@ -839,7 +839,7 @@ describe("disclosure state and synchronized findings reads", () => {
     const value = await api.getFindings(workspace, project, run);
     expect(calls).toEqual([findingsPath]);
     expect(value).toEqual(findings());
-    expect(Object.isFrozen(value.scenario_results[0].finding)).toBe(true);
+    expect(value.schema_version === "heel.canary-findings-projection.v1" && Object.isFrozen(value.scenario_results[0].finding)).toBe(true);
 
     const aborted = new AbortController();
     aborted.abort();
@@ -872,11 +872,12 @@ describe("scenario library and run-frozen bindings", () => {
     mechanism_id: "route-access", applicability: "unknown", applicability_rule: "always", evidence_state: "inferred",
     execution_support: "runner_supported", catalog_scenario_id: "anonymous_authenticated_read", binding_version: 1,
     coverage_statement: "Executed check: anonymous_authenticated_read (GET/HEAD, roles anonymous and authenticated).",
-    prerequisites: ["methods: GET, HEAD"], ...overrides,
+    prerequisites: ["methods: GET, HEAD"], live_test: null,
+    live_support: overrides.source === "custom" ? "static_only" : "template_only", ...overrides,
   });
   const listing = (rows: unknown[] = [libraryRow()]) => ({
     schema_version: "heel.scenario-library.v1", library_digest: "f".repeat(64), engine_version: "1.3.0rc4", binding_version: 1,
-    custom_coverage_statements: coverage, scenarios: rows,
+    custom_coverage_statements: coverage, live_test_coverage_statements: coverage, scenarios: rows,
   });
   const frozen = {
     catalog_scenario_id: "anonymous_authenticated_read", method: "GET", route_template: "/api/canary",
@@ -977,4 +978,21 @@ describe("scenario library and run-frozen bindings", () => {
       libraryScenarioId: "sc.endpoint.hidden", source: "library", definitionDigest: digest }])).rejects.toMatchObject({ code: "run_bindings_frozen", status: 409 });
     await expect(api.freezeRunScenarioBindings(workspace, project, run, "b".repeat(64), [])).rejects.toMatchObject({ code: "invalid_request" });
   });
+});
+
+it("a configured run's disclosure permit (v2 findings projection) is accepted; an unknown version is refused", async () => {
+  const permitFor = (schema: string) => ({
+    schema_version: "heel.disclosure-permit.v1", permit_id: "cdp_0123456789abcdef0123456789abcdef",
+    workspace_id: workspace, project_id: project, run_id: run, grant_id: "cgr_0123456789abcdef0123456789abcdef",
+    runner_binding: { runner_id: "runr_0123456789abcdef0123456789abcdef", runner_key_id: "key_0123456789abcdef" },
+    projection: { schema_version: schema, projection_digest: digest, maximum_bytes: 1024, scenario_count: 2, finding_count: 1 },
+    approved_by: "usr_0123456789abcdef", approved_at_ms: 1, issued_at_ms: 1, expires_at_ms: 600001,
+    permit_nonce: "nonce_0123456789abcdef", permit_digest: "b".repeat(64), signing_key_id: "cloud_0123456789abcdef", signature_b64: "A".repeat(86) + "==",
+  });
+  const metadata = { projectionDigest: digest, projectionBytes: 1024, scenarioCount: 2, findingCount: 1 };
+  const v2 = new CanaryApi({ transport: async () => jsonResponse(permitFor("heel.canary-findings-projection.v2"), 201) });
+  const accepted = await v2.createDisclosurePermit(workspace, project, run, metadata) as { projection: { schema_version: string } };
+  assert.equal(accepted.projection.schema_version, "heel.canary-findings-projection.v2");
+  const v3 = new CanaryApi({ transport: async () => jsonResponse(permitFor("heel.canary-findings-projection.v3"), 201) });
+  await assert.rejects(() => v3.createDisclosurePermit(workspace, project, run, metadata), /invalid canary response/);
 });

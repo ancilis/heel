@@ -1793,6 +1793,51 @@ describe("CUSTOMER-TRACK-UX: a new customer registers one target through the exi
     expectNoRunnerDefault();
   });
 
+  test("signed out, the dashboard offers the no-account static sample separately from real target setup", async () => {
+    render(<Dashboard />);
+    await screen.findByRole("heading", { name: "Create your Heel account" });
+    const sample = screen.getByRole("link", { name: "Try the static sample — no account" });
+    expect(sample.getAttribute("href")).toBe("/");
+    expect(sample.closest("p")?.textContent).toMatch(/browser-only example that never contacts a target or changes this account/);
+    expect(screen.getByRole("link", { name: "paired runner guide" }).getAttribute("href")).toBe("/guide");
+  });
+
+  test("a pasted root slash and uppercase host start the proof with exactly the canonical origin", async () => {
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Customer staging");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await screen.findByRole("heading", { name: "Add target" });
+    await waitFor(() => expect(nav.search).toMatch(/^workspace=ws_[0-9a-f]{16}&project=prj_[0-9a-f]{32}$/));
+    const { ws, prj } = selection();
+
+    fill(/target url/i, "  https://Staging.Customer.Example.test/  ");
+    expect(screen.getByText(TARGET).closest("p")?.textContent).toBe(`Heel will register ${TARGET}.`);
+    fireEvent.click(screen.getByRole("button", { name: "Create ownership proof" }));
+    await screen.findByText(/^Target verification pending\./);
+    const starts = server.calls.filter((call) => call.method === "POST" && call.path === `/api/control-plane/v1/workspaces/${ws}/projects/${prj}/environments`);
+    expect(starts).toHaveLength(1);
+    expect(JSON.parse(starts[0].body).origin).toBe(TARGET);
+  });
+
+  test("an origin with a path is explained at the field and sends no request", async () => {
+    await signUp();
+    await screen.findByText("Create a project first.");
+    fill(/new project/i, "Customer staging");
+    fireEvent.click(screen.getByRole("button", { name: "Create project" }));
+    await screen.findByRole("heading", { name: "Add target" });
+    const before = server.calls.length;
+
+    fill(/target url/i, `${TARGET}/login`);
+    const input = screen.getByLabelText(/target url/i);
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(document.getElementById(input.getAttribute("aria-describedby") ?? "")?.textContent).toMatch(/^Remove the path\./);
+    const button = screen.getByRole("button", { name: "Create ownership proof" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(server.calls.slice(before).filter((call) => call.method !== "GET")).toEqual([]);
+  });
+
   test("a proof start that settles after the session ended elsewhere restores nothing, even after signing in again", async () => {
     const account = server.account(EMAIL, SECRET, [{ role: "owner", projects: ["Customer staging"] }]);
     server.session = account;
@@ -2285,13 +2330,13 @@ describe("CUSTOMER-LOCAL-PAIRING-UI: a new customer pairs and revokes a local ru
     const { ws } = verifiedOwner();
     render(<Dashboard />);
     const card = await pairCard();
-    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc5\/heel_sim-1\.3\.0rc5-py3-none-any\.whl#sha256=a7c7293be3e30f1c3fb6fd968ab16c2845ebaae34d4fe3bcb2ddfd54855aa226' && \.\/heel-rc5\/bin\/heel --version$/)).toBeTruthy();
-    expect((within(card).getByRole("link", { name: "Heel 1.3.0rc5 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc5");
+    expect(within(card).getByText(/pip --isolated install 'heel-sim\[runner\] @ https:\/\/github\.com\/ancilis\/heel\/releases\/download\/v1\.3\.0rc6\/heel_sim-1\.3\.0rc6-py3-none-any\.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && \.\/heel-rc6\/bin\/heel --version$/)).toBeTruthy();
+    expect((within(card).getByRole("link", { name: "Heel 1.3.0rc6 release" }) as HTMLAnchorElement).href).toBe("https://github.com/ancilis/heel/releases/tag/v1.3.0rc6");
     expect(within(card).queryByRole("textbox", { name: /credential|secret|password|token/i })).toBeNull();
     const mark = server.calls.length;
 
     const token = await createInvitation();
-    expect(within(card).getByText(`./heel-rc5/bin/heel runner pair --origin https://heel.example --invite ${token}`)).toBeTruthy();
+    expect(within(card).getByText(`./heel-rc6/bin/heel runner pair --origin https://heel.example --invite ${token}`)).toBeTruthy();
     expect(card.textContent).not.toContain("<dashboard-origin>");
     expect(within(card).getByText(/before \d{1,2}:\d{2}/)).toBeTruthy();
     expectTokenOnlyOnScreen(token);

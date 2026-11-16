@@ -42,6 +42,17 @@ from heel.canary_contracts import (
     validate_runner_context_binding,
     validate_canary_disclosure_state,
     validate_runner_disclosure_poll_request,
+    CONFIGURED_RUNNER_CAPABILITY,
+    RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA,
+    RUNNER_CONFIGURED_PLAN_SYNC_SCHEMA,
+    RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA,
+    findings_results,
+    validate_runner_approval_projection,
+    validate_runner_configured_plan_sync,
+    validate_runner_configured_plan_sync_result,
+    validate_runner_configured_projection_submit,
+    validate_runner_findings,
+    validate_runner_projection_submission,
 )
 from heel.crypto import ed25519_key_id, verify_envelope
 from heel.runner.runtime import (
@@ -281,7 +292,7 @@ _STOPS = {
 _MAX_FINDINGS_UPLOAD_BYTES = 272 * 1024
 _CALL_DIAGNOSTIC_OPERATIONS = frozenset({
     "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings", "poll-disclosure",
-    "list-contexts", "claim-context", "submit-context-approval-projection",
+    "list-contexts", "claim-context", "submit-context-approval-projection", "configured-plan-sync",
 })
 _MAX_CALL_DIAGNOSTICS = 128
 _MAX_TRACKED_RUNS = 64
@@ -290,7 +301,7 @@ _FINDINGS_RECEIPT_FIELDS = {
     "grant_id", "permit_id", "projection_id", "projection_digest", "byte_count",
     "scenario_count", "finding_count", "accepted_at_ms", "status",
 }
-_SUPERSEDABLE_CLAIM_CHAIN_OPERATIONS = frozenset({"list-contexts", "claim-context", "claim"})
+_SUPERSEDABLE_CLAIM_CHAIN_OPERATIONS = frozenset({"list-contexts", "claim-context", "configured-plan-sync", "claim"})
 _DEFAULT_RETRY_AFTER_MS = 60_000
 _MIN_RETRY_AFTER_MS = 1_000
 _MAX_RETRY_AFTER_MS = 300_000
@@ -472,6 +483,7 @@ class RunnerControlClient:
             "list-contexts": (200, "heel.runner-context-list-result.v1"),
             "claim-context": (200, "heel.runner-context-claim-result.v1"),
             "submit-context-approval-projection": (201, "heel.canary-projection-submitted.v1"),
+            "configured-plan-sync": (200, RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA),
         }
         if operation not in shapes or pending.chain_operation != "claim" or pending.run_id is not None:
             raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
@@ -487,7 +499,13 @@ class RunnerControlClient:
         elif operation == "claim-context":
             if validate_runner_context_claim(request) != request:
                 raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
-        elif validate_runner_approval_projection_submit(request) != request:
+        elif operation == "configured-plan-sync":
+            try:
+                if validate_runner_configured_plan_sync(request) != request:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise RunnerRuntimeCorrupt("runtime pending context call is invalid") from None
+        elif validate_runner_projection_submission(request) != request:
             raise RunnerRuntimeCorrupt("runtime pending context call is invalid")
         status, headers, payload = self._closed_transport_response(
             self.transport.post(pending.path, headers=dict(pending.headers), body=pending.body),
@@ -531,6 +549,8 @@ class RunnerControlClient:
                         or type(item["claimed"]) is not bool
                     ):
                         raise ValueError
+            elif operation == "configured-plan-sync":
+                self._check_configured_sync_result(payload)
             elif operation == "claim-context":
                 if set(payload) != {"schema_version", "context_binding", "claimed_at_ms"} or (
                     type(payload["claimed_at_ms"]) is not int or payload["claimed_at_ms"] < 0
@@ -592,7 +612,7 @@ class RunnerControlClient:
         if current != pending:
             raise RunnerRuntimeCorrupt("runtime pending call changed during replay")
         if pending.request_operation in {
-            "list-contexts", "claim-context", "submit-context-approval-projection",
+            "list-contexts", "claim-context", "submit-context-approval-projection", "configured-plan-sync",
         }:
             return self._replay_context_pending(current, now_ms=now_ms)
         if pending.request_operation in _RUN_OPERATIONS:
@@ -856,7 +876,7 @@ class RunnerControlClient:
                 or body["projection_id"] != findings["projection_id"]
                 or body["projection_digest"] != findings["projection_digest"]
                 or body["byte_count"] != projection_bytes
-                or body["scenario_count"] != len(findings["scenario_results"])
+                or body["scenario_count"] != len(findings_results(findings))
                 or body["finding_count"] != finding_count
             ):
                 raise ValueError("invalid runner findings receipt")
@@ -1040,7 +1060,7 @@ class RunnerControlClient:
         if status != 200 or not isinstance(body, dict) or set(body) != fields:
             raise ValueError("invalid runner claim response")
         try:
-            projection = validate_approval_projection(body["approval_projection"])
+            projection = validate_runner_approval_projection(body["approval_projection"])
             grant = validate_execution_grant(body["grant"])
         except (TypeError, ValueError):
             raise ValueError("invalid runner claim response") from None
@@ -1532,6 +1552,8 @@ class RunnerControlClient:
                         or binding["runner_binding"]["runner_key_id"] != self.signer.key_id
                         or binding["binding_id"] != request["binding_id"] or binding["binding_digest"] != request["binding_digest"]):
                     raise ValueError
+            elif schema == RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA:
+                self._check_configured_sync_result(payload)
             elif schema == "heel.canary-projection-submitted.v1":
                 if set(payload) != {"schema_version", "approval_id", "run_id", "status", "projection_digest"} or payload["status"] not in {"awaiting_execution_approval", "approved", "cancelled", "expired"}:
                     raise ValueError
@@ -1669,6 +1691,44 @@ class RunnerControlClient:
             request, expected_status=201, schema="heel.canary-projection-submitted.v1", diagnostic_operation="submit-context-approval-projection",
         )
 
+    @staticmethod
+    def _check_configured_sync_result(payload: object) -> None:
+        if validate_runner_configured_plan_sync_result(payload) != payload:
+            raise ValueError
+
+    def configured_plan_sync(self, binding_id: str, binding_digest: str, readiness: object | None) -> dict:
+        """Exchange the bound context's open configured request and this runner's readiness.
+
+        Rides the PoP claim chain exactly like the other context calls; values are never sent,
+        only bounded requirement states for the request's own instances.
+        """
+        request = validate_runner_configured_plan_sync({
+            "schema_version": RUNNER_CONFIGURED_PLAN_SYNC_SCHEMA, "binding_id": binding_id,
+            "binding_digest": binding_digest, "capability": CONFIGURED_RUNNER_CAPABILITY,
+            "readiness": readiness,
+        })
+        return self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/configured-plan-requests/sync",
+            request, expected_status=200, schema=RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA,
+            diagnostic_operation="configured-plan-sync",
+        )
+
+    def submit_configured_projection(
+        self, binding_id: str, binding_digest: str, plan_request_id: str, plan_request_nonce: str,
+        approval_projection: object,
+    ) -> dict:
+        request = validate_runner_configured_projection_submit({
+            "schema_version": RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA,
+            "context_binding_id": binding_id, "context_binding_digest": binding_digest,
+            "plan_request_id": plan_request_id, "plan_request_nonce": plan_request_nonce,
+            "approval_projection": approval_projection,
+        })
+        return self._context_control(
+            f"/v1/workspaces/{self.workspace_id}/runners/{self.runner_id}/contexts/{binding_id}/approval-projections",
+            request, expected_status=201, schema="heel.canary-projection-submitted.v1",
+            diagnostic_operation="submit-context-approval-projection",
+        )
+
     def _heartbeat_closed(self, run_id: str, operational_projection: object):
         return self._closed_control("heartbeat", run_id, operational_projection)
 
@@ -1710,12 +1770,12 @@ class RunnerControlClient:
     ):
         try:
             permit_value = validate_disclosure_permit(permit)
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
         except (TypeError, ValueError):
             raise ValueError("invalid runner findings upload") from None
         projection_bytes = canonical_bytes(findings)
         finding_count = sum(
-            item["finding"] is not None for item in findings["scenario_results"]
+            item["finding"] is not None for item in findings_results(findings)
         )
         if (
             permit_value["workspace_id"] != self.workspace_id
@@ -1731,7 +1791,7 @@ class RunnerControlClient:
                 "schema_version": findings["schema_version"],
                 "projection_digest": findings["projection_digest"],
                 "maximum_bytes": len(projection_bytes),
-                "scenario_count": len(findings["scenario_results"]),
+                "scenario_count": len(findings_results(findings)),
                 "finding_count": finding_count,
             }
         ):
@@ -1881,7 +1941,7 @@ class RunnerControlClient:
 
     def _disclosure_poll_body(self, run_id: str, findings_projection: object) -> tuple[dict[str, Any], bytes]:
         try:
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
             self._verify_projection_signature(findings)
         except (TypeError, ValueError):
             raise ValueError("invalid runner disclosure poll") from None
@@ -1893,9 +1953,9 @@ class RunnerControlClient:
                 "schema_version": findings["schema_version"],
                 "projection_digest": findings["projection_digest"],
                 "byte_count": len(canonical_bytes(findings)),
-                "scenario_count": len(findings["scenario_results"]),
+                "scenario_count": len(findings_results(findings)),
                 "finding_count": sum(
-                    item["finding"] is not None for item in findings["scenario_results"]
+                    item["finding"] is not None for item in findings_results(findings)
                 ),
             },
         })
@@ -2035,7 +2095,7 @@ class RunnerControlClient:
         if type(run_id) is not str or not run_id:
             raise ValueError("invalid runner findings upload")
         try:
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
             self._verify_projection_signature(findings)
         except (TypeError, ValueError):
             raise ValueError("invalid runner findings upload") from None
@@ -2190,6 +2250,11 @@ class RunnerControlClient:
                     validate_runner_claim_request(request) == request
                     and request == {"schema_version": "heel.runner-claim-request.v1"}
                     and pending.path == f"{prefix}/claim"
+                )
+            elif operation == "configured-plan-sync":
+                exact = (
+                    validate_runner_configured_plan_sync(request) == request
+                    and pending.path == f"{prefix}/contexts/{request['binding_id']}/configured-plan-requests/sync"
                 )
             else:
                 exact = (

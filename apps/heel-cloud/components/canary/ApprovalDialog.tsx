@@ -4,6 +4,8 @@
 
 import { useState } from "react";
 
+import type { ConfiguredApprovalView } from "../../lib/canary-api";
+import { COMPARISON_LABELS, conditionText, roleText, successCheckText } from "../../lib/live-test-text";
 import { ScenarioBindingStep, type ScenarioBindingStepProps } from "./ScenarioBindingStep";
 
 
@@ -19,6 +21,8 @@ export interface ApprovalDialogProps {
   onClose: () => void;
   /** Optional selection-provenance step; approval never depends on it. */
   scenarioBinding?: ScenarioBindingStepProps;
+  /** A configured plan's frozen conditions; approving then requires an explicit review of each. */
+  configured?: ConfiguredApprovalView | null;
 }
 
 
@@ -33,13 +37,16 @@ export function ApprovalDialog({
   onApprove,
   onClose,
   scenarioBinding,
+  configured = null,
 }: ApprovalDialogProps) {
   const [hostname, setHostname] = useState("");
   const [reason, setReason] = useState("");
+  const [reviewed, setReviewed] = useState(false);
   if (!open) return null;
 
   const exactHostname = new URL(origin).hostname;
-  const canApprove = hostname === exactHostname && reason.trim().length >= 4;
+  const canApprove = hostname === exactHostname && reason.trim().length >= 4 && (configured === null || reviewed);
+  const plannedReads = configured === null ? null : configured.instances.reduce((sum, item) => sum + item.requestCount, 0);
 
   return (
     <div className="canary-dialog-backdrop" role="presentation">
@@ -72,6 +79,37 @@ export function ApprovalDialog({
             <div><span>Scenarios</span><ul>{scenarios.map((scenario) => <li key={scenario}>{scenario}</li>)}</ul></div>
           </div>
         </fieldset>
+
+        {configured !== null ? (
+          <fieldset className="immutable-summary configured-review" aria-describedby="configured-review-note">
+            <legend>{configured.planKind === "configured_regression" ? "Saved regression to replay" : "Configured live tests in this signed plan"}</legend>
+            <p id="configured-review-note">
+              {plannedReads} planned reads ({requestBudget}-request signed ceiling). Each test reads one route once per role and
+              reports only whether its condition held for the restricted role after the control read succeeded. Expected values
+              stay on your runner; only their names appear here.
+            </p>
+            <ol aria-label="Configured tests to approve">
+              {configured.instances.map((item) => (
+                <li key={item.testInstanceId}>
+                  <h3><code>{item.source.sourceScenarioId}</code> revision {item.source.sourceRevision}</h3>
+                  <dl>
+                    <div><dt>Comparison</dt><dd>{COMPARISON_LABELS[item.scenarioId]}</dd></div>
+                    <div><dt>Route</dt><dd><code>{item.method} {item.routeTemplate}</code></dd></div>
+                    <div><dt>Roles (restricted, then control)</dt><dd>{item.roles.map((role) => roleText(role, configured.planLabels)).join(" → ")}</dd></div>
+                    <div><dt>Requests</dt><dd>{item.requestCount}</dd></div>
+                    <div><dt>Successful response check</dt><dd>{successCheckText(item.assertion)}</dd></div>
+                    <div><dt>Condition tested</dt><dd>{conditionText(item.assertion)}</dd></div>
+                    <div><dt>Local values (names only)</dt><dd>{item.localInputRefs.join(", ")}</dd></div>
+                  </dl>
+                </li>
+              ))}
+            </ol>
+            <label className="configured-review-ack">
+              <input checked={reviewed} onChange={(event) => setReviewed(event.target.checked)} type="checkbox" />
+              I reviewed every route, role pair and condition above; approve exactly these.
+            </label>
+          </fieldset>
+        ) : null}
 
         {scenarioBinding ? <ScenarioBindingStep {...scenarioBinding} /> : null}
 

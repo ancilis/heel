@@ -642,7 +642,7 @@ def test_runtime_upgrades_v1_metadata_without_rewriting_existing_sealed_rows(tmp
     with sqlite3.connect(path) as check:
         # v1 -> v2 -> v3 -> v4 (T2b2R1 recovery records) -> v5 (C retired claims) -> v6 (H2
         # poll-disclosure registration) in one transaction; sealed rows are untouched.
-        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v6"
+        assert check.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v7"
         assert check.execute("SELECT sealed_blob FROM control_chains WHERE chain=?", (chain,)).fetchone()[0] == sealed
     check.close()
 
@@ -1593,12 +1593,12 @@ def test_runtime_v3_to_v4_migration_preserves_every_prior_row_and_rejects_a_tamp
     assert migrated.load_chain("claim", None) == cursor
     assert migrated.load_pending_calls() == (pending,)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v6"
+        assert conn.execute("SELECT schema_version FROM metadata").fetchone()[0] == "heel.runner-runtime-state.v7"
         after = {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
                  for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs")}
         assert after == before
         migrated_metadata = conn.execute("SELECT * FROM metadata").fetchone()
-        assert migrated_metadata[2:] == metadata[2:] and migrated_metadata[1] == "heel.runner-runtime-state.v6"
+        assert migrated_metadata[2:] == metadata[2:] and migrated_metadata[1] == "heel.runner-runtime-state.v7"
         assert conn.execute("SELECT COUNT(*) FROM chain_recovery").fetchone()[0] == 0
     conn.close()
 
@@ -2427,13 +2427,13 @@ def test_runtime_v4_to_v5_upgrade_preserves_every_row_and_rejects_permissive_pre
 
     upgraded = RunnerRuntimeState(variants["plain"], fixture.identity, fixture.signer)
     after = _semantic_rows(variants["plain"])
-    assert after["metadata"][0][1] == "heel.runner-runtime-state.v6"
+    assert after["metadata"][0][1] == "heel.runner-runtime-state.v7"
     assert after["metadata"][0][2:] == before["plain"]["metadata"][0][2:]
     for table in ("control_chains", "pending_calls", "terminal_disclosures", "active_runs", "chain_recovery"):
         assert after[table] == before["plain"][table]
     assert after["retired_claims"] == []
     with contextlib.closing(sqlite3.connect(variants["plain"])) as conn:
-        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V6_SCHEMA_SQL)
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V7_SCHEMA_SQL)
     assert [item.run_id for item in upgraded.load_active_run_controls()] == [fixture.run_id]
     assert len(upgraded.load_superseded_calls()) == 1
 
@@ -2510,8 +2510,27 @@ def test_retire_inactive_claim_seals_active_chains_and_every_pending_core_then_r
     assert reopened.load_retired_claim(fixture.run_id, authenticate_components=True) == record
 
 
+@pytest.mark.parametrize("probe", ["reserved", "RESERVED-enum", "ABSENT-enum"])
+def test_retire_inactive_claim_archives_the_canonical_reservation_observation(tmp_path, probe):
+    """F1(b): the caller may retire a never-activated reserved claim; the sealed archive records the
+    observation as the canonical literal, whatever str-valued object the caller passed."""
+    from heel.runner.store import RunReservationProbe
+
+    value = {
+        "reserved": "reserved", "RESERVED-enum": RunReservationProbe.RESERVED,
+        "ABSENT-enum": RunReservationProbe.ABSENT,
+    }[probe]
+    fixture = _retirable(tmp_path)
+    record = _retire(fixture, probe=value)
+    expected = "absent" if probe == "ABSENT-enum" else "reserved"
+    assert dict(record.local_observations) == {"reservation": expected, "terminal": "absent"}
+    reopened = fixture.runtime.load_retired_claim(fixture.run_id, authenticate_components=True)
+    assert dict(reopened.local_observations) == {"reservation": expected, "terminal": "absent"}
+    assert fixture.runtime.load_active_run_controls() == ()
+
+
 @pytest.mark.parametrize("case", (
-    "changed-snapshot", "unknown-run", "local-terminal", "progress-pending", "reservation-reserved",
+    "changed-snapshot", "unknown-run", "local-terminal", "progress-pending",
     "reservation-journal-pending", "reservation-unresolved", "reservation-not-a-string",
     "chain-recovery-row",
 ))
@@ -2541,7 +2560,7 @@ def test_retire_inactive_claim_rejects_changed_snapshot_terminal_or_non_heartbea
         _stage_run_call(runtime, fixture.signer, fixture.identity, fixture.run_id, "progress", body)
     elif case.startswith("reservation-"):
         kwargs["probe"] = {
-            "reservation-reserved": "reserved", "reservation-journal-pending": "journal_pending",
+            "reservation-journal-pending": "journal_pending",
             "reservation-unresolved": "unresolved", "reservation-not-a-string": object(),
         }[case]
     if case == "chain-recovery-row":
@@ -3408,7 +3427,7 @@ _SERVER_BODY_CAPS = {
     "claim": 256, "list-contexts": 128, "claim-context": 256,
     "heartbeat": 36 * 1024, "progress": 36 * 1024, "stop-ack": 36 * 1024,
     "result": 36 * 1024 + 64 * 1024 + 1024, "submit-context-approval-projection": 69_632,
-    "upload-findings": 272 * 1024, "poll-disclosure": 2 * 1024,
+    "upload-findings": 272 * 1024, "poll-disclosure": 2 * 1024, "configured-plan-sync": 8 * 1024,
 }
 
 
@@ -3512,6 +3531,7 @@ def _claim_chain_path(identity, operation):
         "claim": f"{prefix}/claim", "list-contexts": f"{prefix}/contexts/list",
         "claim-context": f"{prefix}/contexts/rcb_{'b' * 32}/claim",
         "submit-context-approval-projection": f"{prefix}/contexts/rcb_{'b' * 32}/approval-projections",
+        "configured-plan-sync": f"{prefix}/contexts/rcb_{'b' * 32}/configured-plan-requests/sync",
     }[operation]
 
 
@@ -3603,6 +3623,7 @@ def test_pending_body_cap_table_is_the_server_route_budget_and_the_reader_keeps_
     assert _SERVER_BODY_CAPS["result"] == http_api.DISCOVERY_RESULT_MAX_BYTES
     assert _SERVER_BODY_CAPS["upload-findings"] == canary_disclosure.MAX_UPLOAD_BYTES == http_api.MAX_UPLOAD_BYTES
     assert _SERVER_BODY_CAPS["poll-disclosure"] == http_api.RUNNER_DISCLOSURE_POLL_MAX_BYTES
+    assert _SERVER_BODY_CAPS["configured-plan-sync"] == http_api.RUNNER_CONFIGURED_SYNC_MAX_BYTES
     source = inspect.getsource(http_api._Handler._runner_request)
     for literal in (
         '128 if operation == "context-list"', '256 if operation in {"claim", "context-claim"}',
@@ -4322,13 +4343,13 @@ def test_runtime_v5_to_v6_registers_poll_disclosure_and_keeps_every_row_byte_for
 
     upgraded = RunnerRuntimeState(runtime.path, identity, signer)
     after = _semantic_rows(runtime.path)
-    assert after["metadata"][0][1] == "heel.runner-runtime-state.v6"
+    assert after["metadata"][0][1] == "heel.runner-runtime-state.v7"
     assert after["metadata"][0][2:] == before["metadata"][0][2:]
     for table in before:
         if table != "metadata":
             assert after[table] == before[table], table
     with contextlib.closing(sqlite3.connect(runtime.path)) as conn:
-        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V6_SCHEMA_SQL)
+        assert RunnerRuntimeState._schema_matches(conn, runtime_module._V7_SCHEMA_SQL)
     assert upgraded.load_pending_calls() == (staged,)
 
 

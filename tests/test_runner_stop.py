@@ -3245,8 +3245,18 @@ def test_activated_pre_factory_and_terminal_local_runs_never_enter_preactivation
     claim_builder.identity, claim_builder.signer = identity, signer
     claimed = claim_builder._claimed_projection(manifest, projection, grant, claimed_at_ms=2_000)
     if case == "activated-pre-factory":
-        # The executor's activation reserves before any factory or target transport exists.
+        # The executor's activation, before any factory or target transport exists: reserve, log
+        # ``grant_verified`` and move to ``running`` under one activation lock.  (A bare
+        # ``verified``, event-free reservation never activated; F1(b) retires it under a Cloud
+        # attestation instead, tests/test_runner_coordinator.py ``…recovered_reserv…``.)
+        from heel.runner.containment import ContainmentLog
+
         store.reserve_run(grant, retention_expires_at_ms=2_000 + 86_400_000)
+        ContainmentLog(
+            store=store, signer=signer, run_id=run_id, grant_id=grant["grant_id"],
+            manifest_digest=manifest["manifest_digest"], clock_ms=lambda: 2_000,
+        ).append("grant_verified", detail_code="grant_exact")
+        store.transition_run(run_id, "running", now_ms=2_000)
     elif case == "local-terminal":
         LocalCanaryExecutor(
             store=store, identity=identity, signer=signer, trusted_grant_keys=trusted,

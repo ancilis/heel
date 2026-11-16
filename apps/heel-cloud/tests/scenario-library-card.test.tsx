@@ -24,12 +24,13 @@ function row(id: string, overrides: Partial<ScenarioLibraryEntry> = {}): Scenari
     objective: `Objective ${id}`, category: "unintended_endpoints", kind: "endpoint", pack: "core_saas",
     recommendedControl: "control", mechanismId: id, applicability: "unknown", applicabilityRule: "always",
     evidenceState: "inferred", executionSupport: "static_only", catalogScenarioId: null, bindingVersion: null,
-    coverageStatement: null, prerequisites: [], ...overrides,
+    coverageStatement: null, prerequisites: [], liveTest: null,
+    liveSupport: overrides.source === "custom" ? "static_only" : "template_only", ...overrides,
   };
 }
 
 const LIBRARY: ScenarioLibrary = {
-  libraryDigest: "f".repeat(64), engineVersion: "1.3.0rc4", bindingVersion: 1, customCoverageStatements: COVERAGE,
+  libraryDigest: "f".repeat(64), engineVersion: "1.3.0rc4", bindingVersion: 1, customCoverageStatements: COVERAGE, liveTestCoverageStatements: COVERAGE,
   scenarios: [
     row("sc.endpoint.hidden", { executionSupport: "runner_supported", catalogScenarioId: "anonymous_authenticated_read",
       bindingVersion: 1, coverageStatement: "Executed check: anonymous_authenticated_read (GET/HEAD, roles anonymous and authenticated). The library objective beyond this check remains inferred; it is not executed.",

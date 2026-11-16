@@ -549,7 +549,7 @@ def test_has_no_public_generic_request_api():
     control, _, _ = client()
     assert not hasattr(control, "request")
     public = {name for name, value in vars(RunnerControlClient).items() if callable(value) and not name.startswith("_")}
-    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "recover_staged_upload", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
+    assert public == {"claim", "heartbeat", "progress", "result", "upload_findings", "recover_staged_upload", "poll_disclosure", "stop_ack", "start_resync", "complete_resync", "install_rotation_claim", "list_contexts", "claim_context", "submit_context_approval_projection", "configured_plan_sync", "submit_configured_projection", "replay_pending_call", "replay_all_pending", "stage_recovered_result"}
 
 
 def test_replay_receipt_requires_a_fully_authenticated_byte_identical_pop():

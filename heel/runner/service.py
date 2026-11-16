@@ -237,6 +237,11 @@ class RunnerService:
         submit_pending = getattr(self.coordinator, "submit_pending_projection", None)
         if submit_pending is not None:
             submit_pending()
+        # A configured plan the browser requested for this context: report readiness for the
+        # selected tests, or compile and submit it for a separate human approval.
+        configured = getattr(self.coordinator, "process_configured_plan", None)
+        if configured is not None:
+            configured()
         lease = self.coordinator.claim()
         if lease is None:
             # Idle step: advance the metadata-only result handoff (H2 §3.3) at the claim cadence.

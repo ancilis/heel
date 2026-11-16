@@ -14,8 +14,9 @@ from typing import Any, Callable
 
 from heel.canary_contracts import (
     canonical_bytes,
-    validate_canary_findings,
+    findings_results,
     validate_operational_run,
+    validate_runner_findings,
 )
 from heel.crypto import verify_envelope
 from heel.runner.containment import LOCAL_EVENT_CODES
@@ -88,7 +89,7 @@ def validate_local_result_view(
     if value["schema_version"] != _RESULT_SCHEMA:
         raise ValueError("invalid local result view")
     operational = validate_operational_run(value["operational_projection"])
-    findings = validate_canary_findings(value["findings_projection"])
+    findings = validate_runner_findings(value["findings_projection"])
     if trusted_runner_keys is not None:
         _verify_projection_signature(operational, trusted_runner_keys)
         _verify_projection_signature(findings, trusted_runner_keys)
@@ -135,15 +136,15 @@ def validate_disclosure_preview(
         raise ValueError("invalid local disclosure preview")
     if value["schema_version"] != _DISCLOSURE_SCHEMA:
         raise ValueError("invalid local disclosure preview")
-    projection = validate_canary_findings(value["projection"])
+    projection = validate_runner_findings(value["projection"])
     if trusted_runner_keys is not None:
         _verify_projection_signature(projection, trusted_runner_keys)
     if value["projection_digest"] != projection["projection_digest"]:
         raise ValueError("local disclosure digest mismatch")
     if _bounded_integer(value["projection_bytes"], "projection byte count") != len(canonical_bytes(projection)):
         raise ValueError("local disclosure byte count mismatch")
-    scenarios = len(projection["scenario_results"])
-    findings = sum(item["finding"] is not None for item in projection["scenario_results"])
+    scenarios = len(findings_results(projection))
+    findings = sum(item["finding"] is not None for item in findings_results(projection))
     if (
         _bounded_integer(value["scenario_count"], "scenario count") != scenarios
         or _bounded_integer(value["finding_count"], "finding count") != findings

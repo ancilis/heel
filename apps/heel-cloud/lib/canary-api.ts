@@ -139,6 +139,33 @@ export interface CanaryFindingsProjection {
   signature_b64: string;
 }
 
+export type ConfiguredResultReason = string;
+/** One configured instance's bounded result (`heel.canary-findings-projection.v2`). */
+export interface CanaryConfiguredResult {
+  ordinal: number;
+  test_instance_id: string;
+  scenario_id: string;
+  adapter_version: string;
+  source: { source_scenario_id: string; source_revision: number };
+  assertion_digest: string;
+  condition_kind: "json_field_present" | "json_scalar_equals_fixture";
+  route: { method: "GET" | "HEAD"; route_template: string };
+  assessment_outcome: CanaryAssessmentOutcome;
+  reason: ConfiguredResultReason;
+  positive_control: "established" | "not_established";
+  restricted_condition: "true" | "false" | "not_observed";
+  observations: readonly (CanaryFindingObservation & { action_ordinal: number })[];
+  finding: CanaryFinding | null;
+  containment_codes: readonly string[];
+  redaction_count: number;
+  local_evidence_refs: readonly string[];
+}
+export interface CanaryConfiguredFindingsProjection extends Omit<CanaryFindingsProjection, "schema_version" | "scenario_results"> {
+  schema_version: "heel.canary-findings-projection.v2";
+  test_results: readonly CanaryConfiguredResult[];
+}
+export type AnyCanaryFindingsProjection = CanaryFindingsProjection | CanaryConfiguredFindingsProjection;
+
 export interface CanaryApprovalSummary {
   approvalId: string;
   runId: string;
@@ -177,6 +204,8 @@ export interface ScenarioLibraryEntry {
   bindingVersion: 1 | null;
   coverageStatement: string | null;
   prerequisites: readonly string[];
+  liveTest: ScenarioLiveTest | null;
+  liveSupport: ScenarioLiveSupport;
 }
 
 export interface ScenarioLibrary {
@@ -184,13 +213,85 @@ export interface ScenarioLibrary {
   engineVersion: string;
   bindingVersion: 1;
   customCoverageStatements: Readonly<Record<ScenarioBindableCatalogId, string>>;
+  liveTestCoverageStatements: Readonly<Record<ScenarioBindableCatalogId, string>>;
   scenarios: readonly ScenarioLibraryEntry[];
 }
+
+/** Canonical `heel.live-read-assertion.v1`: references are local input NAMES, never values. */
+export type LivePathSegment = string | number;
+export interface LiveReadAssertion {
+  schema_version: "heel.live-read-assertion.v1";
+  success_witness: { path: readonly LivePathSegment[]; expected_fixture: string };
+  condition:
+    | { kind: "json_field_present"; path: readonly LivePathSegment[] }
+    | { kind: "json_scalar_equals_fixture"; path: readonly LivePathSegment[]; expected_fixture: string };
+}
+
+/** A workspace-private revision's configured live read (server-derived digest, references, roles). */
+export interface ScenarioLiveTest {
+  scenarioId: ScenarioBindableCatalogId;
+  method: "GET" | "HEAD";
+  routeTemplate: string;
+  assertion: LiveReadAssertion;
+  assertionDigest: string;
+  localInputRefs: readonly string[];
+  roles: readonly string[];
+  coverageStatement: string;
+  setupSteps: readonly string[];
+}
+
+export type ScenarioLiveSupport = "configured_live_read" | "static_only" | "template_only";
 
 export interface CustomScenarioInput {
   definition: Readonly<Record<string, unknown>>;
   supersedesRevision: number | null;
   executionBinding: null | { catalogScenarioId: ScenarioBindableCatalogId; coverageAck: string };
+  /** Present (even null) selects the v2 request that may carry one configured live test. */
+  liveTest?: null | { scenarioId: ScenarioBindableCatalogId; method: "GET" | "HEAD"; routeTemplate: string; assertion: LiveReadAssertion };
+}
+
+export type ConfiguredReadinessKind = "route" | "role_credential" | "local_input" | "frozen_run";
+export type ConfiguredReadinessState = "ready" | "missing" | "revoked" | "unsupported";
+export interface ConfiguredReadinessRequirement { kind: ConfiguredReadinessKind; subject: string | null; state: ConfiguredReadinessState }
+export interface ConfiguredPlanInstance {
+  testInstanceId: string;
+  scenarioId: ScenarioBindableCatalogId;
+  source: { sourceScenarioId: string; sourceRevision: number };
+  method: "GET" | "HEAD";
+  routeTemplate: string;
+  assertion: LiveReadAssertion;
+  assertionDigest: string;
+  localInputRefs: readonly string[];
+}
+export interface PlanLabel { role: "higher_plan" | "lower_plan"; plan_label: string }
+export interface ConfiguredPlanRequestView {
+  planRequestId: string;
+  bindingId: string;
+  planKind: "configured_live_read" | "configured_regression";
+  status: "open" | "projected" | "approved" | "expired" | "cancelled";
+  instances: readonly ConfiguredPlanInstance[];
+  planLabels: readonly PlanLabel[];
+  sourceRunId: string | null;
+  createdAtMs: number;
+  expiresAtMs: number;
+  runnerSeenAtMs: number | null;
+  readiness: null | { reportedAtMs: number; instances: readonly { testInstanceId: string; requirements: readonly ConfiguredReadinessRequirement[] }[] };
+  approvalId: string | null;
+  runId: string | null;
+  projectionDigest: string | null;
+}
+export type ConfiguredPlanRequestInput =
+  | { planKind: "configured_live_read"; tests: readonly { sourceScenarioId: string; sourceRevision: number }[]; planLabels: readonly PlanLabel[] }
+  | { planKind: "configured_regression"; sourceRunId: string; testInstanceId: string };
+
+/** Exactly what the approver saw for one configured plan; the review acknowledgement restates it. */
+export interface ConfiguredApprovalInstance extends ConfiguredPlanInstance { roles: readonly string[]; requestCount: number }
+export interface ConfiguredApprovalView {
+  planRequestId: string;
+  planKind: "configured_live_read" | "configured_regression";
+  reviewSchema: "heel.configured-condition-review.v1";
+  planLabels: readonly PlanLabel[];
+  instances: readonly ConfiguredApprovalInstance[];
 }
 
 export interface ScenarioPlanAction {
@@ -231,6 +332,8 @@ export interface RunScenarioBindingsView {
 export interface CanaryPendingApprovalRequest extends CanaryApprovalSummary {
   submittedAtMs: number;
   expiresAtMs: number;
+  /** Non-null only for a configured (v3) plan: the frozen conditions the review must restate. */
+  configured: ConfiguredApprovalView | null;
 }
 
 export interface RunnerContextBindingRecord {
@@ -352,6 +455,25 @@ const PUBLIC_MESSAGES = Object.freeze({
   action_not_in_plan: "A selected check is not an action in the signed plan.",
   binding_not_allowed: "That scenario is not bound to the selected runner check.",
   stale_definition: "A selected scenario changed. Reload the library before freezing bindings.",
+  invalid_live_test: "The live test configuration did not pass validation.",
+  live_test_route_unsupported: "Parameterized routes are not supported for configured tests yet. Choose a literal imported route.",
+  live_test_unavailable: "That live test is unavailable. Reload the library.",
+  invalid_configured_plan_request: "Heel could not safely prepare that test request.",
+  plan_labels_required: "Name the lower and higher plans before comparing plans.",
+  custom_revision_not_found: "That private test revision is not in this workspace.",
+  live_test_not_configured: "That revision has no configured live test; it is static only.",
+  configured_request_not_found: "That test request is unavailable in this project.",
+  configured_request_closed: "That test request is no longer open.",
+  configured_source_run_unavailable: "Only a finished configured run of this paired runner can be replayed.",
+  configured_plan_mismatch: "The runner's signed plan did not match the frozen request. Nothing was approved.",
+  configured_review_required: "This plan has configured conditions. Review them in the current dashboard before approving.",
+  configured_review_mismatch: "The displayed conditions no longer match the signed plan. Reload before approving.",
+  plan_request_open: "A test request is already waiting for this runner. Cancel it or wait for it to finish.",
+  runner_context_binding_not_found: "This runner authorization is unavailable. Authorize the paired runner again.",
+  plan_binding_required: "The runner's plan was not bound to this request.",
+  plan_request_consumed: "That test request already produced a plan.",
+  plan_request_expired: "That test request expired. Request it again.",
+  discovery_unavailable: "Heel Cloud is temporarily unavailable. Your local result is unchanged.",
 } as const);
 
 type CanaryErrorCode = keyof typeof PUBLIC_MESSAGES;
@@ -369,7 +491,8 @@ export class CanaryApiError extends Error {
     this.name = "CanaryApiError";
     this.code = safeCode;
     this.status = status;
-    this.details = Object.freeze(safeCode === "invalid_scenario" ? [...details] : []);
+    this.details = Object.freeze(safeCode === "invalid_scenario" || safeCode === "invalid_live_test"
+      || safeCode === "live_test_route_unsupported" ? [...details] : []);
   }
 }
 
@@ -447,8 +570,58 @@ function plainJson(value: unknown, depth = 0): boolean {
     && Object.values(value).every((item) => plainJson(item, depth + 1));
 }
 
+const FIXTURE_REF = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const TEST_INSTANCE_REF = /^lti_[0-9a-f]{32}$/;
+const PLAN_REQUEST_REF = /^cpr_[0-9a-f]{32}$/;
+const ASSERTION_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+function validLivePath(value: unknown): value is LivePathSegment[] {
+  return Array.isArray(value) && value.length >= 1 && value.length <= 8 && value.every((segment) =>
+    (typeof segment === "string" && segment.length >= 1 && segment.length <= 128)
+    || (Number.isInteger(segment) && (segment as number) >= 0 && (segment as number) <= 1023));
+}
+
+function validAssertion(value: unknown): value is LiveReadAssertion {
+  if (!exact(value, ["schema_version", "success_witness", "condition"]) || value.schema_version !== "heel.live-read-assertion.v1"
+    || !exact(value.success_witness, ["path", "expected_fixture"]) || !validLivePath(value.success_witness.path)
+    || typeof value.success_witness.expected_fixture !== "string" || !FIXTURE_REF.test(value.success_witness.expected_fixture)) return false;
+  const condition = value.condition;
+  if (exact(condition, ["kind", "path"])) return condition.kind === "json_field_present" && validLivePath(condition.path);
+  return exact(condition, ["kind", "path", "expected_fixture"]) && condition.kind === "json_scalar_equals_fixture"
+    && validLivePath(condition.path) && typeof condition.expected_fixture === "string" && FIXTURE_REF.test(condition.expected_fixture);
+}
+
+function assertionRefs(assertion: LiveReadAssertion): string[] {
+  const refs = new Set([assertion.success_witness.expected_fixture]);
+  if (assertion.condition.kind === "json_scalar_equals_fixture") refs.add(assertion.condition.expected_fixture);
+  return [...refs].sort();
+}
+
+const CONFIGURED_ROLES: Readonly<Record<ScenarioBindableCatalogId, readonly [string, string]>> = Object.freeze({
+  anonymous_authenticated_read: ["anonymous", "authenticated"],
+  plan_entitlement_read: ["lower_plan", "higher_plan"],
+});
+
+function parseLiveTest(value: unknown): ScenarioLiveTest {
+  if (!exact(value, ["schema_version", "scenario_id", "method", "route_template", "assertion", "assertion_digest", "local_input_refs", "roles", "coverage_statement", "setup_steps"])
+    || value.schema_version !== "heel.custom-live-test.v1" || !BINDABLE_CATALOG_IDS.includes(value.scenario_id as ScenarioBindableCatalogId)
+    || !["GET", "HEAD"].includes(String(value.method)) || typeof value.route_template !== "string" || !ROUTE_TEMPLATE.test(value.route_template)
+    || value.route_template.includes("{") || !validAssertion(value.assertion) || typeof value.assertion_digest !== "string"
+    || !ASSERTION_DIGEST.test(value.assertion_digest) || !Array.isArray(value.local_input_refs)
+    || JSON.stringify(value.local_input_refs) !== JSON.stringify(assertionRefs(value.assertion))
+    || JSON.stringify(value.roles) !== JSON.stringify(CONFIGURED_ROLES[value.scenario_id as ScenarioBindableCatalogId])
+    || !closedString(value.coverage_statement, 512) || !Array.isArray(value.setup_steps) || value.setup_steps.length > 8
+    || !value.setup_steps.every((item) => closedString(item, 256))) invalidResponse();
+  return {
+    scenarioId: value.scenario_id as ScenarioBindableCatalogId, method: value.method as "GET" | "HEAD",
+    routeTemplate: value.route_template, assertion: value.assertion, assertionDigest: value.assertion_digest,
+    localInputRefs: value.local_input_refs as string[], roles: value.roles as string[],
+    coverageStatement: value.coverage_statement as string, setupSteps: value.setup_steps as string[],
+  };
+}
+
 function parseLibraryEntry(value: unknown): ScenarioLibraryEntry {
-  if (!exact(value, ["id", "source", "revision", "definition_digest", "definition", "mechanism_id", "applicability", "applicability_rule", "evidence_state", "execution_support", "catalog_scenario_id", "binding_version", "coverage_statement", "prerequisites"])
+  if (!exact(value, ["id", "source", "revision", "definition_digest", "definition", "mechanism_id", "applicability", "applicability_rule", "evidence_state", "execution_support", "catalog_scenario_id", "binding_version", "coverage_statement", "prerequisites", "live_test", "live_support"])
     || typeof value.id !== "string" || !SCENARIO_ID.test(value.id) || !digest(value.definition_digest)
     || !record(value.definition) || !plainJson(value.definition) || value.definition.id !== value.id
     || !closedString(value.definition.objective, 2000) || !closedString(value.definition.category, 128)
@@ -464,10 +637,14 @@ function parseLibraryEntry(value: unknown): ScenarioLibraryEntry {
     || (bound && (!identifier(value.catalog_scenario_id) || !closedString(value.coverage_statement, 512)))
     || (!bound && value.binding_version !== null)) invalidResponse();
   if (value.source === "library") {
-    if (value.revision !== null || value.evidence_state !== "inferred") invalidResponse();
+    if (value.revision !== null || value.evidence_state !== "inferred" || value.live_test !== null
+      || value.live_support !== "template_only") invalidResponse();
   } else if (value.source === "custom") {
-    if (!integer(value.revision, 1) || value.evidence_state !== "customer_declared") invalidResponse();
+    if (!integer(value.revision, 1) || value.evidence_state !== "customer_declared"
+      || (value.live_test === null) !== (value.live_support === "static_only")
+      || !["static_only", "configured_live_read"].includes(String(value.live_support))) invalidResponse();
   } else invalidResponse();
+  const liveTest = value.live_test === null ? null : parseLiveTest(value.live_test);
   const pack = value.definition.pack;
   return {
     id: value.id, source: value.source as "library" | "custom", revision: value.revision as number | null,
@@ -480,6 +657,116 @@ function parseLibraryEntry(value: unknown): ScenarioLibraryEntry {
     executionSupport: value.execution_support as ScenarioExecutionSupport,
     catalogScenarioId: value.catalog_scenario_id as string | null, bindingVersion: bound ? 1 : null,
     coverageStatement: value.coverage_statement as string | null, prerequisites: value.prerequisites as string[],
+    liveTest, liveSupport: value.live_support as ScenarioLiveSupport,
+  };
+}
+
+function parseSnapshotInstance(value: unknown): ConfiguredPlanInstance {
+  if (!exact(value, ["test_instance_id", "scenario_id", "source", "method", "route_template", "assertion", "assertion_digest", "local_input_refs", "local_input_binding_digest"])
+    || typeof value.test_instance_id !== "string" || !TEST_INSTANCE_REF.test(value.test_instance_id)
+    || !BINDABLE_CATALOG_IDS.includes(value.scenario_id as ScenarioBindableCatalogId)
+    || !exact(value.source, ["source_scenario_id", "source_revision"]) || typeof value.source.source_scenario_id !== "string"
+    || !SCENARIO_ID.test(value.source.source_scenario_id) || !integer(value.source.source_revision, 1)
+    || !["GET", "HEAD"].includes(String(value.method)) || typeof value.route_template !== "string"
+    || !ROUTE_TEMPLATE.test(value.route_template) || !validAssertion(value.assertion)
+    || typeof value.assertion_digest !== "string" || !ASSERTION_DIGEST.test(value.assertion_digest)
+    || JSON.stringify(value.local_input_refs) !== JSON.stringify(assertionRefs(value.assertion))
+    || (value.local_input_binding_digest !== null && !digest(value.local_input_binding_digest))) invalidResponse();
+  return {
+    testInstanceId: value.test_instance_id, scenarioId: value.scenario_id as ScenarioBindableCatalogId,
+    source: { sourceScenarioId: value.source.source_scenario_id, sourceRevision: value.source.source_revision as number },
+    method: value.method as "GET" | "HEAD", routeTemplate: value.route_template, assertion: value.assertion,
+    assertionDigest: value.assertion_digest, localInputRefs: value.local_input_refs as string[],
+  };
+}
+
+function validPlanLabels(value: unknown): value is PlanLabel[] {
+  return Array.isArray(value) && value.length <= 2 && value.every((item) => exact(item, ["role", "plan_label"])
+    && ["higher_plan", "lower_plan"].includes(String(item.role)) && closedString(item.plan_label, 32));
+}
+
+const READINESS_KINDS = new Set(["route", "role_credential", "local_input", "frozen_run"]);
+const READINESS_STATES = new Set(["ready", "missing", "revoked", "unsupported"]);
+
+function parseConfiguredPlanView(value: unknown): ConfiguredPlanRequestView {
+  if (!exact(value, ["schema_version", "plan_request_id", "binding_id", "environment_id", "runner_id", "plan_kind", "status", "instances", "plan_labels", "source_run_id", "created_at_ms", "expires_at_ms", "runner_seen_at_ms", "readiness", "approval_id", "run_id", "projection_digest"])
+    || value.schema_version !== "heel.configured-plan-request-view.v1" || typeof value.plan_request_id !== "string"
+    || !PLAN_REQUEST_REF.test(value.plan_request_id) || typeof value.binding_id !== "string"
+    || !["configured_live_read", "configured_regression"].includes(String(value.plan_kind))
+    || !["open", "projected", "approved", "expired", "cancelled"].includes(String(value.status))
+    || !Array.isArray(value.instances) || value.instances.length < 1 || value.instances.length > 4
+    || !validPlanLabels(value.plan_labels) || (value.source_run_id !== null && (typeof value.source_run_id !== "string" || !RUN_REF.test(value.source_run_id)))
+    || !integer(value.created_at_ms) || !integer(value.expires_at_ms) || !nullableInteger(value.runner_seen_at_ms)
+    || (value.run_id !== null && (typeof value.run_id !== "string" || !RUN_REF.test(value.run_id)))
+    || (value.approval_id !== null && !identifier(value.approval_id))
+    || (value.projection_digest !== null && !digest(value.projection_digest))) invalidResponse();
+  const instances = value.instances.map(parseSnapshotInstance);
+  let readiness: ConfiguredPlanRequestView["readiness"] = null;
+  if (value.readiness !== null) {
+    const raw = value.readiness;
+    if (!exact(raw, ["reported_at_ms", "instances"]) || !integer(raw.reported_at_ms) || !Array.isArray(raw.instances)
+      || raw.instances.length !== instances.length) invalidResponse();
+    readiness = {
+      reportedAtMs: raw.reported_at_ms as number,
+      instances: raw.instances.map((entry, index) => {
+        if (!exact(entry, ["test_instance_id", "requirements"]) || entry.test_instance_id !== instances[index].testInstanceId
+          || !Array.isArray(entry.requirements) || entry.requirements.length > 8) invalidResponse();
+        return {
+          testInstanceId: entry.test_instance_id as string,
+          requirements: entry.requirements.map((item) => {
+            if (!exact(item, ["kind", "subject", "state"]) || !READINESS_KINDS.has(String(item.kind))
+              || !READINESS_STATES.has(String(item.state)) || (item.subject !== null && !closedString(item.subject, 64))) invalidResponse();
+            return { kind: item.kind as ConfiguredReadinessKind, subject: item.subject as string | null, state: item.state as ConfiguredReadinessState };
+          }),
+        };
+      }),
+    };
+  }
+  return deepFreeze({
+    planRequestId: value.plan_request_id, bindingId: value.binding_id,
+    planKind: value.plan_kind as ConfiguredPlanRequestView["planKind"], status: value.status as ConfiguredPlanRequestView["status"],
+    instances, planLabels: value.plan_labels as PlanLabel[], sourceRunId: value.source_run_id as string | null,
+    createdAtMs: value.created_at_ms as number, expiresAtMs: value.expires_at_ms as number,
+    runnerSeenAtMs: value.runner_seen_at_ms as number | null, readiness,
+    approvalId: value.approval_id as string | null, runId: value.run_id as string | null,
+    projectionDigest: value.projection_digest as string | null,
+  });
+}
+
+function parseConfiguredApproval(value: unknown): ConfiguredApprovalView {
+  if (!exact(value, ["plan_request_id", "plan_kind", "review_schema", "plan_labels", "instances"])
+    || typeof value.plan_request_id !== "string" || !PLAN_REQUEST_REF.test(value.plan_request_id)
+    || !["configured_live_read", "configured_regression"].includes(String(value.plan_kind))
+    || value.review_schema !== "heel.configured-condition-review.v1" || !validPlanLabels(value.plan_labels)
+    || !Array.isArray(value.instances) || value.instances.length < 1 || value.instances.length > 4) invalidResponse();
+  const instances = value.instances.map((item): ConfiguredApprovalInstance => {
+    if (!exact(item, ["test_instance_id", "source", "scenario_id", "method", "route_template", "roles", "request_count", "assertion", "assertion_digest", "local_input_refs"])
+      || item.request_count !== 2) invalidResponse();
+    const parsed = parseSnapshotInstance({
+      test_instance_id: item.test_instance_id, scenario_id: item.scenario_id, source: item.source, method: item.method,
+      route_template: item.route_template, assertion: item.assertion, assertion_digest: item.assertion_digest,
+      local_input_refs: item.local_input_refs, local_input_binding_digest: null,
+    });
+    if (JSON.stringify(item.roles) !== JSON.stringify(CONFIGURED_ROLES[parsed.scenarioId])) invalidResponse();
+    return { ...parsed, roles: item.roles as string[], requestCount: 2 };
+  });
+  return { planRequestId: value.plan_request_id, planKind: value.plan_kind as ConfiguredApprovalView["planKind"],
+    reviewSchema: "heel.configured-condition-review.v1", planLabels: value.plan_labels as PlanLabel[], instances };
+}
+
+/** The acknowledgement for a configured approval, rebuilt only from what the dialog displayed. */
+export function configuredConditionReview(view: ConfiguredApprovalView, maximumRequests: number): JsonRecord {
+  return {
+    schema_version: view.reviewSchema,
+    plan_labels: view.planLabels.map((item) => ({ role: item.role, plan_label: item.plan_label })),
+    maximum_requests: maximumRequests,
+    instances: view.instances.map((item) => ({
+      test_instance_id: item.testInstanceId,
+      source: { source_scenario_id: item.source.sourceScenarioId, source_revision: item.source.sourceRevision },
+      scenario_id: item.scenarioId, method: item.method, route_template: item.routeTemplate,
+      roles: [...item.roles], request_count: item.requestCount, assertion: item.assertion,
+      local_input_refs: [...item.localInputRefs],
+    })),
   };
 }
 
@@ -767,7 +1054,8 @@ function validDisclosurePermit(value: unknown, workspaceRef: string, projectRef:
     || !identifier(value.grant_id) || !exact(value.runner_binding, ["runner_id", "runner_key_id"])
     || !identifier(value.runner_binding.runner_id) || !identifier(value.runner_binding.runner_key_id)
     || !exact(value.projection, ["schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"])
-    || value.projection.schema_version !== "heel.canary-findings-projection.v1"
+    // A configured run's permit names the v2 findings projection; the server binds the version to the run.
+    || !["heel.canary-findings-projection.v1", "heel.canary-findings-projection.v2"].includes(String(value.projection.schema_version))
     || !digest(value.projection.projection_digest) || !integer(value.projection.maximum_bytes, 1, 256 * 1024)
     || !integer(value.projection.scenario_count, 0, 4)
     || !integer(value.projection.finding_count, 0, value.projection.scenario_count as number)
@@ -824,6 +1112,51 @@ function validFindings(value: unknown, workspaceRef: string, projectRef: string,
   return totalObservations <= 20;
 }
 
+const CONFIGURED_REASONS = new Set([
+  "restricted_condition_true", "restricted_condition_false", "restricted_empty_denial", "local_input_unavailable", "run_incomplete",
+]);
+
+function validConfiguredFindings(value: unknown, workspaceRef: string, projectRef: string, runRef: string): value is JsonRecord {
+  if (!exact(value, ["schema_version", "projection_id", "run_id", "grant_id", "workspace_id", "project_id", "environment_id", "manifest_digest", "approval_projection_digest", "grant_digest", "engine_version", "adapter_versions", "started_at_ms", "finished_at_ms", "assessment_outcome", "test_results", "containment_codes", "redaction_count", "projection_digest", "signing_key_id", "signature_b64"])
+    || value.schema_version !== "heel.canary-findings-projection.v2" || value.run_id !== runRef
+    || value.workspace_id !== workspaceRef || value.project_id !== projectRef || !identifier(value.projection_id)
+    || !identifier(value.grant_id) || typeof value.environment_id !== "string" || !ENVIRONMENT_REF.test(value.environment_id)
+    || !digest(value.manifest_digest) || !digest(value.approval_projection_digest) || !digest(value.grant_digest)
+    || value.engine_version !== "2" || !sortedUniqueStrings(value.adapter_versions)
+    || !integer(value.started_at_ms) || !integer(value.finished_at_ms) || value.finished_at_ms < value.started_at_ms
+    || !["blocked", "observed", "inconclusive"].includes(String(value.assessment_outcome))
+    || !Array.isArray(value.test_results) || value.test_results.length > 4
+    || !sortedUniqueStrings(value.containment_codes, CONTAINMENT_CODES)
+    || !integer(value.redaction_count) || !validSignature(value, "projection_digest")) return false;
+  const seen = new Set<string>();
+  return value.test_results.every((item, index) => {
+    if (!exact(item, ["ordinal", "test_instance_id", "scenario_id", "adapter_version", "source", "assertion_digest", "condition_kind", "route", "assessment_outcome", "reason", "positive_control", "restricted_condition", "observations", "finding", "containment_codes", "redaction_count", "local_evidence_refs"])
+      || item.ordinal !== index || typeof item.test_instance_id !== "string" || !TEST_INSTANCE_REF.test(item.test_instance_id)
+      || seen.has(item.test_instance_id) || !BINDABLE_CATALOG_IDS.includes(item.scenario_id as ScenarioBindableCatalogId)
+      || !exact(item.source, ["source_scenario_id", "source_revision"]) || typeof item.source.source_scenario_id !== "string"
+      || !integer(item.source.source_revision, 1) || typeof item.assertion_digest !== "string" || !ASSERTION_DIGEST.test(item.assertion_digest)
+      || !["json_field_present", "json_scalar_equals_fixture"].includes(String(item.condition_kind))
+      || !exact(item.route, ["method", "route_template"]) || !["GET", "HEAD"].includes(String(item.route.method))
+      || !closedString(item.route.route_template, 1024)
+      || !["blocked", "observed", "inconclusive"].includes(String(item.assessment_outcome))
+      || !(CONFIGURED_REASONS.has(String(item.reason)) || /^(?:restricted_)?[a-z_]{1,64}$/.test(String(item.reason)))
+      || !["established", "not_established"].includes(String(item.positive_control))
+      || !["true", "false", "not_observed"].includes(String(item.restricted_condition))
+      || !Array.isArray(item.observations) || item.observations.length > 2
+      || !item.observations.every((observation) => exact(observation, ["action_ordinal", "semantic_role", "status_code", "body_shape", "truncation_state"])
+        && integer(observation.action_ordinal, 0, 19) && identifier(observation.semantic_role) && integer(observation.status_code, 100, 599)
+        && BODY_SHAPES.has(String(observation.body_shape)) && ["complete", "truncated"].includes(String(observation.truncation_state)))
+      || (item.finding !== null) !== (item.assessment_outcome === "observed")
+      || (item.finding !== null && (!exact(item.finding, ["title", "reachability_rationale", "confidence", "recommended_control", "regression_suggestion"])
+        || !closedString(item.finding.title, 160)))
+      || !sortedUniqueStrings(item.containment_codes, CONTAINMENT_CODES) || !integer(item.redaction_count)
+      || !sortedUniqueStrings(item.local_evidence_refs, undefined, 10)
+      || !(item.local_evidence_refs as string[]).every((ref) => /^ev1_[0-9a-f]{64}$/.test(ref))) return false;
+    seen.add(item.test_instance_id);
+    return true;
+  });
+}
+
 const DISCLOSURE_STATUSES: ReadonlySet<string> = new Set([
   "local_result_ready", "awaiting_disclosure_approval", "permitted", "synchronized", "local_only", "expired",
 ]);
@@ -835,7 +1168,7 @@ function parseDisclosureState(value: unknown, runRef: string): CanaryDisclosureS
     || typeof value.request_id !== "string" || !DISCLOSURE_REQUEST_REF.test(value.request_id)
     || value.run_id !== runRef || !DISCLOSURE_STATUSES.has(String(value.status))
     || !exact(value.projection, ["schema_version", "projection_digest", "byte_count", "scenario_count", "finding_count"])
-    || value.projection.schema_version !== "heel.canary-findings-projection.v1"
+    || !["heel.canary-findings-projection.v1", "heel.canary-findings-projection.v2"].includes(String(value.projection.schema_version))
     || !digest(value.projection.projection_digest) || !integer(value.projection.byte_count, 1, 256 * 1024)
     || !integer(value.projection.scenario_count, 0, 4)
     || !integer(value.projection.finding_count, 0, value.projection.scenario_count as number)) invalidResponse();
@@ -1053,7 +1386,10 @@ export class CanaryApi {
       || value.schema_version !== "heel.canary-approval-request-list.v1" || !integer(value.server_time_ms)
       || !Array.isArray(value.requests) || value.requests.length > 1 || typeof value.has_more !== "boolean") invalidResponse();
     if (value.requests.length === 0) return deepFreeze({ request: null, hasMore: value.has_more });
-    const item = value.requests[0];
+    const raw = value.requests[0];
+    const configured = record(raw) && "configured" in raw ? parseConfiguredApproval(raw.configured) : null;
+    const item = record(raw) && configured !== null
+      ? Object.fromEntries(Object.entries(raw).filter(([key]) => key !== "configured")) : raw;
     if (!exact(item, ["approval_id", "run_id", "projection_digest", "status", "submitted_at_ms", "expires_at_ms", "origin", "hostname", "routes", "scenarios", "request_budget", "duration_seconds", "egress"])
       || !identifier(item.approval_id) || typeof item.run_id !== "string" || !RUN_REF.test(item.run_id)
       || !digest(item.projection_digest) || item.status !== "awaiting_execution_approval" || !integer(item.submitted_at_ms)
@@ -1067,7 +1403,7 @@ export class CanaryApi {
       projectionDigest: item.projection_digest as string, origin: item.origin as string, hostname: item.hostname as string,
       routes: item.routes as string[], scenarios: item.scenarios as string[], requestBudget: item.request_budget as number,
       durationSeconds: item.duration_seconds as number, egress: item.egress as string,
-      submittedAtMs: item.submitted_at_ms as number, expiresAtMs: item.expires_at_ms as number }, hasMore: value.has_more as boolean });
+      submittedAtMs: item.submitted_at_ms as number, expiresAtMs: item.expires_at_ms as number, configured }, hasMore: value.has_more as boolean });
   }
 
   async approveRun(workspaceRef: string, projectRef: string, runRef: string, approval: {
@@ -1076,15 +1412,18 @@ export class CanaryApi {
     reason: string;
     idempotencyKey: `ca1-${string}`;
     controlGeneration: number;
+    /** Required for a configured plan: the restated frozen conditions (`configuredConditionReview`). */
+    conditionReview?: JsonRecord;
   }): Promise<Readonly<{ runId: string; grantId: string; reservationId: string; grant: JsonRecord }>> {
     if (!digest(approval.projectionDigest) || !/^[a-z0-9.-]{1,253}$/.test(approval.hostnameRetype)
       || !closedString(approval.reason, 500) || !/^ca1-[0-9a-f]{64}$/.test(approval.idempotencyKey)
       || !integer(approval.controlGeneration)) invalidRequest();
     const value = await this.#json(runPath(workspaceRef, projectRef, runRef, "/approve"), "POST", {
-      schema_version: "heel.canary-execution-approval.v1",
+      schema_version: approval.conditionReview === undefined ? "heel.canary-execution-approval.v1" : "heel.canary-execution-approval.v2",
       projection_digest: approval.projectionDigest,
       hostname_retype: approval.hostnameRetype,
       reason: approval.reason,
+      ...(approval.conditionReview === undefined ? {} : { condition_review: approval.conditionReview }),
     }, 201, {
       "Idempotency-Key": approval.idempotencyKey,
       "If-Heel-Control-Generation": String(approval.controlGeneration),
@@ -1155,10 +1494,51 @@ export class CanaryApi {
     return parseDisclosureState(await this.#json(runPath(workspaceRef, projectRef, runRef, "/disclosure"), "GET", undefined, 200, {}, signal), runRef);
   }
 
-  async getFindings(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<Readonly<CanaryFindingsProjection>> {
+  async getFindings(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<Readonly<AnyCanaryFindingsProjection>> {
     const value = await this.#json(runPath(workspaceRef, projectRef, runRef, "/findings"), "GET", undefined, 200, {}, signal);
+    if (value.schema_version === "heel.canary-findings-projection.v2") {
+      if (!validConfiguredFindings(value, workspaceRef, projectRef, runRef)) invalidResponse();
+      return deepFreeze(value as unknown as CanaryConfiguredFindingsProjection);
+    }
     if (!validFindings(value, workspaceRef, projectRef, runRef)) invalidResponse();
     return deepFreeze(value as unknown as CanaryFindingsProjection);
+  }
+
+  async createConfiguredPlanRequest(workspaceRef: string, projectRef: string, bindingId: string, input: ConfiguredPlanRequestInput): Promise<ConfiguredPlanRequestView> {
+    if (!/^rcb_[0-9a-f]{32}$/.test(bindingId)) invalidRequest();
+    const body = input.planKind === "configured_regression"
+      ? { schema_version: "heel.configured-plan-request.v1", plan_kind: input.planKind, source_run_id: input.sourceRunId, test_instance_id: input.testInstanceId }
+      : { schema_version: "heel.configured-plan-request.v1", plan_kind: input.planKind,
+        tests: input.tests.map((item) => ({ source_scenario_id: item.sourceScenarioId, source_revision: item.sourceRevision })),
+        plan_labels: input.planLabels.map((item) => ({ role: item.role, plan_label: item.plan_label })) };
+    if (input.planKind === "configured_regression" && (!RUN_REF.test(input.sourceRunId) || !TEST_INSTANCE_REF.test(input.testInstanceId))) invalidRequest();
+    return parseConfiguredPlanView(await this.#json(
+      projectPath(workspaceRef, projectRef, `/runner-context-bindings/${bindingId}/configured-plan-requests`), "POST", body, 201));
+  }
+
+  async listConfiguredPlanRequests(workspaceRef: string, projectRef: string, signal?: AbortSignal): Promise<readonly ConfiguredPlanRequestView[]> {
+    const value = await this.#json(projectPath(workspaceRef, projectRef, "/configured-plan-requests"), "GET", undefined, 200, {}, signal);
+    if (!exact(value, ["schema_version", "server_time_ms", "requests"]) || value.schema_version !== "heel.configured-plan-request-list.v1"
+      || !integer(value.server_time_ms) || !Array.isArray(value.requests) || value.requests.length > 8) invalidResponse();
+    return deepFreeze(value.requests.map(parseConfiguredPlanView));
+  }
+
+  async getConfiguredPlanRequest(workspaceRef: string, projectRef: string, planRequestId: string, signal?: AbortSignal): Promise<ConfiguredPlanRequestView> {
+    if (!PLAN_REQUEST_REF.test(planRequestId)) invalidRequest();
+    return parseConfiguredPlanView(await this.#json(projectPath(workspaceRef, projectRef, `/configured-plan-requests/${planRequestId}`), "GET", undefined, 200, {}, signal));
+  }
+
+  /** The frozen configured request a run's signed plan was admitted against (never the current library). */
+  async getConfiguredPlanForRun(workspaceRef: string, projectRef: string, runRef: string, signal?: AbortSignal): Promise<ConfiguredPlanRequestView> {
+    const value = parseConfiguredPlanView(await this.#json(runPath(workspaceRef, projectRef, runRef, "/configured-plan"), "GET", undefined, 200, {}, signal));
+    if (value.runId !== runRef) invalidResponse();
+    return value;
+  }
+
+  async cancelConfiguredPlanRequest(workspaceRef: string, projectRef: string, planRequestId: string): Promise<ConfiguredPlanRequestView> {
+    if (!PLAN_REQUEST_REF.test(planRequestId)) invalidRequest();
+    return parseConfiguredPlanView(await this.#json(projectPath(workspaceRef, projectRef, `/configured-plan-requests/${planRequestId}/cancel`), "POST",
+      { schema_version: "heel.configured-plan-request-cancel.v1" }, 200));
   }
 
   async listEnvironments(workspaceRef: string, projectRef: string): Promise<readonly VerifiedEnvironmentRecord[]> {
@@ -1258,7 +1638,9 @@ export class CanaryApi {
 
   async listScenarioLibrary(workspaceRef: string, signal?: AbortSignal): Promise<Readonly<ScenarioLibrary>> {
     const value = await this.#json(workspacePath(workspaceRef, "/scenario-library"), "GET", undefined, 200, {}, signal);
-    if (!exact(value, ["schema_version", "library_digest", "engine_version", "binding_version", "custom_coverage_statements", "scenarios"])
+    if (!exact(value, ["schema_version", "library_digest", "engine_version", "binding_version", "custom_coverage_statements", "live_test_coverage_statements", "scenarios"])
+      || !exact(value.live_test_coverage_statements, [...BINDABLE_CATALOG_IDS])
+      || !BINDABLE_CATALOG_IDS.every((id) => closedString((value.live_test_coverage_statements as JsonRecord)[id], 512))
       || value.schema_version !== "heel.scenario-library.v1" || !digest(value.library_digest)
       || !identifier(value.engine_version) || value.binding_version !== 1
       || !exact(value.custom_coverage_statements, [...BINDABLE_CATALOG_IDS])
@@ -1269,6 +1651,7 @@ export class CanaryApi {
     return deepFreeze({
       libraryDigest: value.library_digest, engineVersion: value.engine_version, bindingVersion: 1,
       customCoverageStatements: value.custom_coverage_statements as Record<ScenarioBindableCatalogId, string>,
+      liveTestCoverageStatements: value.live_test_coverage_statements as Record<ScenarioBindableCatalogId, string>,
       scenarios,
     });
   }
@@ -1281,10 +1664,19 @@ export class CanaryApi {
       || (binding !== null && (!BINDABLE_CATALOG_IDS.includes(binding.catalogScenarioId) || !closedString(binding.coverageAck, 512)))) invalidRequest();
     const definitionText = JSON.stringify(input.definition);
     if (new TextEncoder().encode(definitionText).byteLength > MAX_CUSTOM_DEFINITION_BYTES) invalidRequest();
+    const live = input.liveTest;
+    if (live !== undefined && live !== null && (!BINDABLE_CATALOG_IDS.includes(live.scenarioId)
+      || !["GET", "HEAD"].includes(live.method) || typeof live.routeTemplate !== "string" || !validAssertion(live.assertion))) invalidRequest();
     const body = JSON.stringify({
       definition: input.definition,
       execution_binding: binding === null ? null : { binding_version: 1, catalog_scenario_id: binding.catalogScenarioId, coverage_ack: binding.coverageAck },
-      schema_version: "heel.custom-scenario.v1",
+      ...(live === undefined ? {} : {
+        live_test: live === null ? null : {
+          assertion: live.assertion, method: live.method, route_template: live.routeTemplate,
+          scenario_id: live.scenarioId, schema_version: "heel.custom-live-test.v1",
+        },
+      }),
+      schema_version: live === undefined ? "heel.custom-scenario.v1" : "heel.custom-scenario.v2",
       supersedes_revision: input.supersedesRevision,
     });
     if (new TextEncoder().encode(body).byteLength > 16 * 1024) invalidRequest();
@@ -1390,6 +1782,8 @@ export class CanaryApi {
       if (exact(value, ["schema_version", "code"])
         && value.schema_version === "heel.canary-error.v1" && typeof value.code === "string"
         && PUBLIC_ERROR_CODES.has(value.code)) code = value.code;
+      else if (exact(value, ["schema_version", "code"]) && value.schema_version === "heel.discovery-error.v1"
+        && typeof value.code === "string" && PUBLIC_ERROR_CODES.has(value.code)) code = value.code;
       else if (exact(value, ["error", "code"]) && closedString(value.error, 512)
         && typeof value.code === "string" && PUBLIC_ERROR_CODES.has(value.code)) code = value.code;
       else if (record(value) && value.schema_version === "heel.scenario-library-error.v1"

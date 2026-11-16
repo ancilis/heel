@@ -33,6 +33,41 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
+## [1.3.0rc6]: unpublished candidate
+
+Runner preview candidate for browser-configured live read tests. It is not yet a GitHub release, it
+will not be on PyPI, and nothing in it is deployed. Customer install surfaces name the one
+hash-pinned 1.3.0rc6 install from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, whose
+wheel digest equals the bundled `/downloads/` wheel. That pin is provisional: the copy may be
+deployed only after the release owner's anonymous verify-public for v1.3.0rc6 has checked the exact
+published bytes. 1.3.0rc1 through 1.3.0rc5 stay published, unchanged, and are named only as history.
+
+- Version identity 1.3.0rc6 (npm 1.3.0-rc.6) across the package, release contract, review engine,
+  MCP server info, `server.json` and browser engine; 1.3.0rc5 stays an accepted saved-review and
+  findings-sync engine version. Wheel, source archive, manifest, browser wheel/manifest, browser
+  sample and review golden are regenerated with the unchanged builders and open-core
+  classification. The published 1.3.0rc5 bytes and version sources are kept byte for byte as the
+  historical fixture `tests/fixtures/runner_preview_rc5/`.
+- Configured live read tests (runner): `heel runner serve` claims owner-approved, signed configured
+  test plans from a Heel Cloud that serves the configured-test sync route and runs each instance as
+  bounded `GET`/`HEAD` reads of one literal imported route, once for a restricted and once for a
+  control role, deciding one JSON field condition after a success check. Local expected values are
+  added with `heel runner input add --type text|number|boolean|null` (or the default `json`
+  scalar entry) and stay in the operating system vault; they are never uploaded. A result covers only the configured field condition on
+  that route. Against a Heel Cloud without that route, `serve` refuses the response, so the Worker
+  must be deployed before or with this runner.
+- Only the `bearer` credential profile has been exercised end to end; `x_api_key` and `cookie_jar`
+  have no recorded acceptance. There are no writes, multi-step workflows, trials or cumulative usage
+  tests, and the scenario library is breadth, not executed coverage.
+- The standalone synthetic staging target (`tests/fixtures/customer_staging`: `README.md`,
+  `openapi.json`, `worker.mjs`, `wrangler.jsonc`) is prepared for separate distribution as the
+  `heel-staging-fixture-*` assets of the same prerelease, listed with sizes and SHA-256 digests in
+  `release/heel-staging-fixture-manifest.json`. It is a test fixture, not inside the wheel or source
+  archive, and not product code. The release notes state its `SOURCE_REVISION`.
+- Findings semantics of the existing `plan_entitlement_read` and `anonymous_authenticated_read`
+  checks are unchanged from 1.3.0rc5. These runner changes are proven with local test fixtures and
+  a local browser journey only; no deployed or customer run is recorded for 1.3.0rc6.
+
 ## [1.3.0rc5]: 2026-11-13
 
 Runner preview prerelease for the customer scenario library and result-chain recovery, published as

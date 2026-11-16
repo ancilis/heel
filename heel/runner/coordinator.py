@@ -11,17 +11,22 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from heel.canary_contracts import (
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_ROLE_ORDER,
     DISCLOSURE_PERMIT_SCHEMA,
     OPERATIONAL_RUN_SCHEMA,
     canonical_bytes,
     canonical_digest,
     validate_canary_findings,
+    validate_runner_findings,
     validate_disclosure_permit,
     validate_operational_run,
 )
 from heel.crypto import verify_envelope
 from heel.runner.control_client import (
     RunnerChainRecoveryDeferred,
+    RunnerInactiveClaimRecoveryBlocked,
+    RunnerInactiveClaimRecoveryWaiting,
     RunnerChainRecoveryRequired,
     RunnerControlClient,
     RunnerResultChainRecovered,
@@ -35,6 +40,7 @@ from heel.runner.execution import (
     _gate_failure,
     validate_execution_bundle,
 )
+from heel.runner.compiler import CanaryCompiler
 from heel.runner.identity import RunnerIdentity, SecureSigner
 from heel.runner.service import ClaimLease
 from heel.runner.store import RunReservationProbe, RunnerContext, RunnerStore, RunnerStoreError
@@ -135,6 +141,10 @@ class RunnerCoordinator:
         self._gate_receipts: dict[str, float] = {}
         self._bindings: dict[str, tuple[str, str, str]] = {}
         self._terminal_runs: set[str] = set()
+        # Runs hydrated at construction with no local terminal: candidates for one bounded
+        # recovered dispatch through ``claim`` (see ``_recovered_lease``).  Process-local only;
+        # each candidate is considered at most once per coordinator.
+        self._recovered_claims: set[str] = set()
         self._lock = threading.Lock()
         # The client serializes its signed chain, but the coordinator also owns
         # the in-memory gate snapshot.  Keep the read -> signed heartbeat ->
@@ -247,6 +257,7 @@ class RunnerCoordinator:
                     self._bindings.pop(run_id, None)
                     self._heartbeat_guards.pop(run_id, None)
             self._terminal_runs.intersection_update(active_ids)
+            self._recovered_claims.intersection_update(active_ids)
 
     @staticmethod
     def _staged_upload_request(item: Any) -> dict[str, Any]:
@@ -267,55 +278,117 @@ class RunnerCoordinator:
             raise RunnerStoreError("local findings replay authority is invalid") from None
         return request
 
-    def _inactive_claim_eligible(self, active: object, pending: tuple[object, ...], now_ms: int) -> bool:
+    def _inactive_claim_eligible(
+        self, active: object, pending: tuple[object, ...], now_ms: int,
+    ) -> tuple[RunReservationProbe, bool] | None:
         """POSTRESET §7.1 L2-L5 for one loaded (L1-valid) active row; L6 is construction order.
 
+        Returns ``None`` (keep the existing restart path) or ``(probe, required)``.
+
         L2 is exactly the hydration failure C exists for: a failed persisted gate or an expired
-        grant.  Every other row keeps its existing restart path.  The coordinator is built before
-        any executor exists and ``serve`` holds the exclusive instance lock, so no reservation can
-        appear between the Store probe and the retirement.
+        grant.  The coordinator is built before any executor exists and ``serve`` holds the
+        exclusive instance lock, so no reservation can appear or advance between the Store reads
+        and the retirement.
+
+        Besides ``ABSENT``, a ``RESERVED`` run is eligible only while it provably never activated:
+        its local state is ``verified`` and its signed containment log is empty (``running`` is
+        durable before any secret, DNS or target action).  Such a reservation exists after a lost
+        claim answer was replayed at restart.  It is eligible under L2 (``required``: a refusal is
+        raised exactly as for an absent reservation), and also when the row can no longer be
+        dispatched by ``_recovered_lease`` (revision > 1 or a staged heartbeat, e.g. a lost
+        recovery-heartbeat answer) so that a Cloud Stop is learned at restart (not ``required``:
+        a ``run_live`` answer keeps the row and construction continues).  A dispatchable row
+        (revision 1, no staged call, passing gate) keeps the ab3a112 recovered-dispatch path.
         """
         try:
             gate = ExecutionGate(**dict(active.gate))
         except (TypeError, ValueError):
-            return False
-        if (
+            return None
+        l2 = not (
             _gate_failure(gate, active.grant["kill_switch_generation"]) is None
             and now_ms < active.grant["expires_at_ms"]
-        ):
-            return False
+        )
         if self.control.runtime.load_terminal_state(active.run_id) is not None:
-            return False
+            return None
+        staged = [item for item in pending if item.run_id == active.run_id]
         if any(
-            item.run_id == active.run_id
-            and (item.chain_operation != "heartbeat" or item.request_operation != "heartbeat")
-            for item in pending
+            item.chain_operation != "heartbeat" or item.request_operation != "heartbeat"
+            for item in staged
         ):
-            return False
-        return self.store.probe_run_reservation(active.run_id) is RunReservationProbe.ABSENT
+            return None
+        probe = self.store.probe_run_reservation(active.run_id)
+        if probe is RunReservationProbe.ABSENT:
+            return (probe, True) if l2 else None
+        if probe is not RunReservationProbe.RESERVED:
+            return None
+        local = self.store.load_run(active.run_id)
+        if local["state"] != "verified" or self.store.load_run_events(active.run_id):
+            return None  # possibly activated: never retired here; existing refusals apply
+        if l2:
+            return probe, True
+        if active.revision != 1 or staged:
+            return probe, False
+        return None
 
     def _reconcile_inactive_claims(self) -> None:
         """Retire every eligible pre-activation claim before any active authority is hydrated.
 
         Only a pinned grant-authority attestation of this exact claim retires it, through the control
         client's per-run guard.  Any refusal, unusable answer or transport failure is raised with the
-        sealed group intact; the next construction asks again with a new challenge.
+        sealed group intact; the next construction asks again with a new challenge.  The one
+        exception is a non-L2 never-activated reservation the Cloud does not attest inactive (still
+        live, or a closed refusal): that row is kept unchanged and construction continues, as it
+        did before it was eligible.
         """
+        self._finish_inactive_reservation_retirements()
         pending = self.control.runtime.load_pending_calls(limit=74)
         now_ms = self._now_ms()
         for active in self.control.runtime.load_active_run_controls(limit=64):
-            if not self._inactive_claim_eligible(active, pending, now_ms):
+            eligible = self._inactive_claim_eligible(active, pending, now_ms)
+            if eligible is None:
                 continue
-            verified = self.control._attest_inactive_claim(active.run_id)
+            probe, required = eligible
+            try:
+                verified = self.control._attest_inactive_claim(active.run_id)
+            except (RunnerInactiveClaimRecoveryWaiting, RunnerInactiveClaimRecoveryBlocked):
+                # A required (L2) row cannot hydrate: the refusal is raised as before.  A non-L2
+                # never-activated row was restartable without this request; any Cloud refusal
+                # keeps it exactly as it was.  An untrusted answer or a transport failure is
+                # raised in both cases.
+                if required:
+                    raise
+                continue
             self.control._retire_inactive_claim(
-                verified, reservation_probe=RunReservationProbe.ABSENT.value, now_ms=self._now_ms(),
+                verified, reservation_probe=probe.value, now_ms=self._now_ms(),
             )
+            if probe is RunReservationProbe.RESERVED:
+                # Release the never-activated reservation's nonterminal slot under the same
+                # attested evidence; a crash before this completes is finished on the next start.
+                self._retire_inactive_reservation(active.run_id)
             with self._lock:
                 if (
                     active.run_id in self._gates or active.run_id in self._gate_receipts
                     or active.run_id in self._bindings
                 ):
                     raise RunnerStoreError("runtime retired claim authority is invalid")
+
+    def _retire_inactive_reservation(self, run_id: str) -> None:
+        self.store.retire_inactive_reservation(
+            run_id, runtime=self.control.runtime, trusted_cloud_keys=self.trusted_grant_keys,
+            now_ms=self._now_ms(),
+        )
+
+    def _finish_inactive_reservation_retirements(self) -> None:
+        """Complete a Store release whose runtime claim was already retired (crash in between).
+
+        Only a run the runtime has sealed as a retired claim is considered; the Store re-verifies its
+        archived attestation and the never-activated reservation before releasing anything.
+        """
+        if not self.store.is_context_bound:
+            return
+        for run_id in self.store.nonterminal_run_ids(runtime=self.control.runtime):
+            if self.control.runtime.load_retired_claim(run_id) is not None:
+                self._retire_inactive_reservation(run_id)
 
     def _recover_active_runtime_state(self) -> None:
         """Rebuild live coordinator authority from sealed runtime controls.
@@ -358,6 +431,8 @@ class RunnerCoordinator:
                     if isinstance(exc, RunnerStoreError):
                         raise
                     raise RunnerStoreError("runtime active reservation is unavailable") from exc
+                with self._lock:
+                    self._recovered_claims.add(active.run_id)
             elif terminal.state == "local_terminal":
                 pending = tuple(
                     item for item in self.control.runtime.load_pending_calls(limit=74)
@@ -539,7 +614,98 @@ class RunnerCoordinator:
         claimed = self.control.runtime.claim_due_prune(now_ms=now_ms, limit=16)
         self._finish_prune_states(claimed.items, now_ms=now_ms)
 
+    def _recovered_lease(self) -> ClaimLease | None:
+        """Hand one recovered, provably unexecuted claim to normal execution, or nothing.
+
+        A claim whose answer was lost is replayed at construction and hydrated with a local
+        ``verified`` reservation, but the Cloud then answers every fresh claim with 204: without
+        this step the run is never executed.  It is dispatched only when every fact below holds,
+        each re-read now rather than trusted from construction:
+
+        * the runtime active row is still claim-only (revision 1) with no staged call for the run,
+          so no heartbeat, progress, stop acknowledgement or result was ever sent for it and the
+          Cloud holds no runner snapshot that the recovered claimed projection could contradict;
+        * no runtime terminal exists and the local reservation is still ``verified`` with an
+          empty containment log, so the run was never locally activated and no secret, DNS or
+          target traffic can have happened (``running`` is durable before any of them);
+        * the immutable local approved pair, grant, binding and kill-switch generation still
+          validate now, and a fresh signed heartbeat answers a passing gate.
+
+        The fresh heartbeat is the run's new gate receipt, exactly as a claim response is for a
+        fresh lease; the executor still re-validates it (age <= 0.5 s) before activation, and the
+        store's ``verified`` -> ``running`` transition remains the durable exactly-once point.  A
+        denied gate is persisted by the heartbeat and the run is not dispatched.  Each candidate
+        is considered once per coordinator; anything else keeps the existing restart path.
+        """
+        with self._lock:
+            candidates = sorted(self._recovered_claims)
+        for run_id in candidates:
+            with self._lock:
+                self._recovered_claims.discard(run_id)
+                gate = self._gates.get(run_id)
+                binding = self._bindings.get(run_id)
+                live = run_id in self._gate_receipts or run_id in self._terminal_runs
+            if gate is None or binding is None or live:
+                continue
+            active = next(
+                (
+                    item for item in self.control.runtime.load_active_run_controls(limit=64)
+                    if item.run_id == run_id
+                ),
+                None,
+            )
+            if active is None or active.revision != 1:
+                continue
+            if any(
+                item.run_id == run_id
+                for item in self.control.runtime.load_pending_calls(limit=74)
+            ):
+                continue
+            if self.control.runtime.load_terminal_state(run_id) is not None:
+                continue
+            if self.store.load_run(run_id)["state"] != "verified":
+                continue
+            if self.store.load_run_events(run_id):
+                continue
+            projection = dict(active.approval_projection)
+            grant = dict(active.grant)
+            manifest, local_projection = self.store.load_approved_pair(active.approval_id)
+            if local_projection != projection or binding != (
+                active.grant_id, active.approval_id, active.approval_projection_digest,
+            ) or ExecutionGate(**dict(active.gate)) != gate:
+                raise RunnerStoreError("runtime active approval authority is unavailable")
+            bundle = ExecutionBundle(manifest, projection, grant)
+            try:
+                validate_execution_bundle(
+                    bundle, store=self.store, identity=self.identity,
+                    trusted_grant_keys=self.trusted_grant_keys, now_ms=self._now_ms(), gate=gate,
+                )
+            except RunnerStoreError:
+                raise
+            except (TypeError, ValueError):
+                # Expired or no longer locally valid: never heartbeat or execute it here.
+                continue
+            claimed = self._claimed_projection(
+                manifest, projection, grant, claimed_at_ms=active.claimed_at_ms,
+            )
+            fresh = self.heartbeat(run_id, claimed)
+            try:
+                # Rejects a stop, revocation, kill switch or expired proof in the fresh gate.
+                validate_execution_bundle(
+                    bundle, store=self.store, identity=self.identity,
+                    trusted_grant_keys=self.trusted_grant_keys, now_ms=self._now_ms(), gate=fresh,
+                )
+            except RunnerStoreError:
+                raise
+            except (TypeError, ValueError):
+                continue  # denied: the heartbeat persisted that gate; nothing is dispatched
+            return ClaimLease(run_id, bundle, claimed)
+        return None
+
     def claim(self) -> ClaimLease | None:
+        recovered = self._recovered_lease()
+        if recovered is not None:
+            return recovered
         response = self.control._claim_closed()
         received_at = self._now_monotonic()
         if response is None:
@@ -729,6 +895,11 @@ class RunnerCoordinator:
             manifest, projection = self.store.load_approved_pair(pending["projection_id"])
         except (RunnerStoreError, ValueError):
             manifest = projection = None
+        if projection is not None and projection.get("schema_version") == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+            # A configured plan is admitted only with its browser request's nonce, which the
+            # configured step submits; the legacy queue never sends it.
+            self.store.settle_projection_submission(pending, state="refused", reason="projection_unavailable")
+            return None
         if (
             projection is None or projection["projection_digest"] != pending["projection_digest"]
             or manifest["manifest_digest"] != pending["manifest_digest"]
@@ -746,6 +917,150 @@ class RunnerCoordinator:
             run_id=submitted["run_id"], status=submitted["status"],
         )
         return submitted
+
+    # --- E3: configured live-read plans requested in the browser --------------------------
+
+    def _configured_readiness(self, request: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Bounded requirement states for exactly this request's instances; never values.
+
+        Only the selected tests' route, non-anonymous roles and named local inputs (or, for a
+        replay, the frozen run and its frozen handles) are examined. Nothing unrelated to the
+        request, and no vault content, is read or reported.
+        """
+        routes = {(item["method"], item["route_template"]) for item in self.store.list_routes()}
+        credentials = {
+            item["semantic_role"] for item in self.store.list_credentials()
+            if item["state"] == "active" and item["backend"] in {"macos_keychain", "linux_secret_service"}
+        }
+        inputs = self.store.list_live_inputs()
+        frozen_handles: dict[str, list[str]] | None = None
+        if request["plan_kind"] == "configured_regression":
+            frozen_handles = {}
+            from heel.runner.regressions import SavedRegressionError, _verified_terminal_run
+
+            try:
+                manifest = _verified_terminal_run(self.store, request["source_run_id"])["manifest"]
+            except (RunnerStoreError, SavedRegressionError, ValueError, KeyError, TypeError):
+                manifest = None
+            if isinstance(manifest, Mapping) and manifest.get("schema_version") == "heel.test-manifest.v2":
+                for instance in manifest["test_instances"]:
+                    frozen_handles[instance["test_instance_id"]] = [
+                        item["input_handle_id"] for item in instance["local_inputs"]
+                    ]
+        report = []
+        for instance in request["instances"]:
+            requirements: list[dict[str, Any]] = []
+            route = (instance["method"], instance["route_template"])
+            requirements.append({
+                "kind": "route", "subject": None,
+                "state": "unsupported" if "{" in instance["route_template"] else
+                ("ready" if route in routes else "missing"),
+            })
+            for role in CONFIGURED_ROLE_ORDER[instance["scenario_id"]]:
+                if role != "anonymous":
+                    requirements.append({
+                        "kind": "role_credential", "subject": role,
+                        "state": "ready" if role in credentials else "missing",
+                    })
+            if frozen_handles is not None:
+                handles = frozen_handles.get(instance["test_instance_id"])
+                requirements.append({
+                    "kind": "frozen_run", "subject": None,
+                    "state": "ready" if handles is not None else "missing",
+                })
+                by_handle = {item["input_handle_id"]: item for item in inputs}
+                for ref, handle in zip(instance["local_input_refs"], handles or []):
+                    record = by_handle.get(handle)
+                    requirements.append({
+                        "kind": "local_input", "subject": ref,
+                        "state": "ready" if record is not None and record["state"] == "active"
+                        else ("revoked" if record is not None else "missing"),
+                    })
+            else:
+                for ref in instance["local_input_refs"]:
+                    named = [item for item in inputs if item["name"] == ref]
+                    current = [item for item in named if item["selection"] == "current" and item["state"] == "active"]
+                    requirements.append({
+                        "kind": "local_input", "subject": ref,
+                        "state": "ready" if len(current) == 1 else ("revoked" if named else "missing"),
+                    })
+            requirements.sort(key=lambda item: (item["kind"], item["subject"] or ""))
+            report.append({"test_instance_id": instance["test_instance_id"], "requirements": requirements})
+        return report
+
+    def process_configured_plan(self) -> dict[str, Any] | None:
+        """One idle step: fetch the bound context's open configured request, then either
+        report what is missing for exactly those tests or compile and submit the signed plan.
+
+        The projection is admitted only with the request's single-use nonce; it creates an
+        awaiting-approval record and nothing else. No target request happens here.
+        """
+        try:
+            binding = self.store.verify_cloud_context_binding(
+                identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
+            )
+        except RunnerStoreError:
+            return None  # a static local context has no browser-requested plans
+        synced = self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], None)
+        request = synced["request"]
+        if request is None:
+            return None
+        readiness = self._configured_readiness(request)
+        ready = all(item["state"] == "ready" for entry in readiness for item in entry["requirements"])
+        if not ready:
+            self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], {
+                "plan_request_id": request["plan_request_id"],
+                "plan_request_nonce": request["plan_request_nonce"],
+                "instances": readiness,
+            })
+            return {"plan_request_id": request["plan_request_id"], "state": "setup_required"}
+        # Report readiness first so the browser shows the exact checked state even if the
+        # submission below is refused.
+        self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], {
+            "plan_request_id": request["plan_request_id"],
+            "plan_request_nonce": request["plan_request_nonce"],
+            "instances": readiness,
+        })
+        compiler = CanaryCompiler(
+            store=self.store, identity=self.identity, signer=self.signer, now_ms=self._now_ms(),
+        )
+        queued = None
+        if request["plan_kind"] == "configured_regression":
+            instance = request["instances"][0]
+            regression, _created = self.store.add_saved_regression(
+                run_id=request["source_run_id"], test_instance_id=instance["test_instance_id"],
+                name=f"replay {instance['source']['source_scenario_id']} r{instance['source']['source_revision']}"[:64],
+                now_ms=self._now_ms(),
+            )
+            result = compiler.compile_configured_replay(regression)
+            queued, _replay = self.store.queue_regression_replay(
+                regression["regression_id"], result.projection["projection_id"],
+                binding_digest=binding["binding_digest"], now_ms=self._now_ms(),
+            )
+        else:
+            result = compiler.compile_configured([{
+                "test_instance_id": item["test_instance_id"],
+                "scenario_id": item["scenario_id"],
+                "source_scenario_id": item["source"]["source_scenario_id"],
+                "source_revision": item["source"]["source_revision"],
+                "method": item["method"],
+                "route_template": item["route_template"],
+                "assertion": item["assertion"],
+                "local_inputs": {ref: ref for ref in item["local_input_refs"]},
+            } for item in request["instances"]])
+        submitted = self.control.submit_configured_projection(
+            binding["binding_id"], binding["binding_digest"], request["plan_request_id"],
+            request["plan_request_nonce"], result.projection,
+        )
+        if (submitted.get("approval_id") != result.projection["projection_id"]
+                or submitted.get("projection_digest") != result.projection["projection_digest"]):
+            raise ValueError("configured submission answer does not match the compiled plan")
+        if queued is not None:
+            self.store.settle_projection_submission(
+                queued, state="submitted", approval_id=submitted["approval_id"],
+                run_id=submitted["run_id"], status=submitted["status"],
+            )
+        return {"plan_request_id": request["plan_request_id"], "state": "submitted", "run_id": submitted["run_id"]}
 
     def _claimed_projection(
         self, manifest: dict[str, Any], projection: dict[str, Any], grant: dict[str, Any],
@@ -775,7 +1090,7 @@ class RunnerCoordinator:
                 "runner_version": self.identity.runner_version,
                 "engine_version": manifest["compiler"]["engine_version"],
                 "adapter_versions": sorted({
-                    item["adapter_version"] for item in manifest["scenarios"]
+                    item["adapter_version"] for item in manifest.get("test_instances", manifest.get("scenarios", []))
                 }),
             },
             "error_category": "none", "stop_reason": "none",
@@ -964,7 +1279,7 @@ class RunnerCoordinator:
             raise ValueError("active runner claim is required")
         try:
             permit_value = validate_disclosure_permit(permit)
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
         except (TypeError, ValueError):
             raise ValueError("invalid runner findings upload") from None
         unsigned = {
@@ -1018,7 +1333,7 @@ class RunnerCoordinator:
         """The exact store-verified local findings projection ``heel runner findings`` prints."""
         try:
             finals = self.store.load_final_projections(run_id)
-            return validate_canary_findings(finals["local_view"]["findings_projection"])
+            return validate_runner_findings(finals["local_view"]["findings_projection"])
         except (RunnerStoreError, KeyError, TypeError, ValueError) as exc:
             raise ValueError("local findings projection is unavailable") from exc
 
@@ -1047,7 +1362,7 @@ class RunnerCoordinator:
         if type(run_id) is not str or not run_id:
             raise ValueError("active runner claim is required")
         try:
-            findings = validate_canary_findings(findings_projection)
+            findings = validate_runner_findings(findings_projection)
             runtime_terminal = self.control.runtime.load_terminal_state(run_id)
             if runtime_terminal is None:
                 raise RunnerStoreError("local terminal disclosure authority is unavailable")

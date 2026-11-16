@@ -67,9 +67,9 @@ UNCHANGED_SHA256 = {
     # H2-LINK-DIAGNOSTICS-R1: H0's default-disabled capture observer (was a1b32cc4...). A shared-helper
     # change: H0/H1F regressions and a fresh H0 qualification are required; it is not H2-only.
     "scripts/host_ingress_proof.py": "76958e1896110155aea9802996f00408c097a2a238b8c73ede138eafbccd4aa4",
-    # RC5 pin refresh: only app.lockfile_sha256 changes (was e011c0cf..., RC4); the npm root version
-    # is now 1.3.0-rc.5, so it names the tracked lockfile d942fca3.... H2 closure moves; UNRUN.
-    "deploy/host/ingress/runtime-lock.json": "eb5c9d3ca2462df59dda2951cc600b7287f7aa5b8b6588ebc6faf2d969e9b77e",
+    # RC6 pin refresh: only app.lockfile_sha256 changes (was eb5c9d3c..., RC5); the npm root version
+    # is now 1.3.0-rc.6, so it names the tracked lockfile bda6d446.... H2 closure moves; UNRUN.
+    "deploy/host/ingress/runtime-lock.json": "7e7f96164d588a562b4ef4de122d7019b38ac80d31fa277f1c03c4394839b80e",
 }
 RECORDED_PICK = {"targets": ("8.8.8.8", "8.8.4.4"), "unapproved_target": "1.1.1.1", "wrong_source": "9.9.9.9",
                  "dual_stack_ipv6": "2001:4860:4860::8888"}

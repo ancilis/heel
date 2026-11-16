@@ -2,12 +2,24 @@
 from __future__ import annotations
 
 import base64
+import secrets
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from heel.canary_contracts import (
     APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_COMPILER_VERSION,
+    CONFIGURED_ENGINE_VERSION,
+    CONFIGURED_ROLE_ORDER,
+    CONFIGURED_TEST_MANIFEST_SCHEMA,
+    MAX_CONFIGURED_TEST_INSTANCES,
+    configured_assertion_refs,
+    configured_projection_instance,
+    validate_configured_approval_projection,
+    validate_configured_test_manifest,
     TEST_MANIFEST_SCHEMA,
     canonical_bytes,
     canonical_digest,
@@ -17,6 +29,11 @@ from heel.canary_contracts import (
 from heel.runner.identity import RunnerIdentity, SecureSigner
 
 from .catalog import CATALOG_BY_ID, CATALOG_IDS
+from .content_assertion import (
+    LiveAssertionError,
+    live_read_assertion_digest,
+    validate_live_read_assertion,
+)
 from .openapi_routes import RouteInventory, normalize_route_template
 from .store import RunnerStore, UnsupportedSecureStorageError
 from .vault import EphemeralVault, VaultUnavailable, validate_credential_secret
@@ -36,6 +53,17 @@ RETRY_POLICY = {
 LOCAL_EVIDENCE_RETENTION_SECONDS = 24 * 60 * 60
 COMPILER_VERSION = "1"
 ENGINE_VERSION = "1"
+
+
+_CONFIGURED_SPEC_FIELDS = frozenset({
+    "test_instance_id", "scenario_id", "source_scenario_id", "source_revision",
+    "method", "route_template", "assertion", "local_inputs",
+})
+
+
+def new_test_instance_id() -> str:
+    """A fresh stable identifier for one configured test instance (``lti_`` + 128 random bits)."""
+    return "lti_" + secrets.token_hex(16)
 
 
 @dataclass(frozen=True)
@@ -370,6 +398,228 @@ class CanaryCompiler:
         if persist:
             self.store.save_approved_pair(manifest, projection)
         return result
+
+    def compile_configured(
+        self,
+        instances: Sequence[Mapping[str, Any]],
+        *,
+        projection_id: str | None = None,
+        persist: bool = True,
+        _pinned_inputs: Mapping[str, list[Mapping[str, str]]] | None = None,
+    ) -> CompileResult:
+        """Compile 1-4 configured live-read instances into a signed manifest v2 / projection v3.
+
+        Each instance freezes its catalog primitive, source scenario/revision, inventoried
+        method/route, the E1 assertion and its digest, and the exact CURRENT local input
+        handle of each referenced name. Later name changes never alter this approval.
+        """
+        if isinstance(instances, (str, bytes)) or not isinstance(instances, Sequence):
+            raise ValueError("configured instances must be a list")
+        if not 1 <= len(instances) <= MAX_CONFIGURED_TEST_INSTANCES:
+            raise ValueError("a plan has one to four configured instances")
+        _, credential_records = self._inputs(())
+        context = self.store.load_context()
+        inventory = {(item["method"], item["route_template"]): item for item in self.store.list_routes()}
+        frozen: list[dict[str, Any]] = []
+        actions: list[dict[str, Any]] = []
+        credentials: dict[str, dict[str, str]] = {}
+        for ordinal, spec in enumerate(instances):
+            if not isinstance(spec, Mapping) or set(spec) != _CONFIGURED_SPEC_FIELDS:
+                raise ValueError("configured instance must use the closed field set")
+            scenario_id = spec["scenario_id"]
+            if scenario_id not in CONFIGURED_ROLE_ORDER:
+                raise ValueError("configured instances support only the two live-read primitives")
+            catalog = CATALOG_BY_ID[scenario_id]
+            method = spec["method"]
+            if type(method) is not str or method not in catalog["allowed_methods"]:
+                raise ValueError("configured instance permits GET or HEAD only")
+            route, placeholders = normalize_route_template(spec["route_template"])
+            if (method, route) not in inventory:
+                raise ValueError("configured route is not in the bound inventory")
+            if placeholders:
+                raise ValueError("configured routes with placeholders are not supported")
+            definition = spec["assertion"]
+            try:
+                assertion = validate_live_read_assertion(definition)
+            except LiveAssertionError:
+                raise ValueError("configured assertion is invalid") from None
+            canonical = assertion.to_json()
+            for path in (assertion.witness_path, assertion.condition_path):
+                if any(
+                    type(segment) is str and unicodedata.normalize("NFC", segment) != segment
+                    for segment in path
+                ):
+                    raise ValueError("configured assertion path segments must be NFC")
+            refs = configured_assertion_refs(canonical)
+            names = spec["local_inputs"]
+            if not isinstance(names, Mapping) or sorted(names) != refs:
+                raise ValueError("local inputs must name exactly the assertion references")
+            pinned = (_pinned_inputs or {}).get(spec["test_instance_id"])
+            if pinned is not None:
+                local_inputs = [dict(item) for item in pinned]
+            else:
+                local_inputs = [{
+                    "fixture_ref": ref,
+                    "input_handle_id": self.store.current_live_input(names[ref])["input_handle_id"],
+                } for ref in refs]
+            roles = CONFIGURED_ROLE_ORDER[scenario_id]
+            role_records = {}
+            for role in roles:
+                if role == "anonymous":
+                    continue
+                record = credential_records.get(role)
+                if record is None:
+                    raise ValueError("every nonanonymous semantic role requires a credential")
+                role_records[role] = record
+            profiles = {record["auth_profile"] for record in role_records.values()}
+            if len(profiles) != 1:
+                raise ValueError("comparison roles require the same nonanonymous auth profile")
+            profile = next(iter(profiles))
+            instance_id = spec["test_instance_id"]
+            frozen.append({
+                "ordinal": ordinal,
+                "test_instance_id": instance_id,
+                "scenario_id": scenario_id,
+                "adapter_version": catalog["adapter_version"],
+                "source": {
+                    "source_scenario_id": spec["source_scenario_id"],
+                    "source_revision": spec["source_revision"],
+                },
+                "method": method,
+                "route_template": route,
+                "assertion": canonical,
+                "assertion_digest": live_read_assertion_digest(assertion),
+                "local_inputs": local_inputs,
+            })
+            for role in roles:
+                actions.append({
+                    "ordinal": len(actions),
+                    "test_instance_id": instance_id,
+                    "scenario_id": scenario_id,
+                    "adapter_version": catalog["adapter_version"],
+                    "method": method,
+                    "route_template": route,
+                    "fixture_bindings": [],
+                    "semantic_auth_role": role,
+                    "auth_profile": "anonymous" if role == "anonymous" else profile,
+                    "assertion_class": catalog["assertion_class"],
+                    "allowed_status_codes": list(catalog["allowed_status_codes"]),
+                    "allowed_body_shapes": list(catalog["allowed_body_shapes"]),
+                    "side_effect_class": catalog["side_effect_class"],
+                })
+                if role != "anonymous":
+                    record = role_records[role]
+                    credentials[role] = {
+                        "semantic_role": role,
+                        "credential_handle_id": record["credential_handle_id"],
+                        "auth_profile": record["auth_profile"],
+                    }
+        environment = {
+            "environment_id": context.environment_id,
+            "verification_record_digest": context.verification_record_digest,
+            "origin": context.origin,
+            "environment_class": context.environment_class,
+        }
+        hostname = urlsplit(context.origin).hostname
+        assert hostname is not None
+        compiler = {
+            "compiler_version": CONFIGURED_COMPILER_VERSION,
+            "engine_version": CONFIGURED_ENGINE_VERSION,
+        }
+        manifest: dict[str, Any] = {
+            "schema_version": CONFIGURED_TEST_MANIFEST_SCHEMA,
+            "workspace_id": context.workspace_id,
+            "project_id": context.project_id,
+            "environment": environment,
+            "runner": {
+                "runner_id": self.identity.runner_id,
+                "runner_key_id": self.identity.key_id,
+                "minimum_runner_version": self.identity.runner_version,
+            },
+            "compiler": compiler,
+            "test_instances": frozen,
+            "actions": actions,
+            "credential_bindings": sorted(
+                credentials.values(),
+                key=lambda item: (
+                    item["semantic_role"], item["auth_profile"], item["credential_handle_id"],
+                ),
+            ),
+            "budgets": dict(BUDGETS),
+            "egress": {"hostname": hostname, "port": 443, "redirect_policy": "deny"},
+            "retry_policy": {
+                "maximum_retries": RETRY_POLICY["maximum_retries"],
+                "retryable_failure_codes": list(RETRY_POLICY["retryable_failure_codes"]),
+            },
+            "local_evidence_policy": {"retention_seconds": LOCAL_EVIDENCE_RETENTION_SECONDS},
+            "compiled_at_ms": self.now_ms,
+        }
+        try:
+            manifest["manifest_digest"] = canonical_digest(manifest)
+            manifest = validate_configured_test_manifest(manifest)
+        except ValueError:
+            raise ValueError("configured instances do not form a valid signed manifest") from None
+        unsigned = {
+            "schema_version": CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+            "projection_id": projection_id or f"projection_{manifest['manifest_digest'][:24]}",
+            "workspace_id": context.workspace_id,
+            "project_id": context.project_id,
+            "environment": environment,
+            "runner": {
+                "runner_id": self.identity.runner_id,
+                "runner_key_id": self.identity.key_id,
+                "runner_version": self.identity.runner_version,
+                "adapter_versions": sorted({item["adapter_version"] for item in frozen}),
+            },
+            "compiler": compiler,
+            "test_instances": [configured_projection_instance(item) for item in manifest["test_instances"]],
+            "actions": [{
+                key: value for key, value in action.items()
+                if key not in {"fixture_bindings", "auth_profile"}
+            } for action in manifest["actions"]],
+            "budgets": dict(BUDGETS),
+            "egress": manifest["egress"],
+            "retry_policy": manifest["retry_policy"],
+            "compiled_at_ms": self.now_ms,
+            "manifest_digest": manifest["manifest_digest"],
+        }
+        signature = self.signer.sign(canonical_bytes(unsigned))
+        if not isinstance(signature, bytes) or len(signature) != 64:
+            raise ValueError("runner signer must return a 64-byte Ed25519 signature")
+        projection = validate_configured_approval_projection({
+            **unsigned,
+            "projection_digest": canonical_digest(unsigned),
+            "signing_key_id": self.identity.key_id,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+        })
+        result = CompileResult(manifest=manifest, projection=projection)
+        if persist:
+            self.store.save_approved_pair(manifest, projection)
+        return result
+
+    def compile_configured_replay(self, regression: Mapping[str, Any]) -> CompileResult:
+        """Fresh one-instance plan from a saved configured regression's exact frozen inputs.
+
+        The frozen local input handles are reused as-is (never re-resolved by name); a revoked
+        or missing handle refuses. The result still needs a new approval and one-shot grant.
+        """
+        from .regressions import check_replay_inputs, configured_replay_instance
+
+        check_replay_inputs(self.store, regression)
+        frozen = configured_replay_instance(regression)
+        spec = {
+            "test_instance_id": frozen["test_instance_id"],
+            "scenario_id": frozen["scenario_id"],
+            "source_scenario_id": frozen["source"]["source_scenario_id"],
+            "source_revision": frozen["source"]["source_revision"],
+            "method": frozen["method"],
+            "route_template": frozen["route_template"],
+            "assertion": frozen["assertion"],
+            "local_inputs": {item["fixture_ref"]: item["fixture_ref"] for item in frozen["local_inputs"]},
+        }
+        return self.compile_configured(
+            [spec], _pinned_inputs={frozen["test_instance_id"]: frozen["local_inputs"]},
+        )
 
     def compile_plan_differential_pair(
         self,

@@ -1941,6 +1941,9 @@ def test_serve_exits_execution_unavailable_for_an_undecodable_claim_without_traf
             calls.append("submit_pending")  # nothing queued: no control call
             return None
 
+        def process_configured_plan(self):
+            calls.append("configured")  # no open configured request: no control call
+
         def claim(self):
             calls.append("claim")
             self.control.runtime.active.append(type("Active", (), {"run_id": "crun_" + "a" * 32})())
@@ -1964,7 +1967,7 @@ def test_serve_exits_execution_unavailable_for_an_undecodable_claim_without_traf
     with pytest.raises(daemon_module.RunnerServeError) as refused:
         service.run_once()
     assert refused.value.code == "execution_unavailable"
-    assert calls == ["ensure", "submit_pending", "claim"]  # no heartbeat, progress, result or stop-ack
+    assert calls == ["ensure", "submit_pending", "configured", "claim"]  # no heartbeat, progress, result or stop-ack
     assert daemon_module._serve_failure(refused.value) == ("failed", "execution_unavailable")
     # A claim that fails without recording a run keeps its own failure.
     plain = Coordinator()
@@ -2647,6 +2650,243 @@ def test_accepted_remote_ack_with_a_lost_answer_fails_closed_on_the_null_ack_res
         _fresh_coordinator(bridge)
     assert bridge.control.operations() == operations
     assert bridge.vault.loads == [] and held.sockets.calls == [] and held.resolver.calls == ["staging.acme.dev"]
+
+
+class _LostClaimControl(_BridgeControl):
+    """BRIDGE-CONTROL whose first claim answer is lost after the Cloud committed it.
+
+    The exact staged replay answers the same 200 claim; every later fresh claim is idle (204),
+    which is what the Cloud answers once the run is already claimed for this runner.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.claims = 0
+
+    def post(self, path, *, headers, body):
+        if path.endswith("/claim"):
+            with self._lock:
+                self.claims += 1
+                count = self.claims
+                if count != 2:
+                    self.requests.append((path, body))
+            if count == 1:
+                raise ConnectionResetError("synthetic lost claim answer")
+            if count > 2:
+                nonce = {"X-Heel-Runner-Next-Nonce": base64.b64encode(os.urandom(32)).decode("ascii")}
+                return 204, nonce, None
+        return super().post(path, headers=headers, body=body)
+
+
+def _recovered_claim_bridge(tmp_path, monkeypatch, **control):
+    """A bridge whose claim answer was lost, rebuilt the way the next serve cycle rebuilds it."""
+    monkeypatch.setattr(sys.modules[__name__], "_BridgeControl", _LostClaimControl)
+    bridge = _bridge(tmp_path, **control)
+    with pytest.raises(Exception):
+        bridge.coordinator.claim()
+    assert [item.request_operation for item in bridge.runtime.load_pending_calls(limit=74)] == ["claim"]
+    fresh = _fresh_coordinator(bridge)  # replays the staged claim byte-identically: 200
+    bridge.coordinator = fresh
+    run_id = bridge.grant["run_id"]
+    assert bridge.runtime.load_pending_calls(limit=74) == ()
+    assert [item.run_id for item in bridge.runtime.load_active_run_controls(limit=64)] == [run_id]
+    assert bridge.store.load_run(run_id)["state"] == "verified"  # reserved, never activated
+    assert bridge.store.load_run_events(run_id) == []
+    assert run_id in fresh._gates and run_id not in fresh._gate_receipts  # receipt-stale
+    assert bridge.control.operations() == ["claim", "claim"]
+    return bridge
+
+
+class _OrderedResolver:
+    def __init__(self, inner, order):
+        self.inner, self.order = inner, order
+
+    @property
+    def calls(self):
+        return self.inner.calls
+
+    def __call__(self, hostname, *, deadline):
+        self.order.append(("dns", hostname))
+        return self.inner(hostname, deadline=deadline)
+
+
+def test_normal_service_executes_a_recovered_unexecuted_claim_after_fresh_authority(tmp_path, monkeypatch):
+    """Lost claim answer -> staged replay 200 on restart -> the normal service step hands the
+    recovered, never-activated run to the ordinary executor after one fresh signed heartbeat, and
+    only then resolves the target. Exactly one execution: later steps and a restart replay none."""
+    from tests.test_runner_http_transport import PUBLIC, TLS, Resolver, Sockets, TLSSocket
+
+    bridge = _recovered_claim_bridge(tmp_path, monkeypatch)
+    run_id = bridge.grant["run_id"]
+    order = []
+    scripted_post = bridge.control.post
+
+    def ordered_post(path, *, headers, body):
+        order.append(("control", path.rsplit("/", 1)[1]))
+        return scripted_post(path, headers=headers, body=body)
+
+    bridge.control.post = ordered_post
+    resolver = _OrderedResolver(Resolver([[PUBLIC]]), order)
+    tls_sockets = [TLSSocket(answer) for answer in _target_answers()]
+    sockets = Sockets(tls_sockets)
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    assert service.run_once() is True
+    owner.close()
+    # The dispatch step sends no fresh claim: the first control call is the recovered heartbeat,
+    # signed over the recovered claimed projection, and it precedes every target DNS lookup.
+    assert order[0] == ("control", "heartbeat")
+    first_dns = next(index for index, item in enumerate(order) if item[0] == "dns")
+    assert ("control", "heartbeat") in order[:first_dns]
+    operations = bridge.control.operations()
+    assert operations[:3] == ["claim", "claim", "heartbeat"] and operations.count("claim") == 2
+    recovered_heartbeat = bridge.control.bodies("heartbeat")[0]
+    assert (recovered_heartbeat["run_id"], recovered_heartbeat["lifecycle_phase"]) == (run_id, "claimed")
+    assert recovered_heartbeat["event_sequence"] == 0
+    assert [call[0] for call in resolver.calls] == ["staging.acme.dev"] * 5
+    assert [call[0] for call in sockets.calls] == [(PUBLIC, 443)] * 4
+    assert sorted(bridge.vault.loads) == sorted(bridge.vault.tokens)
+    _assert_terminal_evidence(bridge, "completed", evidence_count=4)
+    _assert_no_secret_left_the_target(bridge)
+    assert operations.count("result") == 1
+    # Exactly once: a restart over the same store/runtime finds no active run to recover.
+    before = bridge.control.operations()
+    fresh = _fresh_coordinator(bridge)
+    assert bridge.runtime.load_active_run_controls(limit=64) == ()
+    assert run_id not in fresh._gates
+    assert bridge.control.operations() == before
+    assert len(resolver.calls) == 5 and len(sockets.calls) == 4
+
+
+def _assert_not_dispatched(bridge, service, owner, resolver, sockets, *, state="verified"):
+    run_id = bridge.grant["run_id"]
+    assert service.run_once() is False  # the fresh claim is idle; nothing was handed to execution
+    owner.close()
+    assert resolver.calls == [] and sockets.calls == [] and bridge.vault.loads == []
+    assert bridge.factory_calls == []
+    assert bridge.store.load_run(run_id)["state"] == state
+    operations = bridge.control.operations()
+    assert "progress" not in operations and "result" not in operations and "stop-ack" not in operations
+    assert operations[-1] == "claim"  # fell through to an ordinary fresh claim
+    return operations
+
+
+@pytest.mark.parametrize("gate", [
+    {"stop_reason": "cloud_stop"},
+    {"runner_state": "revoked"},
+    {"proof_state": "revoked"},
+    {"active": False, "stop_reason": "kill_switch", "kill_switch_generation": 8},
+])
+def test_recovered_claim_denied_by_its_fresh_heartbeat_is_never_executed(tmp_path, monkeypatch, gate):
+    """A stop, revocation or kill switch answered to the recovered heartbeat ends dispatch before
+    activation: no executor, vault, DNS, socket, progress, result or acknowledgement, and the same
+    process never asks again."""
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    bridge = _recovered_claim_bridge(tmp_path, monkeypatch, stop_gate=gate)
+    resolver, sockets = Resolver([]), Sockets([])
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    operations = _assert_not_dispatched(bridge, service, owner, resolver, sockets)
+    assert operations == ["claim", "claim", "heartbeat", "claim"]
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    assert service.run_once() is False
+    owner.close()
+    assert bridge.control.operations() == operations + ["claim"]  # one recovery attempt per process
+
+
+@pytest.mark.parametrize("local", ["running", "logged"])
+def test_recovered_claim_already_activated_locally_is_never_replayed(tmp_path, monkeypatch, local):
+    """A recovered run whose local reservation left ``verified``, or that already holds a signed
+    containment event, may have begun activation: the normal service neither heartbeats nor
+    executes it again."""
+    from heel.runner.containment import ContainmentLog
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    bridge = _recovered_claim_bridge(tmp_path, monkeypatch)
+    run_id = bridge.grant["run_id"]
+    if local == "running":
+        bridge.store.transition_run(run_id, "running", now_ms=bridge.clock())
+    else:
+        ContainmentLog(
+            store=bridge.store, signer=bridge.coordinator.signer, run_id=run_id,
+            grant_id=bridge.grant["grant_id"], manifest_digest=bridge.manifest["manifest_digest"],
+            clock_ms=bridge.clock,
+        ).append("grant_verified", detail_code="grant_exact")
+    resolver, sockets = Resolver([]), Sockets([])
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    state = "running" if local == "running" else "verified"
+    operations = _assert_not_dispatched(bridge, service, owner, resolver, sockets, state=state)
+    assert operations == ["claim", "claim", "claim"]
+
+
+def test_executor_refuses_to_adopt_a_recovered_reservation_that_holds_a_containment_event(tmp_path, monkeypatch):
+    """Defense in depth below the coordinator: the ordinary executor adopts a restart-recovered
+    reservation only while it is ``verified`` with an empty containment log, so a lease handed to
+    it for an already-logged run keeps the fresh retention and is refused by the store's exact
+    grant marker, before any vault, DNS or socket use."""
+    from heel.runner.containment import ContainmentLog
+    from heel.runner.http_transport import CancellationToken
+    from heel.runner.service import ClaimLease
+    from heel.runner.execution import ExecutionBundle
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    bridge = _recovered_claim_bridge(tmp_path, monkeypatch)
+    run_id, coordinator = bridge.grant["run_id"], bridge.coordinator
+    ContainmentLog(
+        store=bridge.store, signer=coordinator.signer, run_id=run_id,
+        grant_id=bridge.grant["grant_id"], manifest_digest=bridge.manifest["manifest_digest"],
+        clock_ms=bridge.clock,
+    ).append("grant_verified", detail_code="grant_exact")
+    active = bridge.runtime.load_active_run_controls(limit=64)[0]
+    manifest, projection = bridge.store.load_approved_pair(active.approval_id)
+    snapshot = coordinator._claimed_projection(
+        manifest, projection, dict(active.grant), claimed_at_ms=active.claimed_at_ms,
+    )
+    coordinator.heartbeat(run_id, snapshot)  # a fresh receipt, so only the adoption guard decides
+    resolver, sockets = Resolver([]), Sockets([])
+    execution = daemon_module._ServeExecution(
+        coordinator, clock_ms=bridge.clock, vault_factory=bridge.vault_factory,
+        target_network={"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)},
+    )
+    lease = ClaimLease(run_id, ExecutionBundle(manifest, projection, dict(active.grant)), snapshot)
+    with pytest.raises(ValueError, match="execution grant was already consumed"):
+        execution.execute(lease, cancellation=CancellationToken(), on_progress=lambda _value: None)
+    assert resolver.calls == [] and sockets.calls == [] and bridge.vault.loads == []
+    assert bridge.store.load_run(run_id)["state"] == "verified"
+    assert len(bridge.store.load_run_events(run_id)) == 1
+
+
+def test_recovered_claim_with_a_heartbeat_already_answered_is_never_dispatched(tmp_path, monkeypatch):
+    """Once any heartbeat for the run was answered, Cloud may hold a different claimed snapshot;
+    the recovered dispatch requires the claim-only runtime revision and sends nothing for it."""
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    bridge = _recovered_claim_bridge(tmp_path, monkeypatch)
+    run_id = bridge.grant["run_id"]
+    active = bridge.runtime.load_active_run_controls(limit=64)[0]
+    manifest, projection = bridge.store.load_approved_pair(active.approval_id)
+    snapshot = bridge.coordinator._claimed_projection(
+        manifest, projection, dict(active.grant), claimed_at_ms=active.claimed_at_ms,
+    )
+    bridge.coordinator.heartbeat(run_id, snapshot)
+    assert bridge.runtime.load_active_run_controls(limit=64)[0].revision == 2
+    bridge.coordinator = _fresh_coordinator(bridge)  # receipt-stale again, revision stays 2
+    assert run_id in bridge.coordinator._gates and run_id not in bridge.coordinator._gate_receipts
+    resolver, sockets = Resolver([]), Sockets([])
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    operations = _assert_not_dispatched(bridge, service, owner, resolver, sockets)
+    assert operations == ["claim", "claim", "heartbeat", "claim"]
+
+
+def test_recovered_claim_whose_grant_expired_after_restart_is_never_dispatched(tmp_path, monkeypatch):
+    """Expiry between restart and the service step is checked locally before any heartbeat."""
+    from tests.test_runner_http_transport import TLS, Resolver, Sockets
+
+    bridge = _recovered_claim_bridge(tmp_path, monkeypatch)
+    bridge.coordinator.clock_ms = lambda: bridge.grant["expires_at_ms"] + 1
+    resolver, sockets = Resolver([]), Sockets([])
+    owner, service = _bridge_service(bridge, {"resolver": resolver, "sockets": sockets, "tls": TLS(sockets)})
+    operations = _assert_not_dispatched(bridge, service, owner, resolver, sockets)
+    assert operations == ["claim", "claim", "claim"]
 
 
 def test_stop_known_before_local_activation_reserves_loads_and_dials_nothing(tmp_path, monkeypatch):

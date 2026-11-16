@@ -6,11 +6,22 @@ import { useEffect, useRef, useState } from "react";
 
 import type {
   CustomScenarioInput,
+  LiveReadAssertion,
   ScenarioBindableCatalogId,
   ScenarioLibrary,
   ScenarioLibraryEntry,
 } from "../../lib/canary-api";
 import { CanaryApiError } from "../../lib/canary-api";
+import { COMPARISON_LABELS, conditionText, successCheckText, type LocalBackend, type LocalValueType } from "../../lib/live-test-text";
+import { LocalValueCommands } from "../canary/LocalValueChoices";
+import {
+  LiveAssertionFields,
+  emptyLiveAssertionDraft,
+  hydrateLiveAssertion,
+  validateLiveAssertionDraft,
+  type LiveAssertionDraft,
+  type LiveAssertionValidation,
+} from "../onboarding/LiveAssertionFields";
 import type {
   RetainedBrowserInput,
   ScenarioAssessmentEnvelopeV1,
@@ -41,6 +52,65 @@ export interface ScenarioLibraryCardProps {
   createAssessor: () => ScenarioAssessor;
   /** The ReviewWorkspace's retained local input, when one exists in this browser. */
   retainedInput?: RetainedBrowserInput | null;
+  /** Called after a revision is saved, so other cards re-read server state. */
+  onSaved?: () => void;
+}
+
+// The static fields a new private copy takes from its library template (a subset of the server's
+// CUSTOM_EVALUATION_FIELDS). Library investigation_signals use operators the custom validator refuses, and they
+// are optional, so a guided copy omits them rather than failing the save.
+const CUSTOM_FIELDS = new Set([
+  "id", "category", "objective", "kind", "success_criterion", "severity_model", "recommended_control",
+  "containment_limits", "applies_when", "pack", "probe_strategy", "exploitability_reduction",
+]);
+const TEMPLATE_FOR: Readonly<Record<ScenarioBindableCatalogId, string>> = Object.freeze({
+  plan_entitlement_read: "sc.flag.tiergate",
+  anonymous_authenticated_read: "sc.endpoint.hidden",
+});
+const SLUG = /^[a-z0-9][a-z0-9-]{1,60}$/;
+
+/** A browser-side pre-check; the server's route validation stays authoritative. */
+export function routeProblem(route: string): string | null {
+  if (route === "") return "Enter the exact imported path, for example /billing/features.";
+  if (!route.startsWith("/")) return "The path must begin with /.";
+  if (route.includes("{") || route.includes("}")) {
+    return "Parameterized routes are not supported for configured tests yet. Choose a literal imported route.";
+  }
+  if (route.includes("?") || route.includes("#") || route.includes("//") || /\s/.test(route)) {
+    return "Enter only the path: no query, fragment, spaces or empty segments.";
+  }
+  if (new TextEncoder().encode(route).byteLength > 512) return "The path is too long.";
+  return null;
+}
+
+type GuidedForm = {
+  editId: string | null;
+  slug: string;
+  objective: string;
+  comparison: ScenarioBindableCatalogId;
+  method: "GET" | "HEAD";
+  route: string;
+  draft: LiveAssertionDraft;
+  validation: LiveAssertionValidation;
+  attempted: boolean;
+};
+
+function newGuidedForm(): GuidedForm {
+  const draft = emptyLiveAssertionDraft();
+  return {
+    editId: null, slug: "", objective: "", comparison: "plan_entitlement_read", method: "GET", route: "",
+    draft, validation: validateLiveAssertionDraft(draft), attempted: false,
+  };
+}
+
+function guidedFromRow(row: ScenarioLibraryEntry): GuidedForm {
+  const live = row.liveTest;
+  const draft = (live ? hydrateLiveAssertion(live.assertion) : null) ?? emptyLiveAssertionDraft();
+  return {
+    editId: row.id, slug: row.id.replace(/^sc\.(?:internal|community)\./, ""), objective: row.objective,
+    comparison: live?.scenarioId ?? "plan_entitlement_read", method: live?.method ?? "GET",
+    route: live?.routeTemplate ?? "", draft, validation: validateLiveAssertionDraft(draft), attempted: false,
+  };
 }
 
 export const OUTCOME_WORDS: Readonly<Record<ScenarioAssessmentOutcome, string>> = Object.freeze({
@@ -77,7 +147,11 @@ function errorText(error: unknown): string {
  * outcome. Static assessment runs only in this browser over the customer's own OpenAPI document, with only the
  * scenarios the customer selected, and its result is never uploaded.
  */
-export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssessor, retainedInput = null }: ScenarioLibraryCardProps) {
+export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssessor, retainedInput = null, onSaved }: ScenarioLibraryCardProps) {
+  const [guided, setGuided] = useState<GuidedForm>(newGuidedForm);
+  const [savedNote, setSavedNote] = useState<{ id: string; revision: number; refs: readonly string[] } | null>(null);
+  const [backend, setBackend] = useState<LocalBackend>("keychain");
+  const [valueTypes, setValueTypes] = useState<Readonly<Record<string, LocalValueType>>>({});
   const [library, setLibrary] = useState<Readonly<ScenarioLibrary> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
@@ -136,6 +210,53 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
       setAcknowledged(false);
       setAssessment(null);
       setReloadTick((value) => value + 1);
+    } catch (error) {
+      setNotice(errorText(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const editing = guided.editId === null || library === null ? null
+    : library.scenarios.find((row) => row.source === "custom" && row.id === guided.editId) ?? null;
+  const guidedId = guided.editId ?? `sc.internal.${guided.slug}`;
+  const slugError = guided.editId !== null || SLUG.test(guided.slug) ? null
+    : "Use 2-61 lowercase letters, digits or hyphens, starting with a letter or digit.";
+  const objectiveError = guided.objective.trim() === "" ? "Describe what this test protects." : null;
+  const routeError = routeProblem(guided.route);
+  const guidedReady = canManage && !busy && library !== null && slugError === null && objectiveError === null
+    && routeError === null && guided.validation.ok;
+  const showGuidedErrors = guided.attempted;
+
+  const saveGuided = async () => {
+    setGuided((form) => ({ ...form, attempted: true }));
+    if (!guidedReady || library === null || !guided.validation.ok) return;
+    const template = library.scenarios.find((row) => row.id === TEMPLATE_FOR[guided.comparison]);
+    const base: Record<string, unknown> = editing !== null
+      ? { ...editing.definition }
+      : Object.fromEntries(Object.entries(template?.definition ?? {}).filter(([key]) => CUSTOM_FIELDS.has(key)));
+    if (editing === null && template === undefined) { setNotice("The library template is unavailable. Reload the library."); return; }
+    const limits = (base.containment_limits ?? {}) as Record<string, unknown>;
+    const definition = {
+      ...base, id: guidedId, objective: guided.objective.trim(),
+      containment_limits: { ...limits, no_live_targets: true },
+    };
+    setBusy(true);
+    setNotice(null);
+    try {
+      const saved = await api.createCustomScenario(workspaceRef, {
+        definition,
+        supersedesRevision: editing?.revision ?? null,
+        executionBinding: null,
+        liveTest: {
+          scenarioId: guided.comparison, method: guided.method, routeTemplate: guided.route,
+          assertion: guided.validation.assertion as LiveReadAssertion,
+        },
+      });
+      setSavedNote({ id: saved.id, revision: saved.revision ?? 1, refs: saved.liveTest?.localInputRefs ?? [] });
+      setGuided(newGuidedForm());
+      setReloadTick((value) => value + 1);
+      onSaved?.();
     } catch (error) {
       setNotice(errorText(error));
     } finally {
@@ -211,6 +332,16 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
                   ? `Runner-supported check: ${row.catalogScenarioId}`
                   : "Static analysis only"}</dd></div>
               </dl>
+              {row.source === "custom" ? (row.liveTest !== null ? <>
+                <p>Configured live test: {COMPARISON_LABELS[row.liveTest.scenarioId]} · <code>{row.liveTest.method} {row.liveTest.routeTemplate}</code></p>
+                <p>Success check: {successCheckText(row.liveTest.assertion)}. Condition: {conditionText(row.liveTest.assertion)}.</p>
+                <p>{row.liveTest.coverageStatement}</p>
+              </> : <p>Static only: no configured live test on this revision.</p>) : null}
+              {row.source === "custom" && canManage ? (
+                <button className="text-button" disabled={busy} onClick={() => { setSavedNote(null); setGuided(guidedFromRow(row)); }} type="button">
+                  Edit {row.id} (saves revision {(row.revision ?? 0) + 1})
+                </button>
+              ) : null}
               {row.coverageStatement ? <p>{row.coverageStatement}</p> : null}
               {row.prerequisites.length > 0 ? (
                 <ul aria-label={`Prerequisites for ${row.id}`}>
@@ -250,6 +381,78 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
         </fieldset>
 
         {canManage ? (
+          <fieldset className="custom-scenario-intake guided-live-test" aria-describedby="guided-live-test-note">
+            <legend>{editing ? `Edit private test ${editing.id}` : "Create a private live test"}</legend>
+            <p id="guided-live-test-note">
+              No JSON needed. A configured test reads one literal imported route once per role and checks one JSON field.
+              Expected values are named here and entered only on your runner; they never reach the browser or Heel Cloud.
+              {editing ? ` Saving creates revision ${(editing.revision ?? 0) + 1}; revision ${editing.revision} and every run that used it stay unchanged.` : ""}
+            </p>
+            {editing === null ? (
+              <label>
+                Test name
+                <span id="guided-slug-hint">Saved as <code>sc.internal.{guided.slug || "your-name"}</code>.</span>
+                <input aria-describedby={showGuidedErrors && slugError ? "guided-slug-hint guided-slug-error" : "guided-slug-hint"}
+                  aria-invalid={showGuidedErrors && slugError !== null} disabled={busy} value={guided.slug}
+                  onChange={(event) => setGuided((form) => ({ ...form, slug: event.target.value }))} />
+                {showGuidedErrors && slugError ? <span className="error-message" id="guided-slug-error">{slugError}</span> : null}
+              </label>
+            ) : null}
+            <label>
+              What this test protects
+              <textarea aria-describedby={showGuidedErrors && objectiveError ? "guided-objective-error" : undefined}
+                aria-invalid={showGuidedErrors && objectiveError !== null} disabled={busy} rows={2} value={guided.objective}
+                onChange={(event) => setGuided((form) => ({ ...form, objective: event.target.value }))} />
+              {showGuidedErrors && objectiveError ? <span className="error-message" id="guided-objective-error">{objectiveError}</span> : null}
+            </label>
+            <label>
+              Comparison
+              <select disabled={busy} value={guided.comparison}
+                onChange={(event) => setGuided((form) => ({ ...form, comparison: event.target.value as ScenarioBindableCatalogId }))}>
+                {BINDABLE.map((id) => <option key={id} value={id}>{COMPARISON_LABELS[id]}</option>)}
+              </select>
+            </label>
+            <div className="approval-fields">
+              <label>
+                Method
+                <span id="guided-method-hint">HEAD returns no body, so a field condition on HEAD is always inconclusive.</span>
+                <select aria-describedby="guided-method-hint" disabled={busy} value={guided.method}
+                  onChange={(event) => setGuided((form) => ({ ...form, method: event.target.value as "GET" | "HEAD" }))}>
+                  <option value="GET">GET</option>
+                  <option value="HEAD">HEAD</option>
+                </select>
+              </label>
+              <label>
+                Imported route
+                <span id="guided-route-hint">The exact literal path from the OpenAPI document imported on your runner.</span>
+                <input aria-describedby={guided.route !== "" && routeError ? "guided-route-hint guided-route-error" : "guided-route-hint"}
+                  aria-invalid={(guided.route !== "" || showGuidedErrors) && routeError !== null} disabled={busy} value={guided.route}
+                  onChange={(event) => setGuided((form) => ({ ...form, route: event.target.value }))} />
+                {(guided.route !== "" || showGuidedErrors) && routeError ? <span className="error-message" id="guided-route-error">{routeError}</span> : null}
+              </label>
+            </div>
+            <LiveAssertionFields draft={guided.draft} disabled={busy} showErrors={showGuidedErrors}
+              onChange={(draft, validation) => setGuided((form) => ({ ...form, draft, validation }))} />
+            <p>{library?.liveTestCoverageStatements[guided.comparison]}</p>
+            <div className="run-actions">
+              <button className="button button-primary" disabled={!canManage || busy} onClick={() => void saveGuided()} type="button">
+                {editing ? "Save new revision" : "Save private test"}
+              </button>
+              {editing ? <button className="button button-secondary" disabled={busy} onClick={() => setGuided(newGuidedForm())} type="button">Cancel edit</button> : null}
+            </div>
+            {savedNote ? (
+              <div role="status">
+                <p>Saved <code>{savedNote.id}</code> revision {savedNote.revision}. Before requesting a dry run, enter each named value on the runner (hidden prompt):</p>
+                <LocalValueCommands backend={backend} onBackend={setBackend} references={savedNote.refs}
+                  onType={(reference, value) => setValueTypes((current) => ({ ...current, [reference]: value }))} types={valueTypes} />
+              </div>
+            ) : null}
+          </fieldset>
+        ) : null}
+
+        {canManage ? (
+          <details className="custom-scenario-intake">
+          <summary>Advanced: paste a static scenario definition (JSON)</summary>
           <fieldset className="custom-scenario-intake">
             <legend>Save a private custom scenario</legend>
             <label>
@@ -275,6 +478,7 @@ export function ScenarioLibraryCard({ workspaceRef, api, canManage, createAssess
               Save custom revision
             </button>
           </fieldset>
+          </details>
         ) : null}
       </>}
     </section>

@@ -25,6 +25,7 @@ import unicodedata
 
 from heel.canary_contracts import (
     canonical_bytes, validate_approval_projection, validate_execution_grant,
+    validate_runner_approval_projection,
 )
 from heel.crypto import load_public_key_base64, verify_envelope
 from heel.runner.identity import (
@@ -37,7 +38,8 @@ _SCHEMA_V2 = "heel.runner-runtime-state.v2"
 _SCHEMA_V3 = "heel.runner-runtime-state.v3"
 _SCHEMA_V4 = "heel.runner-runtime-state.v4"
 _SCHEMA_V5 = "heel.runner-runtime-state.v5"
-_SCHEMA = "heel.runner-runtime-state.v6"
+_SCHEMA_V6 = "heel.runner-runtime-state.v6"
+_SCHEMA = "heel.runner-runtime-state.v7"
 _SEAL_DOMAIN = b"heel.runner-runtime-state-seal.v1\0"
 _STATE_KEY_WRAP_DOMAIN = b"heel.runner-runtime-state-key-wrap.v1\0"
 _DIGEST_DOMAIN = b"heel.runner-runtime-state-digest.v1\0"
@@ -52,7 +54,7 @@ _MAX_SUPERSEDED_CALLS = 512
 # Staged claim-chain intents an accepted resync may retire. The context calls are idempotent to
 # re-issue; a job ``claim`` is not, and is retired only on the server's own proof that its sequence
 # was never consumed (T2b2R1D cursor-equality ruling, see ``commit_resync_supersession``).
-_SUPERSEDABLE_OPERATIONS = frozenset({"list-contexts", "claim-context", "claim"})
+_SUPERSEDABLE_OPERATIONS = frozenset({"list-contexts", "claim-context", "configured-plan-sync", "claim"})
 # A retained terminal disclosure's staged result-chain call may be retired only on the server's
 # resync proof (rc5 result-chain recovery).  ``chain_authority_lost``: both resync cursors equal
 # the staged sequence (never consumed).  ``sequence_consumed``: both equal the staged sequence + 1,
@@ -66,6 +68,11 @@ _RESYNC_ATTEMPT_SCHEMA = "heel.runner-resync-attempt.v1"
 _SUPERSEDED_CALL_SCHEMA = "heel.runner-superseded-call.v1"
 # C recovery: a cloud-attested inactive, unexecuted claim is retired into one sealed archive row.
 _RETIRED_CLAIM_SCHEMA = "heel.runner-retired-claim.v1"
+# What retirement observed locally: no reservation, or a never-activated (verified, event-free) one.
+_RETIRED_LOCAL_OBSERVATIONS = (
+    {"reservation": "absent", "terminal": "absent"},
+    {"reservation": "reserved", "terminal": "absent"},
+)
 _RUN_CHAIN_OPERATIONS = ("heartbeat", "progress", "result", "stop-ack")
 _RETIRED_ATTESTATION_HEADERS = frozenset({
     "X-Heel-Runner-Id", "X-Heel-Runner-Key-Id", "X-Heel-Runner-Timestamp-Ms", "X-Heel-Runner-Signature",
@@ -98,7 +105,7 @@ _PENDING_CALL_SCHEMA = "heel.runner-pending-call.v1"
 _PENDING_BODY_CAPS = MappingProxyType({
     "claim": 256, "list-contexts": 128, "claim-context": 256,
     "heartbeat": 36_864, "progress": 36_864, "stop-ack": 36_864,
-    "result": 103_424, "submit-context-approval-projection": 69_632,
+    "result": 103_424, "submit-context-approval-projection": 69_632, "configured-plan-sync": 8_192,
     "upload-findings": 278_528, "poll-disclosure": 2_048,
 })
 _PENDING_BODY_MAX = 278_528
@@ -284,6 +291,27 @@ _PENDING_INDEX_SQL = tuple(
 )
 assert len(_PENDING_INDEX_SQL) == 2
 _V6_SCHEMA_SQL = (_V6_METADATA_SQL, _V5_SCHEMA_SQL[1], _V6_PENDING_SQL, *_V5_SCHEMA_SQL[3:])
+
+# v7 (E3 configured delivery) = v6 with one closed claim-chain operation registered on
+# pending_calls: ``configured-plan-sync``, the context-bound configured-plan request/readiness
+# exchange.  Every other table, index and row is unchanged; only pending_calls is rebuilt.
+_V7_METADATA_SQL = _V6_METADATA_SQL.replace(
+    "CHECK(schema_version='heel.runner-runtime-state.v6')",
+    "CHECK(schema_version='heel.runner-runtime-state.v7')",
+)
+assert _V7_METADATA_SQL != _V6_METADATA_SQL
+_V7_PENDING_SQL = _V6_PENDING_SQL.replace(
+    "'claim-context','submit-context-approval-projection')),",
+    "'claim-context','submit-context-approval-projection','configured-plan-sync')),",
+).replace(
+    "operation IN ('claim','list-contexts','claim-context','submit-context-approval-projection') OR",
+    "operation IN ('claim','list-contexts','claim-context','submit-context-approval-projection','configured-plan-sync') OR",
+)
+assert _V7_PENDING_SQL.count("'configured-plan-sync'") == 2
+_V7_SCHEMA_SQL = (_V7_METADATA_SQL, _V6_SCHEMA_SQL[1], _V7_PENDING_SQL, *_V6_SCHEMA_SQL[3:])
+_CLAIM_CHAIN_REQUESTS = frozenset({
+    "claim", "list-contexts", "claim-context", "submit-context-approval-projection", "configured-plan-sync",
+})
 
 # Tier A load guards: index columns only, never an archive blob.  CROSS JOIN fixes the bounded live
 # table as the outer loop, so retired_claims is reached only by primary-key search.
@@ -1625,6 +1653,8 @@ class RunnerRuntimeState:
             return "v5"
         if self._schema_matches(conn, _V6_SCHEMA_SQL):
             return "v6"
+        if self._schema_matches(conn, _V7_SCHEMA_SQL):
+            return "v7"
         raise RunnerRuntimeCorrupt("runtime state schema is invalid")
 
     @staticmethod
@@ -1747,7 +1777,7 @@ class RunnerRuntimeState:
             "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
             "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v5 "
             "WHERE schema_version=?",
-            (_SCHEMA, _SCHEMA_V5),
+            (_SCHEMA_V6, _SCHEMA_V5),
         )
         if changed.rowcount != 1:
             raise RunnerRuntimeCorrupt("runtime state schema is invalid")
@@ -1771,6 +1801,46 @@ class RunnerRuntimeState:
         if [tuple(row) for row in after] != [tuple(row) for row in before]:
             raise RunnerRuntimeCorrupt("runtime state schema is invalid")
         self._assert_schema_parity(conn, _V6_SCHEMA_SQL)
+
+    def _upgrade_v6_to_v7(self, conn: sqlite3.Connection) -> None:
+        """Register ``configured-plan-sync`` on pending_calls; every v6 row is kept byte for byte."""
+        if not self._schema_matches(conn, _V6_SCHEMA_SQL):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._validate_opaque_authority_rows(conn)
+        before = conn.execute(
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms "
+            "FROM pending_calls ORDER BY call_id"
+        ).fetchall()
+        conn.execute("ALTER TABLE metadata RENAME TO metadata_v6")
+        conn.execute(_V7_METADATA_SQL)
+        changed = conn.execute(
+            "INSERT INTO metadata(singleton,schema_version,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext) "
+            "SELECT singleton,?,workspace_id,runner_id,runner_key_id,public_key_digest,authority_epoch,authority_identity_digest,rotation_fence_digest,state_key_ciphertext FROM metadata_v6 "
+            "WHERE schema_version=?",
+            (_SCHEMA, _SCHEMA_V6),
+        )
+        if changed.rowcount != 1:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        conn.execute("DROP TABLE metadata_v6")
+        conn.execute("DROP INDEX idx_pending_calls_created")
+        conn.execute("DROP INDEX idx_pending_calls_run_operation")
+        conn.execute("ALTER TABLE pending_calls RENAME TO pending_calls_v6")
+        conn.execute(_V7_PENDING_SQL)
+        self._execute_schema(conn, _PENDING_INDEX_SQL)
+        copied = conn.execute(
+            "INSERT INTO pending_calls(call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms) "
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms FROM pending_calls_v6"
+        )
+        if copied.rowcount != len(before):
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        conn.execute("DROP TABLE pending_calls_v6")
+        after = conn.execute(
+            "SELECT call_id,chain,run_hash,operation,sequence,generation,sealed_blob,created_at_ms "
+            "FROM pending_calls ORDER BY call_id"
+        ).fetchall()
+        if [tuple(row) for row in after] != [tuple(row) for row in before]:
+            raise RunnerRuntimeCorrupt("runtime state schema is invalid")
+        self._assert_schema_parity(conn, _V7_SCHEMA_SQL)
 
     def _validate_opaque_authority_rows(self, conn: sqlite3.Connection) -> None:
         """Authenticate the legacy opaque index before a byte-for-byte v3 copy."""
@@ -1816,7 +1886,7 @@ class RunnerRuntimeState:
                 raise RunnerRuntimeCorrupt("runtime terminal disclosure index is invalid")
 
     def _validate_open_runtime(self, conn: sqlite3.Connection, *, allow_rotation_fence: bool = False) -> None:
-        self._assert_schema_parity(conn, _V6_SCHEMA_SQL)
+        self._assert_schema_parity(conn, _V7_SCHEMA_SQL)
         if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal" or conn.execute(
             "PRAGMA secure_delete"
         ).fetchone()[0] != 1 or conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
@@ -1876,7 +1946,7 @@ class RunnerRuntimeState:
         try:
             state = self._classify_schema(conn)
             if state == "none":
-                self._execute_schema(conn, _V6_SCHEMA_SQL)
+                self._execute_schema(conn, _V7_SCHEMA_SQL)
                 state_key = self._random_source(32)
                 if type(state_key) is not bytes or len(state_key) != 32:
                     raise RunnerRuntimeCorrupt("runtime state random source returned an invalid key")
@@ -1904,10 +1974,11 @@ class RunnerRuntimeState:
                 self._upgrade_v3_to_v4(conn)
                 self._upgrade_v4_to_v5(conn)
                 self._upgrade_v5_to_v6(conn)
-            elif state in {"v3", "v4", "v5", "v6"}:
+                self._upgrade_v6_to_v7(conn)
+            elif state in {"v3", "v4", "v5", "v6", "v7"}:
                 row = conn.execute("SELECT * FROM metadata WHERE singleton=1").fetchone()
                 expected_version = {
-                    "v3": _SCHEMA_V3, "v4": _SCHEMA_V4, "v5": _SCHEMA_V5, "v6": _SCHEMA,
+                    "v3": _SCHEMA_V3, "v4": _SCHEMA_V4, "v5": _SCHEMA_V5, "v6": _SCHEMA_V6, "v7": _SCHEMA,
                 }[state]
                 if row is None or row["schema_version"] != expected_version or tuple(
                     row[key] for key in ("workspace_id", "runner_id", "runner_key_id", "public_key_digest")
@@ -1920,6 +1991,8 @@ class RunnerRuntimeState:
                     self._upgrade_v4_to_v5(conn)
                 if state in {"v3", "v4", "v5"}:
                     self._upgrade_v5_to_v6(conn)
+                if state in {"v3", "v4", "v5", "v6"}:
+                    self._upgrade_v6_to_v7(conn)
             self._validate_open_runtime(conn, allow_rotation_fence=allow_rotation_fence)
             conn.execute("COMMIT")
         except BaseException:
@@ -3177,6 +3250,16 @@ class RunnerRuntimeState:
                 request == {"schema_version": "heel.runner-claim-request.v1"}
                 and pending.path == f"{prefix}/claim"
             )
+        elif pending.request_operation == "configured-plan-sync":
+            from heel.canary_contracts import validate_runner_configured_plan_sync
+
+            try:
+                valid = (
+                    validate_runner_configured_plan_sync(request) == request
+                    and pending.path == f"{prefix}/contexts/{request['binding_id']}/configured-plan-requests/sync"
+                )
+            except (TypeError, ValueError):
+                valid = False
         else:
             binding_id = request.get("binding_id")
             valid = (
@@ -3666,6 +3749,7 @@ class RunnerRuntimeState:
         valid_requests = {
             "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings",
             "poll-disclosure", "list-contexts", "claim-context", "submit-context-approval-projection",
+            "configured-plan-sync",
         }
         if request_operation not in valid_requests or chain_operation not in {
             "claim", "heartbeat", "progress", "result", "stop-ack",
@@ -3673,7 +3757,7 @@ class RunnerRuntimeState:
             raise RunnerRuntimeCorrupt("runtime pending call is invalid")
         run_id = _run_id(value["run_id"], nullable=True)
         expected_chain = (
-            "claim" if request_operation in {"claim", "list-contexts", "claim-context", "submit-context-approval-projection"}
+            "claim" if request_operation in _CLAIM_CHAIN_REQUESTS
             else "result" if request_operation in _RESULT_CHAIN_DISCLOSURE_OPERATIONS else request_operation
         )
         if chain_operation != expected_chain or ((chain_operation == "claim") != (run_id is None)):
@@ -3788,6 +3872,8 @@ class RunnerRuntimeState:
             return path.startswith(f"{prefix}/contexts/rcb_") and path.endswith("/claim")
         if request_operation == "submit-context-approval-projection":
             return path.startswith(f"{prefix}/contexts/rcb_") and path.endswith("/approval-projections")
+        if request_operation == "configured-plan-sync":
+            return path.startswith(f"{prefix}/contexts/rcb_") and path.endswith("/configured-plan-requests/sync")
         return False
 
     def _seal_pending_core(
@@ -3823,11 +3909,11 @@ class RunnerRuntimeState:
         _safe_int(now_ms, "runtime pending time")
         if request_operation not in {
             "claim", "heartbeat", "progress", "result", "stop-ack", "upload-findings",
-            "list-contexts", "claim-context", "submit-context-approval-projection",
+            "list-contexts", "claim-context", "submit-context-approval-projection", "configured-plan-sync",
         } or not self._expected_path(request_operation, run_id, path):
             raise RunnerRuntimeStateError("invalid runtime pending call")
         expected_chain = (
-            "claim" if request_operation in {"claim", "list-contexts", "claim-context", "submit-context-approval-projection"}
+            "claim" if request_operation in _CLAIM_CHAIN_REQUESTS
             else "result" if request_operation == "upload-findings" else request_operation
         )
         if chain_operation != expected_chain or ((chain_operation == "claim") != (run_id is None)):
@@ -4175,7 +4261,7 @@ class RunnerRuntimeState:
         claimed_at_ms: int, gate_received_at_ms: int, revision: int,
         prior_state_digest: str | None,
     ) -> dict[str, Any]:
-        checked_projection = validate_approval_projection(approval_projection)
+        checked_projection = validate_runner_approval_projection(approval_projection)
         checked_grant = validate_execution_grant(grant)
         checked_gate = self._validate_active_gate(gate)
         run_id = _run_id(run_id)
@@ -4796,14 +4882,14 @@ class RunnerRuntimeState:
     def _retired_core(
         self, *, run_id: str, created_at_ms: int, sealing_identity: Mapping[str, Any],
         active: Mapping[str, Any], chains: list[Mapping[str, Any]], pending: list[Mapping[str, Any]],
-        attestation: Mapping[str, Any],
+        attestation: Mapping[str, Any], reservation: str = "absent",
     ) -> dict[str, Any]:
         """Assemble the closed archive shape (RETIREMENT-RESYNC §4.1) and its retired digest."""
         core = {
             "schema_version": _RETIRED_CLAIM_SCHEMA, "reason": "cloud_inactive_attested",
             "run_id": run_id, "run_hash": _run_hash(run_id), "created_at_ms": created_at_ms,
             "sealing_identity": dict(sealing_identity),
-            "local_observations": {"reservation": "absent", "terminal": "absent"},
+            "local_observations": {"reservation": reservation, "terminal": "absent"},
             "chain_recovery": {
                 "run_chain_rows": 0,
                 "run_chains": {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS},
@@ -4848,7 +4934,7 @@ class RunnerRuntimeState:
         _safe_int(identity["authority_epoch"], "runtime retired sealing identity", minimum=1)
         keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
         if (
-            value["local_observations"] != {"reservation": "absent", "terminal": "absent"}
+            value["local_observations"] not in _RETIRED_LOCAL_OBSERVATIONS
             or not isinstance(value["chain_recovery"], Mapping)
             or set(value["chain_recovery"]) != {"run_chain_rows", "run_chains"}
             or type(value["chain_recovery"]["run_chain_rows"]) is not int
@@ -5030,8 +5116,11 @@ class RunnerRuntimeState:
         The caller, not this method, guarantees that no ``reserve_run`` caller exists in any process:
         it holds the exclusive serve lock for this HEEL_HOME and retires before hydration.  The
         snapshot digest proves only that the runtime row is unchanged; ``reservation_probe`` must be
-        the Store's ``RunReservationProbe.ABSENT`` observed under that ownership.  Pending delivery
-        stays uncertain, nothing in ``chain_recovery`` is written, and nothing grants execution.
+        the Store's ``RunReservationProbe.ABSENT`` observed under that ownership, or ``reserved``
+        when the caller observed, under the same ownership, a never-activated local reservation
+        (``verified`` with an empty containment log).  A reserved run's signed Store authority is
+        left untouched; only this runtime group is sealed and removed.  Pending delivery stays
+        uncertain, nothing in ``chain_recovery`` is written, and nothing grants execution.
 
         The archived ``local_observations.reservation`` is that ``RunReservationProbe`` value observed
         under the serve lock at retirement: ``absent`` means no reservation record exists now (never
@@ -5043,8 +5132,12 @@ class RunnerRuntimeState:
         run_hash = _run_hash(run_id)
         expected_state_digest = _digest(expected_state_digest, "runtime retirement state digest")
         now_ms = _safe_int(now_ms, "runtime retirement time")
-        if not isinstance(reservation_probe, str) or reservation_probe != "absent":
-            raise RunnerRuntimeConflict("runtime retirement requires an absent local reservation")
+        if not isinstance(reservation_probe, str) or reservation_probe not in {"absent", "reserved"}:
+            raise RunnerRuntimeConflict(
+                "runtime retirement requires an absent local reservation or a never-activated reserved one"
+            )
+        # Archive the canonical literal, never the caller's object (a str-valued probe enum).
+        reservation = "absent" if reservation_probe == "absent" else "reserved"
         attestation = self._retirement_attestation(evidence)
         keys = {operation: self._chain_key(operation, run_id) for operation in _RUN_CHAIN_OPERATIONS}
         with self._connection() as conn:
@@ -5131,7 +5224,7 @@ class RunnerRuntimeState:
                         "delivery": "uncertain",
                         "sealed_blob_b64": self._canonical_b64(row["sealed_blob"]),
                     } for row in pending_rows],
-                    attestation=attestation,
+                    attestation=attestation, reservation=reservation,
                 )
                 try:
                     metadata = _retired_metadata_size(core)

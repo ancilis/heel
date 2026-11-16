@@ -2762,3 +2762,54 @@ fieldset.question {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Configured live tests (E3): fieldsets shrink with their card instead of their content's min width,
+   labels stack like .approval-fields, and long route/path text wraps rather than clipping on narrow screens. */
+.guided-live-test,
+.guided-live-test fieldset,
+.configured-tests-panel,
+.configured-tests-panel fieldset,
+.configured-review {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.guided-live-test > label {
+  display: grid;
+  gap: 7px;
+  margin-top: 14px;
+  color: var(--ink-soft);
+  font-size: var(--text-sm);
+  font-weight: 780;
+}
+
+.guided-live-test > label span {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 560;
+}
+
+.guided-live-test > label input,
+.guided-live-test > label textarea,
+.guided-live-test > label select,
+.guided-live-test .approval-fields select {
+  width: 100%;
+  padding: 12px 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: calc(var(--radius) - 9px);
+  background: white;
+  color: var(--ink);
+}
+
+/* Long opaque identifiers (runner ids, binding origins) wrap inside dashboard cards instead of setting the
+   column's minimum width on narrow screens; the grid column may then shrink to the viewport. */
+.dashboard-grid > div {
+  min-width: 0;
+}
+
+.runner-recovery li > span,
+.runner-recovery code,
+.activation-card code {
+  overflow-wrap: anywhere;
+}

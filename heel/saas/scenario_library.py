@@ -29,7 +29,21 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 import heel
-from heel.canary_contracts import validate_approval_projection
+import unicodedata
+
+from heel.canary_contracts import (
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_ROLE_ORDER,
+    _route as canary_route,
+    configured_assertion_refs,
+    validate_runner_approval_projection,
+)
+from heel.runner.content_assertion import (
+    LiveAssertionError,
+    live_read_assertion_digest,
+    validate_live_read_assertion,
+)
+from heel.runner.openapi_routes import normalize_route_template
 from heel.review_contract import stable_json, stable_json_hash
 from heel.runner.catalog import CATALOG_BY_ID, CATALOG_IDS
 from heel.scenario_validate import validate_scenario
@@ -38,6 +52,11 @@ from heel.scenarios import list_scenarios
 
 LIBRARY_SCHEMA = "heel.scenario-library.v1"
 CUSTOM_REQUEST_SCHEMA = "heel.custom-scenario.v1"
+# E3: the same immutable revision may also carry ONE validated configured live-read test. The
+# static definition (and its success_criterion) keeps its static meaning; the live test is a
+# distinct record stored beside the revision, never folded into the static model.
+CUSTOM_REQUEST_V2_SCHEMA = "heel.custom-scenario.v2"
+LIVE_TEST_SCHEMA = "heel.custom-live-test.v1"
 BINDINGS_REQUEST_SCHEMA = "heel.run-scenario-bindings.v1"
 BINDINGS_VIEW_SCHEMA = "heel.run-scenario-bindings-view.v1"
 BINDING_POLICY_VERSION = 1
@@ -74,8 +93,193 @@ _RUNNER_SETUP_STEPS = (
     "heel runner map --scenario <catalog id>",
     "protected_canary marker fixture served to the positive-control role",
 )
+_LIVE_SETUP_STEPS = (
+    "heel runner import-openapi (the route must be in the runner's imported inventory)",
+    "heel runner credential add --role <role> for each non-anonymous role",
+    "heel runner input add --name <reference> --type text for each named local value",
+    "heel runner serve (the paired runner reports readiness for the selected tests)",
+)
 _DISPLAY_LIMIT = 500
 _DISPLAY_BYTE_LIMIT = 1024
+
+
+# Registered as control-plane migration 35 (heel.saas.migrate); services also run it with IF NOT
+# EXISTS. Additive only: no existing table, row or trigger is changed.
+CONFIGURED_LIVE_TEST_MIGRATION = """
+CREATE TABLE IF NOT EXISTS workspace_custom_live_tests(
+  workspace_id TEXT NOT NULL,
+  scenario_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  live_test_json TEXT NOT NULL CHECK(length(CAST(live_test_json AS BLOB)) BETWEEN 2 AND 6144),
+  live_test_digest TEXT NOT NULL CHECK(length(live_test_digest)=64 AND live_test_digest NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY(workspace_id, scenario_id, revision),
+  FOREIGN KEY(workspace_id, scenario_id, revision)
+    REFERENCES workspace_custom_scenarios(workspace_id, scenario_id, revision));
+CREATE TRIGGER IF NOT EXISTS workspace_custom_live_tests_immutable
+BEFORE UPDATE ON workspace_custom_live_tests
+BEGIN SELECT RAISE(ABORT, 'custom live tests are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS workspace_custom_live_tests_no_delete
+BEFORE DELETE ON workspace_custom_live_tests
+BEGIN SELECT RAISE(ABORT, 'custom live tests are immutable'); END;
+CREATE TABLE IF NOT EXISTS canary_configured_plan_requests(
+  plan_request_id TEXT PRIMARY KEY CHECK(length(plan_request_id)=36 AND substr(plan_request_id,1,4)='cpr_'
+    AND substr(plan_request_id,5) NOT GLOB '*[^0-9a-f]*'),
+  workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL, environment_id TEXT NOT NULL,
+  rcb_id TEXT NOT NULL, binding_digest TEXT NOT NULL, runner_id TEXT NOT NULL, runner_key_id TEXT NOT NULL,
+  plan_kind TEXT NOT NULL CHECK(plan_kind IN ('configured_live_read','configured_regression')),
+  plan_request_nonce TEXT NOT NULL UNIQUE CHECK(length(plan_request_nonce) BETWEEN 32 AND 64),
+  snapshot_json TEXT NOT NULL CHECK(length(CAST(snapshot_json AS BLOB)) BETWEEN 2 AND 32768),
+  snapshot_digest TEXT NOT NULL CHECK(length(snapshot_digest)=64 AND snapshot_digest NOT GLOB '*[^0-9a-f]*'),
+  status TEXT NOT NULL CHECK(status IN ('open','projected','approved','expired','cancelled')),
+  readiness_json TEXT CHECK(readiness_json IS NULL OR length(CAST(readiness_json AS BLOB)) BETWEEN 2 AND 8192),
+  readiness_at_ms INTEGER, last_runner_sync_at_ms INTEGER,
+  created_by TEXT NOT NULL, created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms=created_at_ms+86400000),
+  approval_id TEXT UNIQUE, run_id TEXT UNIQUE, projection_digest TEXT UNIQUE,
+  CHECK((status IN ('projected','approved'))=(approval_id IS NOT NULL AND run_id IS NOT NULL AND projection_digest IS NOT NULL)));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_configured_plan_request_one_open
+  ON canary_configured_plan_requests(workspace_id, rcb_id) WHERE status='open';
+CREATE INDEX IF NOT EXISTS idx_configured_plan_request_project
+  ON canary_configured_plan_requests(workspace_id, project_ref, created_at_ms);
+CREATE TRIGGER IF NOT EXISTS canary_configured_plan_requests_frozen
+BEFORE UPDATE OF plan_request_id, workspace_id, project_ref, environment_id, rcb_id, binding_digest,
+  runner_id, runner_key_id, plan_kind, plan_request_nonce, snapshot_json, snapshot_digest, created_by,
+  created_at_ms, expires_at_ms ON canary_configured_plan_requests
+BEGIN SELECT RAISE(ABORT, 'configured plan request snapshots are frozen'); END;
+CREATE TRIGGER IF NOT EXISTS canary_configured_plan_requests_no_delete
+BEFORE DELETE ON canary_configured_plan_requests
+BEGIN SELECT RAISE(ABORT, 'configured plan requests are retained'); END;
+"""
+
+
+def ensure_configured_live_test_schema(conn: sqlite3.Connection) -> None:
+    """Direct-construction parity with migrations 34 and 35 (both are IF NOT EXISTS)."""
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_custom_scenarios'"
+    ).fetchone() is None:
+        conn.executescript(SCENARIO_LIBRARY_MIGRATION)
+    if conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN "
+        "('workspace_custom_live_tests','canary_configured_plan_requests')"
+    ).fetchone()[0] != 2:
+        conn.executescript(CONFIGURED_LIVE_TEST_MIGRATION)
+
+
+def live_test_coverage_statement(scenario_id: str) -> str:
+    roles = " and ".join(CONFIGURED_ROLE_ORDER[scenario_id])
+    return (
+        f"Configured live read: one request per role ({roles}) on one literal imported route. "
+        "The verdict is only whether the configured JSON field condition held for the restricted role "
+        "after a positive control; the static objective and criterion are not executed by it."
+    )
+
+
+def validate_live_test(value: Any) -> dict:
+    """Closed browser-authored live-test record; references are names, never values."""
+    if (type(value) is not dict
+            or set(value) != {"schema_version", "scenario_id", "method", "route_template", "assertion"}
+            or value.get("schema_version") != LIVE_TEST_SCHEMA):
+        raise ScenarioLibraryError(400, "invalid_live_test", errors=["live_test: use the guided live test fields"])
+    errors: list[str] = []
+    if type(value["scenario_id"]) is not str or value["scenario_id"] not in CONFIGURED_ROLE_ORDER:
+        errors.append("live_test.scenario_id: choose anonymous vs authenticated, or lower vs higher plan")
+    if type(value["method"]) is not str or value["method"] not in ("GET", "HEAD"):
+        errors.append("live_test.method: only GET and HEAD are supported")
+    route = value["route_template"]
+    try:
+        route_bytes = route.encode("utf-8") if type(route) is str else None
+    except UnicodeEncodeError:
+        route_bytes = None  # lone surrogates: refused, never normalized
+    if route_bytes is None or not route.startswith("/") or len(route_bytes) > 512:
+        errors.append("live_test.route_template: enter a path beginning with / using valid text")
+    elif "{" in route or "}" in route:
+        raise ScenarioLibraryError(400, "live_test_route_unsupported", errors=[
+            "live_test.route_template: parameterized routes are not supported for configured tests yet; "
+            "choose a literal imported route",
+        ])
+    else:
+        try:
+            canary_route(route)
+            normalized, placeholders = normalize_route_template(route)
+        except (ValueError, TypeError):
+            errors.append("live_test.route_template: the path contains unsupported characters")
+        else:
+            if placeholders or normalized != route:
+                errors.append("live_test.route_template: enter the exact imported path")
+    try:
+        assertion = validate_live_read_assertion(value["assertion"])
+    except LiveAssertionError as error:
+        errors.append(f"live_test.assertion: {error.code}")
+        assertion = None
+    if assertion is not None:
+        for path in (assertion.witness_path, assertion.condition_path):
+            if any(type(item) is str and unicodedata.normalize("NFC", item) != item for item in path):
+                errors.append("live_test.assertion: field names must be NFC text")
+    if errors:
+        raise ScenarioLibraryError(400, "invalid_live_test", errors=errors)
+    return {
+        "schema_version": LIVE_TEST_SCHEMA,
+        "scenario_id": value["scenario_id"],
+        "method": value["method"],
+        "route_template": route,
+        "assertion": assertion.to_json(),
+    }
+
+
+def live_test_view(live_test: Mapping[str, Any]) -> dict:
+    """The listing form: the record plus derived digest, references, roles and honest scope."""
+    assertion = validate_live_read_assertion(live_test["assertion"])
+    return {
+        "schema_version": live_test["schema_version"],
+        "scenario_id": live_test["scenario_id"],
+        "method": live_test["method"],
+        "route_template": live_test["route_template"],
+        "assertion": assertion.to_json(),
+        "assertion_digest": live_read_assertion_digest(assertion),
+        "local_input_refs": configured_assertion_refs(assertion.to_json()),
+        "roles": list(CONFIGURED_ROLE_ORDER[live_test["scenario_id"]]),
+        "coverage_statement": live_test_coverage_statement(live_test["scenario_id"]),
+        "setup_steps": list(_LIVE_SETUP_STEPS),
+    }
+
+
+def stored_live_test(conn: sqlite3.Connection, workspace_id: str, scenario_id: str, revision: int) -> dict | None:
+    row = conn.execute(
+        "SELECT live_test_json,live_test_digest FROM workspace_custom_live_tests "
+        "WHERE workspace_id=? AND scenario_id=? AND revision=?",
+        (workspace_id, scenario_id, revision),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        live = json.loads(row["live_test_json"])
+        if stable_json_hash(live) != row["live_test_digest"] or validate_live_test(live) != live:
+            raise ValueError
+    except (ValueError, TypeError, ScenarioLibraryError):
+        raise ScenarioLibraryError(409, "live_test_unavailable") from None
+    return live
+
+
+def resolve_custom_live_test(conn: sqlite3.Connection, workspace_id: str, scenario_id: Any, revision: Any) -> dict:
+    """The authoritative live test of one exact workspace-private revision, or a closed refusal.
+
+    Only this workspace's own immutable revision is consulted; another workspace's identical id
+    is invisible, and a revision without a configured live test is refused, never defaulted.
+    """
+    if (type(scenario_id) is not str or not _ID.fullmatch(scenario_id)
+            or not scenario_id.startswith(CUSTOM_ID_PREFIXES)
+            or type(revision) is not int or revision < 1):
+        raise ScenarioLibraryError(404, "custom_revision_not_found")
+    exists = conn.execute(
+        "SELECT 1 FROM workspace_custom_scenarios WHERE workspace_id=? AND scenario_id=? AND revision=?",
+        (workspace_id, scenario_id, revision),
+    ).fetchone()
+    if exists is None:
+        raise ScenarioLibraryError(404, "custom_revision_not_found")
+    live = stored_live_test(conn, workspace_id, scenario_id, revision)
+    if live is None:
+        raise ScenarioLibraryError(409, "live_test_not_configured")
+    return live
 
 
 class ScenarioLibraryError(Exception):
@@ -299,6 +503,7 @@ class ScenarioLibraryService:
         self.clock = clock
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCENARIO_LIBRARY_MIGRATION)
+        self.conn.executescript(CONFIGURED_LIVE_TEST_MIGRATION)
 
     # --- listing ---------------------------------------------------------------------------
     def _library_row(self, definition: Mapping[str, Any]) -> dict:
@@ -318,12 +523,15 @@ class ScenarioLibraryService:
             "binding_version": BINDING_POLICY_VERSION if catalog else None,
             "coverage_statement": library_coverage_statement(catalog) if catalog else None,
             "prerequisites": _prerequisites(catalog) if catalog else [],
+            "live_test": None,
+            "live_support": "template_only",
         }
 
     def _custom_row(self, row: sqlite3.Row | tuple) -> dict:
         definition = json.loads(row["definition_json"])
         binding = json.loads(row["execution_binding_json"]) if row["execution_binding_json"] else None
         catalog = binding["catalog_scenario_id"] if binding else None
+        live = self._live_test(row["workspace_id"], row["scenario_id"], int(row["revision"]))
         return {
             "id": row["scenario_id"],
             "source": "custom",
@@ -339,7 +547,22 @@ class ScenarioLibraryService:
             "binding_version": BINDING_POLICY_VERSION if catalog else None,
             "coverage_statement": coverage_statement(catalog) if catalog else None,
             "prerequisites": _prerequisites(catalog) if catalog else [],
+            "live_test": live_test_view(live) if live is not None else None,
+            "live_support": "configured_live_read" if live is not None else "static_only",
         }
+
+    def _live_test(self, workspace_id: str, scenario_id: str, revision: int) -> dict | None:
+        return stored_live_test(self.conn, workspace_id, scenario_id, revision)
+
+    def revision_history(self, workspace_id: str, scenario_id: str) -> list[dict]:
+        """Every immutable revision of one custom scenario, oldest first (edit history)."""
+        rows = self.conn.execute(
+            "SELECT * FROM workspace_custom_scenarios WHERE workspace_id=? AND scenario_id=? ORDER BY revision",
+            (workspace_id, scenario_id),
+        ).fetchall()
+        if not rows:
+            raise ScenarioLibraryError(404, "custom_revision_not_found")
+        return [self._custom_row(row) for row in rows]
 
     def _current_custom_rows(self, workspace_id: str) -> list:
         return self.conn.execute(
@@ -362,12 +585,21 @@ class ScenarioLibraryService:
             "custom_coverage_statements": {
                 catalog: coverage_statement(catalog) for catalog in CUSTOM_BINDABLE_CATALOG_IDS
             },
+            "live_test_coverage_statements": {
+                scenario: live_test_coverage_statement(scenario) for scenario in CONFIGURED_ROLE_ORDER
+            },
             "scenarios": rows,
         }
 
     # --- custom revisions --------------------------------------------------------------------
     def create_custom(self, workspace_id: str, actor: str, body: Any) -> dict:
-        if (type(body) is not dict
+        live_test = None
+        if type(body) is dict and body.get("schema_version") == CUSTOM_REQUEST_V2_SCHEMA:
+            if set(body) != {"schema_version", "definition", "supersedes_revision", "execution_binding", "live_test"}:
+                raise ScenarioLibraryError(400, "invalid_custom_request")
+            if body["live_test"] is not None:
+                live_test = validate_live_test(body["live_test"])
+        elif (type(body) is not dict
                 or set(body) != {"schema_version", "definition", "supersedes_revision", "execution_binding"}
                 or body.get("schema_version") != CUSTOM_REQUEST_SCHEMA):
             raise ScenarioLibraryError(400, "invalid_custom_request")
@@ -449,10 +681,17 @@ class ScenarioLibraryService:
                 (workspace_id, scenario_id, revision, serialized, digest,
                  stable_json(execution_binding) if execution_binding else None, actor, self.clock()),
             )
+            if live_test is not None:
+                self.conn.execute(
+                    "INSERT INTO workspace_custom_live_tests(workspace_id,scenario_id,revision,live_test_json,"
+                    "live_test_digest) VALUES(?,?,?,?,?)",
+                    (workspace_id, scenario_id, revision, stable_json(live_test), stable_json_hash(live_test)),
+                )
             self.conn.execute(
                 "INSERT INTO admin_audit(actor,action,subject,reason,ts) VALUES(?,?,?,?,?)",
                 (actor, "custom_scenario_revision", f"{workspace_id}:{scenario_id}:{revision}",
-                 "workspace-private custom scenario revision " + ("bound" if execution_binding else "static"),
+                 "workspace-private custom scenario revision " + ("bound" if execution_binding else "static")
+                 + (" with configured live test" if live_test is not None else ""),
                  self.clock()),
             )
             row = self.conn.execute(
@@ -492,9 +731,13 @@ class ScenarioLibraryService:
         if not row["projection_json"]:
             raise ScenarioLibraryError(409, "projection_unavailable")
         try:
-            projection = validate_approval_projection(json.loads(row["projection_json"]))
+            projection = validate_runner_approval_projection(json.loads(row["projection_json"]))
         except (TypeError, ValueError):
             raise ScenarioLibraryError(409, "projection_unavailable") from None
+        if projection["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+            # A configured plan already carries its exact private revisions in the signed
+            # projection; library attribution bindings would only duplicate (or misstate) them.
+            return []
         if (projection["projection_digest"] != row["projection_digest"]
                 or projection["manifest_digest"] != row["manifest_digest"]):
             raise ScenarioLibraryError(409, "projection_unavailable")

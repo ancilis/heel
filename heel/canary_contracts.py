@@ -742,7 +742,7 @@ def validate_canary_findings(value: Any) -> dict[str, Any]:
 
 def validate_disclosure_permit(value: Any) -> dict[str, Any]:
     obj = _contract(value, 16 * 1024); obj = _object(obj, {"schema_version", "permit_id", "workspace_id", "project_id", "run_id", "grant_id", "runner_binding", "projection", "approved_by", "approved_at_ms", "issued_at_ms", "expires_at_ms", "permit_nonce", "permit_digest", "signing_key_id", "signature_b64"})
-    _enum(obj["schema_version"], {DISCLOSURE_PERMIT_SCHEMA}); _id_fields(obj, ("permit_id", "workspace_id", "project_id", "run_id", "grant_id", "approved_by", "permit_nonce")); binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id"}); _id_fields(binding, ("runner_id", "runner_key_id")); projection = _object(obj["projection"], {"schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"}); _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA}); _hash(projection["projection_digest"]); _integer(projection["maximum_bytes"], lower=1, upper=262144); _integer(projection["scenario_count"], lower=0, upper=4); _integer(projection["finding_count"], lower=0, upper=4); _integer(obj["approved_at_ms"], lower=0); issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
+    _enum(obj["schema_version"], {DISCLOSURE_PERMIT_SCHEMA}); _id_fields(obj, ("permit_id", "workspace_id", "project_id", "run_id", "grant_id", "approved_by", "permit_nonce")); binding = _object(obj["runner_binding"], {"runner_id", "runner_key_id"}); _id_fields(binding, ("runner_id", "runner_key_id")); projection = _object(obj["projection"], {"schema_version", "projection_digest", "maximum_bytes", "scenario_count", "finding_count"}); _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA, CONFIGURED_FINDINGS_SCHEMA}); _hash(projection["projection_digest"]); _integer(projection["maximum_bytes"], lower=1, upper=262144); _integer(projection["scenario_count"], lower=0, upper=4); _integer(projection["finding_count"], lower=0, upper=4); _integer(obj["approved_at_ms"], lower=0); issued = _integer(obj["issued_at_ms"], lower=0); expires = _integer(obj["expires_at_ms"], lower=0)
     if not issued < expires <= issued + 600000: _fail("invalid permit expiry")
     _signature(obj, "permit_digest"); return copy.deepcopy(obj)
 
@@ -761,7 +761,7 @@ def validate_runner_disclosure_poll_request(value: Any) -> dict[str, Any]:
     obj = _object(obj, {"schema_version", "run_id", "projection"})
     _enum(obj["schema_version"], {RUNNER_DISCLOSURE_POLL_SCHEMA}); _id_fields(obj, ("run_id",))
     projection = _object(obj["projection"], {"schema_version", "projection_digest", "byte_count", "scenario_count", "finding_count"})
-    _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA}); _hash(projection["projection_digest"])
+    _enum(projection["schema_version"], {CANARY_FINDINGS_SCHEMA, CONFIGURED_FINDINGS_SCHEMA}); _hash(projection["projection_digest"])
     _integer(projection["byte_count"], lower=1, upper=262144)
     scenarios = _integer(projection["scenario_count"], lower=0, upper=4)
     if _integer(projection["finding_count"], lower=0, upper=4) > scenarios: _fail("invalid disclosure counts")
@@ -1118,4 +1118,533 @@ def validate_inactive_claim_attestation(value: Any) -> dict[str, Any]:
         _fail("invalid observation")
     _integer(obj["attested_at_ms"], lower=0)
     _signature(obj, "attestation_digest")
+    return copy.deepcopy(obj)
+
+
+# --- Configured live-read test instances ----------------------------------------------------
+# Distinct closed versions: ``heel.test-manifest.v2``, ``heel.approval-manifest-projection.v3``
+# and ``heel.canary-findings-projection.v2``. The v1 validators above are unchanged and refuse
+# these records. Each configured instance keeps its catalog primitive (``scenario_id``) and
+# adds a unique ``test_instance_id``; its live condition is a frozen E1
+# ``heel.live-read-assertion.v1`` definition evaluated only by compiler/engine version 2.
+CONFIGURED_TEST_MANIFEST_SCHEMA = "heel.test-manifest.v2"
+CONFIGURED_APPROVAL_PROJECTION_SCHEMA = "heel.approval-manifest-projection.v3"
+CONFIGURED_FINDINGS_SCHEMA = "heel.canary-findings-projection.v2"
+CONFIGURED_COMPILER_VERSION = "2"
+CONFIGURED_ENGINE_VERSION = "2"
+MAX_CONFIGURED_TEST_INSTANCES = 4
+CONFIGURED_LOCAL_INPUT_BINDING_DOMAIN = "heel.configured-local-input-binding.v1"
+# Restricted role first, then the control role: the exact catalog order of these primitives.
+CONFIGURED_ROLE_ORDER = {
+    "anonymous_authenticated_read": ("anonymous", "authenticated"),
+    "plan_entitlement_read": ("lower_plan", "higher_plan"),
+}
+_CONFIGURED_ASSERTION_CLASS = {
+    "anonymous_authenticated_read": "anonymous_authenticated",
+    "plan_entitlement_read": "plan_entitlement",
+}
+CONFIGURED_RUNNER_REASONS = frozenset({"local_input_unavailable", "run_incomplete"})
+_TEST_INSTANCE_ID = re.compile(r"^lti_[0-9a-f]{32}$")
+_SOURCE_SCENARIO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_FIXTURE_REF = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+_V1_MANIFEST_ACTION_FIELDS = {"ordinal", "scenario_id", "adapter_version", "method", "route_template", "fixture_bindings", "semantic_auth_role", "auth_profile", "assertion_class", "allowed_status_codes", "allowed_body_shapes", "side_effect_class"}
+_V1_PROJECTION_ACTION_FIELDS = _V1_MANIFEST_ACTION_FIELDS - {"fixture_bindings", "auth_profile"}
+_INSTANCE_CORE_FIELDS = {"ordinal", "test_instance_id", "scenario_id", "adapter_version", "source", "method", "route_template", "assertion", "assertion_digest"}
+
+
+def _configured_assertion(value: Any) -> Any:
+    from heel.runner.content_assertion import LiveAssertionError, validate_live_read_assertion
+
+    try:
+        assertion = validate_live_read_assertion(value)
+    except LiveAssertionError:
+        _fail("invalid configured assertion")
+    if assertion.to_json() != value:
+        _fail("configured assertion is not canonical")
+    return assertion
+
+
+def configured_assertion_refs(assertion: Mapping[str, Any]) -> list[str]:
+    """The sorted local fixture references one validated E1 definition needs."""
+    refs = {assertion["success_witness"]["expected_fixture"]}
+    if "expected_fixture" in assertion["condition"]:
+        refs.add(assertion["condition"]["expected_fixture"])
+    return sorted(refs)
+
+
+def configured_local_input_binding_digest(test_instance_id: str, local_inputs: list[Any]) -> str:
+    """Digest of opaque random handles (never of values) shown in the approval projection."""
+    return canonical_digest({
+        "domain": CONFIGURED_LOCAL_INPUT_BINDING_DOMAIN,
+        "test_instance_id": test_instance_id, "local_inputs": local_inputs,
+    })
+
+
+def _configured_instance(value: Any, ordinal: int, *, projection: bool) -> dict[str, Any]:
+    from heel.runner.content_assertion import live_read_assertion_digest
+
+    extra = {"local_input_refs", "local_input_binding_digest"} if projection else {"local_inputs"}
+    obj = _object(value, _INSTANCE_CORE_FIELDS | extra)
+    if _integer(obj["ordinal"]) != ordinal: _fail("non-contiguous ordinal")
+    if not isinstance(obj["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(obj["test_instance_id"]): _fail("invalid test instance ID")
+    _enum(obj["scenario_id"], set(CONFIGURED_ROLE_ORDER)); _enum(obj["adapter_version"], {"1"})
+    source = _object(obj["source"], {"source_scenario_id", "source_revision"})
+    if not isinstance(source["source_scenario_id"], str) or not _SOURCE_SCENARIO_ID.fullmatch(source["source_scenario_id"]): _fail("invalid source scenario")
+    _integer(source["source_revision"], lower=1)
+    _method(obj["method"]); _route(obj["route_template"])
+    assertion = _configured_assertion(obj["assertion"])
+    if obj["assertion_digest"] != live_read_assertion_digest(assertion): _fail("configured assertion digest mismatch")
+    refs = configured_assertion_refs(obj["assertion"])
+    if projection:
+        if obj["local_input_refs"] != refs: _fail("local input references do not match the assertion")
+        _hash(obj["local_input_binding_digest"])
+    else:
+        inputs = _list(obj["local_inputs"], maximum=2)
+        for item in inputs:
+            item = _object(item, {"fixture_ref", "input_handle_id"})
+            if not isinstance(item["input_handle_id"], str) or not _HEX32.fullmatch(item["input_handle_id"]): _fail("invalid local input handle")
+        if [item["fixture_ref"] for item in inputs] != refs: _fail("local inputs must exactly cover the assertion references")
+        if len({item["input_handle_id"] for item in inputs}) != len(inputs): _fail("duplicate local input handle")
+    return obj
+
+
+def configured_projection_instance(instance: Mapping[str, Any]) -> dict[str, Any]:
+    """The approval-visible form of one manifest instance: references and a handle digest."""
+    shown = {key: copy.deepcopy(instance[key]) for key in _INSTANCE_CORE_FIELDS}
+    shown["local_input_refs"] = [item["fixture_ref"] for item in instance["local_inputs"]]
+    shown["local_input_binding_digest"] = configured_local_input_binding_digest(
+        instance["test_instance_id"], instance["local_inputs"],
+    )
+    return shown
+
+
+def _configured_instances(value: Any, *, projection: bool) -> list[dict[str, Any]]:
+    entries = _list(value, maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries: _fail("at least one configured test instance is required")
+    instances = [_configured_instance(item, ordinal, projection=projection) for ordinal, item in enumerate(entries)]
+    if len({item["test_instance_id"] for item in instances}) != len(instances): _fail("duplicate test instance")
+    return instances
+
+
+def _configured_actions(value: Any, instances: list[Mapping[str, Any]], *, projection: bool) -> list[Any]:
+    actions = _list(value, maximum=20)
+    if len(actions) != 2 * len(instances): _fail("each configured instance requires exactly two reads")
+    fields = (_V1_PROJECTION_ACTION_FIELDS if projection else _V1_MANIFEST_ACTION_FIELDS) | {"test_instance_id"}
+    for ordinal, action in enumerate(actions):
+        action = _object(action, fields)
+        instance = instances[ordinal // 2]
+        if _integer(action["ordinal"]) != ordinal: _fail("non-contiguous ordinal")
+        if (
+            action["test_instance_id"] != instance["test_instance_id"]
+            or action["scenario_id"] != instance["scenario_id"]
+            or action["adapter_version"] != instance["adapter_version"]
+            or action["method"] != instance["method"]
+            or action["route_template"] != instance["route_template"]
+            or action["semantic_auth_role"] != CONFIGURED_ROLE_ORDER[instance["scenario_id"]][ordinal % 2]
+            or action["assertion_class"] != _CONFIGURED_ASSERTION_CLASS[instance["scenario_id"]]
+        ): _fail("configured action does not match its instance")
+        _statuses(action["allowed_status_codes"]); _body_shapes(action["allowed_body_shapes"]); _enum(action["side_effect_class"], {"read_only"})
+        if not projection:
+            bindings = _list(action["fixture_bindings"], maximum=20)
+            for binding in bindings:
+                binding = _object(binding, {"parameter_name", "fixture_id"}); _id_fields(binding, ("parameter_name", "fixture_id"))
+            _ordered_records(bindings, ("parameter_name", "fixture_id"), semantic_field="parameter_name")
+            _enum(action["auth_profile"], {"anonymous", "bearer", "cookie_jar", "x_api_key"})
+    return actions
+
+
+def _configured_compiler(value: Any) -> dict[str, Any]:
+    compiler = _object(value, {"compiler_version", "engine_version"})
+    if compiler != {"compiler_version": CONFIGURED_COMPILER_VERSION, "engine_version": CONFIGURED_ENGINE_VERSION}:
+        _fail("unsupported configured compiler or engine version")
+    return compiler
+
+
+def validate_configured_test_manifest(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 256 * 1024)
+    obj = _object(obj, {"schema_version", "workspace_id", "project_id", "environment", "runner", "compiler", "test_instances", "actions", "credential_bindings", "budgets", "egress", "retry_policy", "local_evidence_policy", "compiled_at_ms", "manifest_digest"})
+    _enum(obj["schema_version"], {CONFIGURED_TEST_MANIFEST_SCHEMA}); _id_fields(obj, ("workspace_id", "project_id"))
+    env = _environment(obj["environment"])
+    runner = _object(obj["runner"], {"runner_id", "runner_key_id", "minimum_runner_version"}); _id_fields(runner, ("runner_id", "runner_key_id", "minimum_runner_version"))
+    _configured_compiler(obj["compiler"])
+    instances = _configured_instances(obj["test_instances"], projection=False)
+    _configured_actions(obj["actions"], instances, projection=False)
+    credentials = _list(obj["credential_bindings"], maximum=20)
+    for binding in credentials:
+        binding = _object(binding, {"semantic_role", "credential_handle_id", "auth_profile"}); _id_fields(binding, ("semantic_role",))
+        if not isinstance(binding["credential_handle_id"], str) or not _HEX32.fullmatch(binding["credential_handle_id"]): _fail("invalid credential binding")
+        _enum(binding["auth_profile"], {"anonymous", "bearer", "cookie_jar", "x_api_key"})
+    _ordered_records(credentials, ("semantic_role", "auth_profile", "credential_handle_id"), semantic_field="semantic_role")
+    _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"])
+    policy = _object(obj["local_evidence_policy"], {"retention_seconds"}); _integer(policy["retention_seconds"], lower=1)
+    _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
+    if obj["manifest_digest"] != canonical_digest({k: v for k, v in obj.items() if k != "manifest_digest"}): _fail("digest mismatch")
+    return copy.deepcopy(obj)
+
+
+def validate_configured_approval_projection(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 64 * 1024); _reject_keys(obj, _FORBIDDEN_APPROVAL_KEYS)
+    obj = _object(obj, {"schema_version", "projection_id", "workspace_id", "project_id", "environment", "runner", "compiler", "test_instances", "actions", "budgets", "egress", "retry_policy", "compiled_at_ms", "manifest_digest", "projection_digest", "signing_key_id", "signature_b64"})
+    _enum(obj["schema_version"], {CONFIGURED_APPROVAL_PROJECTION_SCHEMA}); _id_fields(obj, ("projection_id", "workspace_id", "project_id")); env = _environment(obj["environment"])
+    runner = _object(obj["runner"], {"runner_id", "runner_key_id", "runner_version", "adapter_versions"}); _id_fields(runner, ("runner_id", "runner_key_id", "runner_version")); _version_list(runner["adapter_versions"])
+    _configured_compiler(obj["compiler"])
+    instances = _configured_instances(obj["test_instances"], projection=True)
+    _configured_actions(obj["actions"], instances, projection=True)
+    _budgets(obj["budgets"]); _egress(obj["egress"], env); _retry(obj["retry_policy"]); _integer(obj["compiled_at_ms"], lower=0); _hash(obj["manifest_digest"])
+    if obj["signing_key_id"] != runner["runner_key_id"]: _fail("approval signing key mismatch")
+    _signature(obj, "projection_digest")
+    return copy.deepcopy(obj)
+
+
+_CONFIGURED_DECIDED = {
+    "restricted_condition_true": ("observed", "true"),
+    "restricted_condition_false": ("blocked", "false"),
+    "restricted_empty_denial": ("blocked", "not_observed"),
+}
+
+
+def _configured_result(value: Any, ordinal: int) -> dict[str, Any]:
+    from heel.runner.content_assertion import LIVE_READ_CONDITION_KINDS, LIVE_READ_PAIR_REASONS
+
+    item = _object(value, {"ordinal", "test_instance_id", "scenario_id", "adapter_version", "source", "assertion_digest", "condition_kind", "route", "assessment_outcome", "reason", "positive_control", "restricted_condition", "observations", "finding", "containment_codes", "redaction_count", "local_evidence_refs"})
+    if _integer(item["ordinal"]) != ordinal: _fail("non-contiguous ordinal")
+    if not isinstance(item["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(item["test_instance_id"]): _fail("invalid test instance ID")
+    _enum(item["scenario_id"], set(CONFIGURED_ROLE_ORDER)); _enum(item["adapter_version"], {"1"})
+    source = _object(item["source"], {"source_scenario_id", "source_revision"})
+    if not isinstance(source["source_scenario_id"], str) or not _SOURCE_SCENARIO_ID.fullmatch(source["source_scenario_id"]): _fail("invalid source scenario")
+    _integer(source["source_revision"], lower=1)
+    digest = _string(item["assertion_digest"], identifier=True)
+    if not digest.startswith("sha256:") or not _SHA256.fullmatch(digest[7:]): _fail("invalid assertion digest")
+    _enum(item["condition_kind"], set(LIVE_READ_CONDITION_KINDS))
+    route = _object(item["route"], {"method", "route_template"}); _method(route["method"]); _route(route["route_template"])
+    outcome = _enum(item["assessment_outcome"], {"blocked", "observed", "inconclusive"})
+    reason = _enum(item["reason"], set(LIVE_READ_PAIR_REASONS) | set(CONFIGURED_RUNNER_REASONS))
+    control = _enum(item["positive_control"], {"established", "not_established"})
+    restricted = _enum(item["restricted_condition"], {"true", "false", "not_observed"})
+    decided = _CONFIGURED_DECIDED.get(reason)
+    if decided is not None:
+        if (outcome, restricted) != decided or control != "established": _fail("inconsistent configured result")
+    elif outcome != "inconclusive" or restricted != "not_observed" or (control == "established") != reason.startswith("restricted_"):
+        _fail("inconsistent configured result")
+    observations = _list(item["observations"], maximum=2)
+    for observation in observations:
+        observation = _object(observation, {"action_ordinal", "semantic_role", "status_code", "body_shape", "truncation_state"}); _integer(observation["action_ordinal"], upper=19)
+        _enum(observation["semantic_role"], set(CONFIGURED_ROLE_ORDER[item["scenario_id"]])); _integer(observation["status_code"], lower=100, upper=599); _enum(observation["body_shape"], {"absent", "empty", "json_object", "json_array", "json_scalar", "text", "binary", "truncated", "invalid"}); _enum(observation["truncation_state"], {"complete", "truncated"})
+    ordinals = [observation["action_ordinal"] for observation in observations]
+    if ordinals != sorted(set(ordinals)) or (outcome != "inconclusive" and len(observations) != 2): _fail("invalid configured observations")
+    finding = item["finding"]
+    if (finding is not None) != (outcome == "observed"): _fail("finding must accompany exactly an observed result")
+    if finding is not None:
+        finding = _object(finding, {"title", "reachability_rationale", "confidence", "recommended_control", "regression_suggestion"}); _string(finding["title"], limit=160)
+        for field in ("reachability_rationale", "recommended_control", "regression_suggestion"): _string(finding[field], limit=2000)
+        _enum(finding["confidence"], {"low", "medium", "high"})
+    _enum_list(item["containment_codes"], _CONTAINMENT); _integer(item["redaction_count"], lower=0)
+    for ref in _list(item["local_evidence_refs"], maximum=10, sorted_unique=True):
+        if not isinstance(ref, str) or not _EVIDENCE.fullmatch(ref): _fail("invalid evidence reference")
+    return item
+
+
+def validate_configured_findings(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 256 * 1024); _reject_keys(obj, _FORBIDDEN_FINDINGS_KEYS)
+    obj = _object(obj, {"schema_version", "projection_id", "run_id", "grant_id", "workspace_id", "project_id", "environment_id", "manifest_digest", "approval_projection_digest", "grant_digest", "engine_version", "adapter_versions", "started_at_ms", "finished_at_ms", "assessment_outcome", "test_results", "containment_codes", "redaction_count", "projection_digest", "signing_key_id", "signature_b64"})
+    _enum(obj["schema_version"], {CONFIGURED_FINDINGS_SCHEMA}); _id_fields(obj, ("projection_id", "run_id", "grant_id", "workspace_id", "project_id", "environment_id")); _enum(obj["engine_version"], {CONFIGURED_ENGINE_VERSION})
+    _hash(obj["manifest_digest"]); _hash(obj["approval_projection_digest"]); _hash(obj["grant_digest"]); _version_list(obj["adapter_versions"])
+    if _integer(obj["finished_at_ms"], lower=0) < _integer(obj["started_at_ms"], lower=0): _fail("invalid findings timestamps")
+    _enum(obj["assessment_outcome"], {"blocked", "observed", "inconclusive"})
+    entries = _list(obj["test_results"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    results = [_configured_result(item, ordinal) for ordinal, item in enumerate(entries)]
+    if len({item["test_instance_id"] for item in results}) != len(results): _fail("duplicate test result")
+    _enum_list(obj["containment_codes"], _CONTAINMENT); _integer(obj["redaction_count"], lower=0); _signature(obj, "projection_digest")
+    return copy.deepcopy(obj)
+
+
+def _schema_of(value: Any) -> Any:
+    return value.get("schema_version") if isinstance(value, Mapping) else None
+
+
+def validate_runner_test_manifest(value: Any) -> dict[str, Any]:
+    """Runner-local dispatch: exactly v1 or exactly configured v2; anything else is refused."""
+    if _schema_of(value) == CONFIGURED_TEST_MANIFEST_SCHEMA:
+        return validate_configured_test_manifest(value)
+    return validate_test_manifest(value)
+
+
+def validate_runner_approval_projection(value: Any) -> dict[str, Any]:
+    if _schema_of(value) == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+        return validate_configured_approval_projection(value)
+    return validate_approval_projection(value)
+
+
+def validate_runner_findings(value: Any) -> dict[str, Any]:
+    if _schema_of(value) == CONFIGURED_FINDINGS_SCHEMA:
+        return validate_configured_findings(value)
+    return validate_canary_findings(value)
+
+
+def findings_results(findings: Mapping[str, Any]) -> list[Any]:
+    """The per-test result list of a validated v1 or configured findings projection."""
+    return findings["test_results"] if findings["schema_version"] == CONFIGURED_FINDINGS_SCHEMA else findings["scenario_results"]
+
+
+# --- E3: authenticated delivery of configured live-read plans ---------------------------------
+# The browser names workspace-private custom revisions; the control plane freezes their live
+# configuration into a context-bound plan request; the paired runner receives it over its
+# PoP-authenticated claim chain (``configured-plan-sync``), reports bounded readiness for exactly
+# the selected instances, and submits a signed v3 projection bound to the request nonce. These
+# are new closed versions; the v1 plan request/claim/submit records are unchanged.
+CONFIGURED_PLAN_REQUEST_SCHEMA = "heel.configured-plan-request.v1"
+CONFIGURED_PLAN_REQUEST_TTL_MS = 86_400_000
+RUNNER_CONFIGURED_PLAN_SYNC_SCHEMA = "heel.runner-configured-plan-sync.v1"
+RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA = "heel.runner-configured-plan-sync-result.v1"
+RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA = "heel.runner-configured-approval-projection-submit.v1"
+CONFIGURED_CONDITION_REVIEW_SCHEMA = "heel.configured-condition-review.v1"
+CONFIGURED_RUNNER_CAPABILITY = "heel.configured-live-read.v1"
+CONFIGURED_PLAN_KINDS = ("configured_live_read", "configured_regression")
+CONFIGURED_READINESS_KINDS = ("route", "role_credential", "local_input", "frozen_run")
+CONFIGURED_READINESS_STATES = ("ready", "missing", "revoked", "unsupported")
+RUNNER_CONFIGURED_SYNC_MAX_BYTES = 8 * 1024
+RUNNER_CONFIGURED_SUBMIT_MAX_BYTES = 69_632
+_CRUN = re.compile(r"^crun_[0-9a-f]{32}$")
+_CONFIGURED_ROLES = frozenset(role for pair in CONFIGURED_ROLE_ORDER.values() for role in pair)
+_CONFIGURED_SNAPSHOT_FIELDS = {
+    "test_instance_id", "scenario_id", "source", "method", "route_template", "assertion",
+    "assertion_digest", "local_input_refs", "local_input_binding_digest",
+}
+
+
+def _source_ref(value: Any) -> dict[str, Any]:
+    source = _object(value, {"source_scenario_id", "source_revision"})
+    if not isinstance(source["source_scenario_id"], str) or not _SOURCE_SCENARIO_ID.fullmatch(source["source_scenario_id"]):
+        _fail("invalid source scenario")
+    _integer(source["source_revision"], lower=1, upper=10_000)
+    return source
+
+
+def _literal_configured_route(value: Any) -> str:
+    route = _route(value)
+    if "{" in route or "}" in route or len(route.encode("utf-8")) > 512:
+        _fail("configured routes must be literal")
+    return route
+
+
+def _configured_plan_labels(value: Any, instances: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Operator-supplied labels: exactly the two plan roles iff any instance compares plans."""
+    needs = any(item["scenario_id"] == "plan_entitlement_read" for item in instances)
+    labels = _plan_labels(value, minimum=2 if needs else 0)
+    if not needs and labels:
+        _fail("plan labels apply only to plan comparisons")
+    return labels
+
+
+def configured_plan_snapshot_instance(value: Any) -> dict[str, Any]:
+    """One frozen instance as the control plane delivers it: configuration, never values."""
+    from heel.runner.content_assertion import live_read_assertion_digest
+
+    obj = _object(value, _CONFIGURED_SNAPSHOT_FIELDS)
+    if not isinstance(obj["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(obj["test_instance_id"]):
+        _fail("invalid test instance ID")
+    _enum(obj["scenario_id"], set(CONFIGURED_ROLE_ORDER)); _source_ref(obj["source"])
+    _method(obj["method"]); _literal_configured_route(obj["route_template"])
+    assertion = _configured_assertion(obj["assertion"])
+    if obj["assertion_digest"] != live_read_assertion_digest(assertion):
+        _fail("configured assertion digest mismatch")
+    if obj["local_input_refs"] != configured_assertion_refs(obj["assertion"]):
+        _fail("local input references do not match the assertion")
+    if obj["local_input_binding_digest"] is not None:
+        _hash(obj["local_input_binding_digest"])
+    return obj
+
+
+def _snapshot_instances(value: Any) -> list[dict[str, Any]]:
+    entries = _list(value, maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries:
+        _fail("at least one configured test instance is required")
+    instances = [configured_plan_snapshot_instance(item) for item in entries]
+    if len({item["test_instance_id"] for item in instances}) != len(instances):
+        _fail("duplicate test instance")
+    return instances
+
+
+def validate_configured_plan_request(value: Any) -> dict[str, Any]:
+    """The browser's selection: private revisions (live) or one saved instance (regression)."""
+    obj = _contract(value, 2 * 1024); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    kind = obj.get("plan_kind") if isinstance(obj, Mapping) else None
+    if kind == "configured_regression":
+        obj = _object(obj, {"schema_version", "plan_kind", "source_run_id", "test_instance_id"})
+        if not isinstance(obj["source_run_id"], str) or not _CRUN.fullmatch(obj["source_run_id"]):
+            _fail("invalid source run")
+        if not isinstance(obj["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(obj["test_instance_id"]):
+            _fail("invalid test instance ID")
+    else:
+        obj = _object(obj, {"schema_version", "plan_kind", "tests", "plan_labels"})
+        _enum(obj["plan_kind"], {"configured_live_read"})
+        tests = _list(obj["tests"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+        if not tests:
+            _fail("select at least one configured test")
+        seen = set()
+        for item in tests:
+            item = _source_ref(item)
+            key = (item["source_scenario_id"], item["source_revision"])
+            if key in seen:
+                _fail("duplicate configured test")
+            seen.add(key)
+        _plan_labels(obj["plan_labels"], minimum=0)
+    _enum(obj["schema_version"], {CONFIGURED_PLAN_REQUEST_SCHEMA})
+    return copy.deepcopy(obj)
+
+
+def configured_plan_snapshot(value: Any) -> dict[str, Any]:
+    """The exact frozen request a bound runner receives (``request`` of a sync result)."""
+    obj = _object(value, {
+        "plan_request_id", "plan_request_nonce", "plan_kind", "instances", "plan_labels",
+        "source_run_id", "expires_at_ms",
+    })
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    kind = _enum(obj["plan_kind"], set(CONFIGURED_PLAN_KINDS))
+    instances = _snapshot_instances(obj["instances"])
+    _configured_plan_labels(obj["plan_labels"], instances)
+    if kind == "configured_regression":
+        if len(instances) != 1 or instances[0]["local_input_binding_digest"] is None:
+            _fail("a regression replays exactly one frozen instance")
+        if not isinstance(obj["source_run_id"], str) or not _CRUN.fullmatch(obj["source_run_id"]):
+            _fail("invalid source run")
+    elif obj["source_run_id"] is not None or any(item["local_input_binding_digest"] is not None for item in instances):
+        _fail("a live plan freezes no handles before the runner compiles it")
+    _integer(obj["expires_at_ms"], lower=1)
+    return obj
+
+
+def _readiness(value: Any) -> dict[str, Any]:
+    obj = _object(value, {"plan_request_id", "plan_request_nonce", "instances"})
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    entries = _list(obj["instances"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries:
+        _fail("readiness must cover the selected instances")
+    seen = set()
+    for entry in entries:
+        entry = _object(entry, {"test_instance_id", "requirements"})
+        if not isinstance(entry["test_instance_id"], str) or not _TEST_INSTANCE_ID.fullmatch(entry["test_instance_id"]):
+            _fail("invalid test instance ID")
+        if entry["test_instance_id"] in seen:
+            _fail("duplicate readiness instance")
+        seen.add(entry["test_instance_id"])
+        requirements = _list(entry["requirements"], maximum=8)
+        if not requirements:
+            _fail("readiness requires at least one requirement")
+        keys = []
+        for item in requirements:
+            item = _object(item, {"kind", "subject", "state"})
+            kind = _enum(item["kind"], set(CONFIGURED_READINESS_KINDS))
+            state = _enum(item["state"], set(CONFIGURED_READINESS_STATES))
+            subject = item["subject"]
+            if kind == "role_credential":
+                _enum(subject, set(_CONFIGURED_ROLES))
+                if state not in {"ready", "missing"}: _fail("invalid readiness state")
+            elif kind == "local_input":
+                if not isinstance(subject, str) or not _FIXTURE_REF.fullmatch(subject): _fail("invalid local input reference")
+                if state == "unsupported": _fail("invalid readiness state")
+            else:
+                if subject is not None: _fail("readiness subject is not applicable")
+                if kind == "frozen_run" and state not in {"ready", "missing"}: _fail("invalid readiness state")
+                if kind == "route" and state == "revoked": _fail("invalid readiness state")
+            keys.append((kind, subject or ""))
+        if keys != sorted(set(keys)):
+            _fail("readiness requirements must be sorted and unique")
+    return obj
+
+
+def validate_runner_configured_plan_sync(value: Any) -> dict[str, Any]:
+    obj = _contract(value, RUNNER_CONFIGURED_SYNC_MAX_BYTES); _reject_keys(obj, _FORBIDDEN_DISCOVERY_KEYS)
+    obj = _object(obj, {"schema_version", "binding_id", "binding_digest", "capability", "readiness"})
+    _enum(obj["schema_version"], {RUNNER_CONFIGURED_PLAN_SYNC_SCHEMA})
+    if not isinstance(obj["binding_id"], str) or not _CONTEXT_BINDING_ID.fullmatch(obj["binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["binding_digest"]); _enum(obj["capability"], {CONFIGURED_RUNNER_CAPABILITY})
+    if obj["readiness"] is not None:
+        _readiness(obj["readiness"])
+    return copy.deepcopy(obj)
+
+
+def validate_runner_configured_plan_sync_result(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 64 * 1024)
+    obj = _object(obj, {"schema_version", "server_time_ms", "request"})
+    _enum(obj["schema_version"], {RUNNER_CONFIGURED_PLAN_SYNC_RESULT_SCHEMA}); _integer(obj["server_time_ms"])
+    if obj["request"] is not None:
+        configured_plan_snapshot(obj["request"])
+    return copy.deepcopy(obj)
+
+
+def validate_runner_configured_projection_submit(value: Any) -> dict[str, Any]:
+    obj = _contract(value, RUNNER_CONFIGURED_SUBMIT_MAX_BYTES)
+    obj = _object(obj, {
+        "schema_version", "context_binding_id", "context_binding_digest", "plan_request_id",
+        "plan_request_nonce", "approval_projection",
+    })
+    _enum(obj["schema_version"], {RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA})
+    if not isinstance(obj["context_binding_id"], str) or not _CONTEXT_BINDING_ID.fullmatch(obj["context_binding_id"]):
+        _fail("invalid context binding id")
+    _hash(obj["context_binding_digest"])
+    if not isinstance(obj["plan_request_id"], str) or not _PLAN_REQUEST_ID.fullmatch(obj["plan_request_id"]):
+        _fail("invalid plan request id")
+    if not isinstance(obj["plan_request_nonce"], str) or not _NONCE.fullmatch(obj["plan_request_nonce"]):
+        _fail("invalid plan request nonce")
+    obj["approval_projection"] = validate_configured_approval_projection(obj["approval_projection"])
+    if len(canonical_bytes(obj["approval_projection"])) > 65536:
+        _fail("approval projection exceeds size limit")
+    return copy.deepcopy(obj)
+
+
+def validate_runner_projection_submission(value: Any) -> dict[str, Any]:
+    """Exactly the v1 submit envelope or exactly the configured one; nothing else."""
+    if _schema_of(value) == RUNNER_CONFIGURED_PROJECTION_SUBMIT_SCHEMA:
+        return validate_runner_configured_projection_submit(value)
+    return validate_runner_approval_projection_submit(value)
+
+
+def configured_condition_review(projection: Mapping[str, Any], plan_labels: list[Any]) -> dict[str, Any]:
+    """The exact acknowledgement an approver's client must echo for one v3 projection.
+
+    It restates every frozen condition, route, role pair, source revision and the request
+    budget, so a client that cannot display them cannot construct it from a digest alone.
+    """
+    projection = validate_configured_approval_projection(projection)
+    return {
+        "schema_version": CONFIGURED_CONDITION_REVIEW_SCHEMA,
+        "plan_labels": copy.deepcopy(list(plan_labels)),
+        "maximum_requests": projection["budgets"]["maximum_requests"],
+        "instances": [{
+            "test_instance_id": item["test_instance_id"],
+            "source": copy.deepcopy(item["source"]),
+            "scenario_id": item["scenario_id"],
+            "method": item["method"],
+            "route_template": item["route_template"],
+            "roles": list(CONFIGURED_ROLE_ORDER[item["scenario_id"]]),
+            "request_count": 2,
+            "assertion": copy.deepcopy(item["assertion"]),
+            "local_input_refs": list(item["local_input_refs"]),
+        } for item in projection["test_instances"]],
+    }
+
+
+def validate_configured_condition_review(value: Any) -> dict[str, Any]:
+    obj = _contract(value, 16 * 1024)
+    obj = _object(obj, {"schema_version", "plan_labels", "maximum_requests", "instances"})
+    _enum(obj["schema_version"], {CONFIGURED_CONDITION_REVIEW_SCHEMA})
+    _plan_labels(obj["plan_labels"], minimum=0); _integer(obj["maximum_requests"], lower=1, upper=20)
+    entries = _list(obj["instances"], maximum=MAX_CONFIGURED_TEST_INSTANCES)
+    if not entries:
+        _fail("review must restate every configured instance")
+    for entry in entries:
+        entry = _object(entry, {
+            "test_instance_id", "source", "scenario_id", "method", "route_template", "roles",
+            "request_count", "assertion", "local_input_refs",
+        })
+        _source_ref(entry["source"]); _enum(entry["scenario_id"], set(CONFIGURED_ROLE_ORDER))
+        _configured_assertion(entry["assertion"])
     return copy.deepcopy(obj)

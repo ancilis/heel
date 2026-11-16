@@ -20,6 +20,13 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from heel.canary_contracts import (
     APPROVAL_PROJECTION_V2_SCHEMA,
+    CONFIGURED_APPROVAL_PROJECTION_SCHEMA,
+    CONFIGURED_CONDITION_REVIEW_SCHEMA,
+    CONFIGURED_ROLE_ORDER,
+    configured_condition_review,
+    validate_configured_condition_review,
+    validate_runner_approval_projection,
+    validate_runner_configured_projection_submit,
     DISCOVERY_BOUND,
     DISCOVERY_SEED_DIGEST,
     DISCOVERY_SEED_PATHS,
@@ -86,6 +93,8 @@ _PUBLIC_ERROR_CODES = {
     "source_sequence_gap": "event_sequence_conflict",
     "operational_counter_regression": "event_sequence_conflict",
     "operational_time_regression": "event_sequence_conflict",
+    "configured_review_required": "configured_review_required",
+    "configured_review_mismatch": "configured_review_mismatch",
 }
 
 
@@ -248,6 +257,11 @@ DISCOVERY_ERROR_STATUS = {
     "plan_request_open": 409, "selection_outside_inventory": 409, "plan_request_expired": 409,
     "runner_context_binding_not_found": 404, "invalid_plan_request": 400,
     "discovery_unavailable": 503,
+    # E3 configured live-read plans.
+    "invalid_configured_plan_request": 400, "plan_labels_required": 400,
+    "custom_revision_not_found": 404, "configured_request_not_found": 404,
+    "live_test_not_configured": 409, "configured_request_closed": 409,
+    "configured_source_run_unavailable": 409, "configured_plan_mismatch": 409,
 }
 
 
@@ -360,6 +374,8 @@ class CanaryRunService:
             self.conn.execute("PRAGMA busy_timeout=5000")
             CanaryStore(conn)
             ensure_discovery_plan_schema(conn)
+            from .scenario_library import ensure_configured_live_test_schema
+            ensure_configured_live_test_schema(conn)
         self.signing = signing
         self.runner_auth = runner_auth
         if ledger is not None:
@@ -546,7 +562,8 @@ class CanaryRunService:
             or identity.get("adapter_versions") != runner["adapter_versions"]
         ):
             raise CanaryRunError("runner_version_mismatch")
-        versions = sorted({item["adapter_version"] for item in projection["scenarios"]})
+        units = projection["test_instances"] if projection["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA else projection["scenarios"]
+        versions = sorted({item["adapter_version"] for item in units})
         if versions != runner["adapter_versions"]:
             raise CanaryRunError("runner_version_mismatch")
         try:
@@ -556,13 +573,17 @@ class CanaryRunService:
         return row
 
     def submit_projection(self, projection: object, *, uploaded_by: str, _transaction_owned: bool = False,
-                          _actor_class: str = "human") -> dict[str, object]:
+                          _actor_class: str = "human", _configured_submission: bool = False) -> dict[str, object]:
         """Store a human submission, or participate in a caller-owned runner PoP transaction."""
         uploaded_by = _identifier(uploaded_by, "invalid_projection_actor")
         try:
-            validated = validate_approval_projection(projection)
+            validated = validate_runner_approval_projection(projection)
         except (TypeError, ValueError):
             raise CanaryRunError("invalid_projection") from None
+        configured = validated["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA
+        if configured and not _configured_submission:
+            # A configured plan is admitted only with its context-bound request nonce.
+            raise CanaryRunError("invalid_projection")
         if "plan" in validated and not _transaction_owned:
             # A v2 plan binds a runner-context snapshot; a browser upload has neither.
             raise CanaryRunError("invalid_projection")
@@ -608,7 +629,7 @@ class CanaryRunService:
             if expires <= now:
                 raise CanaryRunError("proof_not_executable")
             purge_at = expires + PROJECTION_RETENTION_MS
-            scenario_ids = [item["scenario_id"] for item in validated["scenarios"]]
+            scenario_ids = [item["scenario_id"] for item in (validated["test_instances"] if configured else validated["scenarios"])]
             self.conn.execute(
                 "INSERT INTO canary_approval_projections("
                 "approval_id,workspace_id,project_ref,run_id,environment_id,runner_id,runner_key_id,"
@@ -730,6 +751,119 @@ class CanaryRunService:
             ),
         )
         return _RunnerProjectionSubmission(result, created=True)
+
+    def submit_configured_projection_from_runner_in_transaction(
+        self, envelope: dict, binding_row: sqlite3.Row, *, uploaded_by_runner_id: str,
+    ) -> "_RunnerProjectionSubmission":
+        """Admit a signed v3 projection only as the answer to its exact open configured request.
+
+        The request's single-use nonce, binding, runner key and frozen snapshot must all match;
+        every signed instance must equal the frozen instance (source revision, primitive, route,
+        canonical condition, digest, references, and for a replay the frozen handle digest).
+        Nothing is reserved or granted here; approval remains a separate human step.
+        """
+        if not self.conn.in_transaction:
+            raise RuntimeError("runner projection submission requires caller transaction")
+        if binding_row["status"] != "active" or int(binding_row["expires_at_ms"]) <= self._now_ms():
+            raise CanaryRunError("canary_authority_unavailable")
+        try:
+            envelope = validate_runner_configured_projection_submit(envelope)
+        except (TypeError, ValueError):
+            raise CanaryRunError("invalid_projection") from None
+        validated = envelope["approval_projection"]
+        self._assert_projection_matches_binding(validated, binding_row, uploaded_by_runner_id)
+        prior = self.conn.execute(
+            "SELECT approval_id,run_id,status,projection_digest,uploaded_by,projection_json FROM canary_approval_projections "
+            "WHERE workspace_id=? AND project_ref=? AND (approval_id=? OR projection_digest=?)",
+            (validated["workspace_id"], validated["project_id"], validated["projection_id"], validated["projection_digest"]),
+        ).fetchone()
+        if prior is not None:
+            linked = self.conn.execute(
+                "SELECT plan_request_id FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? "
+                "AND plan_request_id=? AND plan_request_nonce=? AND approval_id=? AND run_id=? AND projection_digest=?",
+                (binding_row["workspace_id"], binding_row["project_ref"], envelope["plan_request_id"],
+                 envelope["plan_request_nonce"], prior["approval_id"], prior["run_id"], prior["projection_digest"]),
+            ).fetchone()
+            if (prior["uploaded_by"] != uploaded_by_runner_id or linked is None
+                    or prior["projection_json"] != canonical_bytes(validated).decode()):
+                raise CanaryRunError("projection_conflict")
+            return _RunnerProjectionSubmission({
+                "schema_version": "heel.canary-projection-submitted.v1", "approval_id": prior["approval_id"],
+                "run_id": prior["run_id"], "status": prior["status"], "projection_digest": prior["projection_digest"],
+            }, created=False)
+        now = self._now_ms()
+        self.conn.execute(
+            "UPDATE canary_configured_plan_requests SET status='expired' WHERE workspace_id=? AND rcb_id=? "
+            "AND status='open' AND expires_at_ms<=?",
+            (binding_row["workspace_id"], binding_row["rcb_id"], now),
+        )
+        row = self.conn.execute(
+            "SELECT * FROM canary_configured_plan_requests WHERE plan_request_id=? AND workspace_id=? AND project_ref=?",
+            (envelope["plan_request_id"], binding_row["workspace_id"], binding_row["project_ref"]),
+        ).fetchone()
+        if (row is None or row["rcb_id"] != binding_row["rcb_id"]
+                or row["binding_digest"] != binding_row["binding_digest"]
+                or row["runner_id"] != binding_row["runner_id"] or row["runner_key_id"] != binding_row["runner_key_id"]
+                or row["plan_request_nonce"] != envelope["plan_request_nonce"]):
+            raise DiscoveryError("plan_binding_required")
+        if row["status"] in {"projected", "approved"}:
+            raise DiscoveryError("plan_request_consumed")
+        if row["status"] != "open":
+            raise DiscoveryError("plan_request_expired")
+        snapshot = json.loads(row["snapshot_json"])
+        if canonical_digest(snapshot) != row["snapshot_digest"]:
+            raise DiscoveryError("discovery_unavailable")
+        signed = validated["test_instances"]
+        frozen = snapshot["instances"]
+        if len(signed) != len(frozen):
+            raise DiscoveryError("configured_plan_mismatch")
+        for item, expected in zip(signed, frozen):
+            core = {key: item[key] for key in (
+                "test_instance_id", "scenario_id", "source", "method", "route_template", "assertion",
+                "assertion_digest", "local_input_refs",
+            )}
+            if core != {key: expected[key] for key in core}:
+                raise DiscoveryError("configured_plan_mismatch")
+            pinned = expected["local_input_binding_digest"]
+            if pinned is not None and item["local_input_binding_digest"] != pinned:
+                raise DiscoveryError("configured_plan_mismatch")
+        result = self.submit_projection(
+            validated, uploaded_by=uploaded_by_runner_id, _transaction_owned=True, _actor_class="runner",
+            _configured_submission=True,
+        )
+        linked = self.conn.execute(
+            "UPDATE canary_configured_plan_requests SET status='projected',approval_id=?,run_id=?,projection_digest=? "
+            "WHERE plan_request_id=? AND status='open'",
+            (result["approval_id"], result["run_id"], result["projection_digest"], row["plan_request_id"]),
+        )
+        if linked.rowcount != 1:
+            raise DiscoveryError("plan_request_consumed")
+        self.conn.execute(
+            "INSERT INTO canary_runner_context_projection_links("
+            "workspace_id,project_ref,approval_id,run_id,environment_id,runner_id,runner_key_id,rcb_id,binding_digest,projection_digest,created_at_ms) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                binding_row["workspace_id"], binding_row["project_ref"], result["approval_id"],
+                result["run_id"], binding_row["environment_id"], binding_row["runner_id"],
+                binding_row["runner_key_id"], binding_row["rcb_id"], binding_row["binding_digest"], result["projection_digest"],
+                self._now_ms(),
+            ),
+        )
+        return _RunnerProjectionSubmission(result, created=True)
+
+    def configured_plan_labels(self, workspace_id: str, project_ref: str, run_id: str) -> list:
+        """The operator-supplied labels frozen in the configured request that produced a run."""
+        row = self.conn.execute(
+            "SELECT snapshot_json,snapshot_digest FROM canary_configured_plan_requests "
+            "WHERE workspace_id=? AND project_ref=? AND run_id=?",
+            (workspace_id, project_ref, run_id),
+        ).fetchone()
+        if row is None:
+            raise CanaryRunError("canary_authority_unavailable")
+        snapshot = json.loads(row["snapshot_json"])
+        if canonical_digest(snapshot) != row["snapshot_digest"]:
+            raise CanaryRunError("canary_authority_unavailable")
+        return snapshot["plan_labels"]
 
     @staticmethod
     def _assert_projection_matches_binding(validated: dict, binding_row: sqlite3.Row, uploaded_by_runner_id: str) -> None:
@@ -1208,8 +1342,14 @@ class CanaryRunService:
         recent_auth_at_ms: int,
         idempotency_key: str,
         expected_kill_switch_generation: int,
+        condition_review: object | None = None,
     ) -> dict[str, object]:
         actor = _identifier(actor, "invalid_approval_actor")
+        if condition_review is not None:
+            try:
+                condition_review = validate_configured_condition_review(condition_review)
+            except (TypeError, ValueError):
+                raise CanaryRunError("configured_review_mismatch") from None
         if (
             type(projection_digest) is not str or len(projection_digest) != 64
             or re.fullmatch(r"[0-9a-f]{64}", projection_digest) is None
@@ -1300,7 +1440,25 @@ class CanaryRunService:
                 raise CanaryRunError("invalid_canary_approval")
             if approval["expires_at"] <= now or approval["projection_json"] is None:
                 raise CanaryRunError("approval_expired")
-            projection = validate_approval_projection(json.loads(approval["projection_json"]))
+            projection = validate_runner_approval_projection(json.loads(approval["projection_json"]))
+            if projection["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+                if condition_review is None:
+                    # An approver whose client cannot restate the frozen conditions (for example
+                    # a stale v1 page echoing only the digest) never approves a configured plan.
+                    raise CanaryRunError("configured_review_required")
+                expected_review = configured_condition_review(
+                    projection, self.configured_plan_labels(workspace_id, project_ref, run_id),
+                )
+                if canonical_bytes(condition_review) != canonical_bytes(expected_review):
+                    raise CanaryRunError("configured_review_mismatch")
+                if self.conn.execute(
+                    "SELECT 1 FROM canary_configured_plan_requests WHERE workspace_id=? AND project_ref=? "
+                    "AND approval_id=? AND run_id=? AND projection_digest=? AND status='projected'",
+                    (workspace_id, project_ref, approval["approval_id"], run_id, approval["projection_digest"]),
+                ).fetchone() is None:
+                    raise CanaryRunError("canary_authority_unavailable")
+            elif condition_review is not None:
+                raise CanaryRunError("configured_review_mismatch")
             plan_request = None
             if "plan" in projection:
                 if projection["plan"]["plan_kind"] == "discovery":
@@ -1400,6 +1558,12 @@ class CanaryRunService:
                 self.conn.execute(
                     "UPDATE canary_plan_requests SET status='approved' WHERE plan_request_id=? AND status='projected'",
                     (plan_request["plan_request_id"],),
+                )
+            if projection["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA:
+                self.conn.execute(
+                    "UPDATE canary_configured_plan_requests SET status='approved' WHERE workspace_id=? AND project_ref=? "
+                    "AND run_id=? AND status='projected'",
+                    (workspace_id, project_ref, run_id),
                 )
             run = self._run(workspace_id, project_ref, run_id)
             self._append_event(run, "quota_reserved", actor_class="system", actor_id="quota")
@@ -1542,7 +1706,7 @@ class CanaryRunService:
             ).fetchone()
             if approval is None or approval["projection_json"] is None or approval["status"] != "approved":
                 raise CanaryRunError("invalid_grant")
-            projection = validate_approval_projection(json.loads(approval["projection_json"]))
+            projection = validate_runner_approval_projection(json.loads(approval["projection_json"]))
             if (
                 grant["approval"]["projection_id"] != projection["projection_id"]
                 or grant["approval"]["projection_digest"] != approval["projection_digest"]
@@ -1718,7 +1882,7 @@ class CanaryRunService:
         if row["projection_json"] is None or row["grant_json"] is None:
             raise CanaryRunError("operational_binding_mismatch")
         try:
-            approval = validate_approval_projection(json.loads(row["projection_json"]))
+            approval = validate_runner_approval_projection(json.loads(row["projection_json"]))
             grant = validate_execution_grant(json.loads(row["grant_json"]))
             self._verify_signature(approval, row["public_key"], "projection_digest")
             self._verify_signature(grant, self.signing.canonical_public_key, "grant_digest")
@@ -2670,7 +2834,7 @@ class CanaryRunService:
                 raw = row["projection_json"].encode("utf-8")
                 if len(raw) > 65536:
                     raise ValueError
-                projection = validate_approval_projection(json.loads(row["projection_json"]))
+                projection = validate_runner_approval_projection(json.loads(row["projection_json"]))
                 if canonical_bytes(projection) != raw or (projection["projection_id"], projection["workspace_id"], projection["project_id"], projection["projection_digest"], projection["signing_key_id"]) != (row["approval_id"], row["workspace_id"], row["project_ref"], row["projection_digest"], row["signing_key_id"]):
                     raise ValueError
                 if (projection["environment"]["environment_id"] != row["environment_id"] or projection["runner"]["runner_id"] != row["runner_id"]
@@ -2699,6 +2863,29 @@ class CanaryRunService:
                         raise ValueError
                 hostname = projection["egress"]["hostname"]
                 enrichment = {}
+                configured = projection["schema_version"] == CONFIGURED_APPROVAL_PROJECTION_SCHEMA
+                if configured:
+                    request = self.conn.execute(
+                        "SELECT plan_request_id,plan_kind FROM canary_configured_plan_requests WHERE workspace_id=? "
+                        "AND project_ref=? AND run_id=? AND approval_id=? AND projection_digest=? AND status='projected'",
+                        (workspace_id, project_ref, row["run_id"], row["approval_id"], row["projection_digest"]),
+                    ).fetchone()
+                    if request is None:
+                        raise ValueError
+                    enrichment = {"configured": {
+                        "plan_request_id": request["plan_request_id"], "plan_kind": request["plan_kind"],
+                        "review_schema": CONFIGURED_CONDITION_REVIEW_SCHEMA,
+                        "plan_labels": self.configured_plan_labels(workspace_id, project_ref, row["run_id"]),
+                        "instances": [{
+                            "test_instance_id": item["test_instance_id"], "source": item["source"],
+                            "scenario_id": item["scenario_id"], "method": item["method"],
+                            "route_template": item["route_template"],
+                            "roles": list(CONFIGURED_ROLE_ORDER[item["scenario_id"]]),
+                            "request_count": 2, "assertion": item["assertion"],
+                            "assertion_digest": item["assertion_digest"],
+                            "local_input_refs": item["local_input_refs"],
+                        } for item in projection["test_instances"]],
+                    }}
                 if "plan" in projection:
                     if projection["plan"]["plan_kind"] == "discovery":
                         raise ValueError
@@ -2710,7 +2897,7 @@ class CanaryRunService:
                         "plan": projection["plan"],
                         "inventory_changed": live is None or live["inventory_digest"] != projection["plan"]["inventory_digest"],
                     }
-                requests.append({**enrichment, "approval_id": row["approval_id"], "run_id": row["run_id"], "projection_digest": row["projection_digest"], "status": "awaiting_execution_approval", "submitted_at_ms": row["created_at"], "expires_at_ms": row["expires_at"], "origin": projection["environment"]["origin"], "hostname": hostname, "routes": [f"{item['method']} {item['route_template']}" for item in projection["actions"]], "scenarios": [item["scenario_id"] for item in projection["scenarios"]], "request_budget": projection["budgets"]["maximum_requests"], "duration_seconds": math.ceil(projection["budgets"]["wall_timeout_ms"] / 1000), "egress": f"{hostname}:443"})
+                requests.append({**enrichment, "approval_id": row["approval_id"], "run_id": row["run_id"], "projection_digest": row["projection_digest"], "status": "awaiting_execution_approval", "submitted_at_ms": row["created_at"], "expires_at_ms": row["expires_at"], "origin": projection["environment"]["origin"], "hostname": hostname, "routes": [f"{item['method']} {item['route_template']}" for item in projection["actions"]], "scenarios": [item["scenario_id"] for item in (projection["test_instances"] if configured else projection["scenarios"])], "request_budget": projection["budgets"]["maximum_requests"], "duration_seconds": math.ceil(projection["budgets"]["wall_timeout_ms"] / 1000), "egress": f"{hostname}:443"})
             except (KeyError, TypeError, ValueError, LookupError):
                 raise CanaryRunError("canary_authority_unavailable") from None
         requests.sort(key=lambda item: (-int(item["submitted_at_ms"]), str(item["run_id"])))

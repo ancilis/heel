@@ -1626,6 +1626,126 @@ def ensure_stop_ack_witness_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 
+# Migration 36 (E3): admit the configured findings projection (heel.canary-findings-projection.v2)
+# in the three disclosure tables. A lossless rebuild in the migration-15 style: every row is copied
+# byte for byte; only the schema CHECK widens from exactly v1 to exactly {v1, v2}.
+CONFIGURED_FINDINGS_DISCLOSURE_MIGRATION = r"""
+DROP INDEX idx_canary_disclosure_expiry;
+DROP INDEX idx_canary_findings_purge;
+ALTER TABLE canary_findings_projections RENAME TO canary_findings_projections_v35;
+ALTER TABLE canary_disclosure_permits RENAME TO canary_disclosure_permits_v35;
+ALTER TABLE canary_disclosure_requests RENAME TO canary_disclosure_requests_v35;
+CREATE TABLE canary_disclosure_requests(
+ request_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL,
+ run_id TEXT NOT NULL, grant_id TEXT NOT NULL, runner_id TEXT NOT NULL, runner_key_id TEXT NOT NULL,
+ schema_version TEXT NOT NULL CHECK(schema_version IN ('heel.canary-findings-projection.v1','heel.canary-findings-projection.v2')),
+ projection_digest TEXT NOT NULL CHECK(length(projection_digest)=64 AND projection_digest NOT GLOB '*[^0-9a-f]*'),
+ maximum_bytes INTEGER NOT NULL CHECK(maximum_bytes BETWEEN 1 AND 262144),
+ scenario_count INTEGER NOT NULL CHECK(scenario_count BETWEEN 0 AND 4),
+ finding_count INTEGER NOT NULL CHECK(finding_count BETWEEN 0 AND 4),
+ status TEXT NOT NULL CHECK(status IN (
+  'local_result_ready','awaiting_disclosure_approval','permitted','synchronized','local_only','expired')),
+ created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ UNIQUE(workspace_id,project_ref,run_id), UNIQUE(workspace_id,project_ref,projection_digest),
+ UNIQUE(workspace_id,project_ref,request_id,run_id,grant_id,runner_id,runner_key_id),
+ FOREIGN KEY(workspace_id,project_ref,run_id,grant_id)
+  REFERENCES canary_runs(workspace_id,project_ref,run_id,grant_id),
+ FOREIGN KEY(workspace_id,runner_id,runner_key_id)
+  REFERENCES canary_runner_keys(workspace_id,runner_id,key_id));
+CREATE TABLE canary_disclosure_permits(
+ permit_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL,
+ request_id TEXT NOT NULL, run_id TEXT NOT NULL, grant_id TEXT NOT NULL,
+ runner_id TEXT NOT NULL, runner_key_id TEXT NOT NULL,
+ schema_version TEXT NOT NULL CHECK(schema_version='heel.disclosure-permit.v1'),
+ projection_schema_version TEXT NOT NULL
+  CHECK(projection_schema_version IN ('heel.canary-findings-projection.v1','heel.canary-findings-projection.v2')),
+ projection_digest TEXT NOT NULL CHECK(
+  length(projection_digest)=64 AND projection_digest NOT GLOB '*[^0-9a-f]*'),
+ permit_digest TEXT NOT NULL UNIQUE CHECK(
+  length(permit_digest)=64 AND permit_digest NOT GLOB '*[^0-9a-f]*'),
+ permit_json TEXT NOT NULL CHECK(length(CAST(permit_json AS BLOB)) BETWEEN 2 AND 16384),
+ nonce_hash TEXT NOT NULL UNIQUE CHECK(length(nonce_hash)=64 AND nonce_hash NOT GLOB '*[^0-9a-f]*'),
+ maximum_bytes INTEGER NOT NULL CHECK(maximum_bytes BETWEEN 1 AND 262144),
+ scenario_count INTEGER NOT NULL CHECK(scenario_count BETWEEN 0 AND 4),
+ finding_count INTEGER NOT NULL CHECK(finding_count BETWEEN 0 AND 4),
+ status TEXT NOT NULL CHECK(status IN ('permitted','consumed','expired','revoked')),
+ approved_by TEXT NOT NULL, approved_at INTEGER NOT NULL, issued_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL CHECK(issued_at<expires_at AND expires_at<=issued_at+600000),
+ consumed_at INTEGER, purge_at INTEGER NOT NULL,
+ UNIQUE(workspace_id,project_ref,permit_id),
+ UNIQUE(workspace_id,project_ref,permit_id,run_id,grant_id,runner_id,runner_key_id),
+ FOREIGN KEY(workspace_id,project_ref,request_id,run_id,grant_id,runner_id,runner_key_id)
+  REFERENCES canary_disclosure_requests(
+   workspace_id,project_ref,request_id,run_id,grant_id,runner_id,runner_key_id),
+ FOREIGN KEY(workspace_id,project_ref,run_id,grant_id)
+  REFERENCES canary_runs(workspace_id,project_ref,run_id,grant_id),
+ FOREIGN KEY(workspace_id,runner_id,runner_key_id)
+  REFERENCES canary_runner_keys(workspace_id,runner_id,key_id));
+CREATE TABLE canary_findings_projections(
+ finding_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, project_ref TEXT NOT NULL,
+ run_id TEXT NOT NULL, grant_id TEXT NOT NULL, permit_id TEXT NOT NULL,
+ runner_id TEXT NOT NULL, runner_key_id TEXT NOT NULL,
+ schema_version TEXT NOT NULL CHECK(schema_version IN ('heel.canary-findings-projection.v1','heel.canary-findings-projection.v2')),
+ projection_digest TEXT NOT NULL UNIQUE CHECK(
+  length(projection_digest)=64 AND projection_digest NOT GLOB '*[^0-9a-f]*'),
+ projection_json TEXT CHECK(
+  projection_json IS NULL OR length(CAST(projection_json AS BLOB)) BETWEEN 2 AND 262144),
+ byte_count INTEGER NOT NULL CHECK(byte_count BETWEEN 1 AND 262144),
+ scenario_count INTEGER NOT NULL CHECK(scenario_count BETWEEN 0 AND 4),
+ finding_count INTEGER NOT NULL CHECK(finding_count BETWEEN 0 AND 4),
+ receipt_id TEXT NOT NULL UNIQUE CHECK(length(CAST(receipt_id AS BLOB)) BETWEEN 1 AND 128),
+ receipt_digest TEXT NOT NULL CHECK(
+  length(receipt_digest)=64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'),
+ receipt_json TEXT NOT NULL CHECK(length(CAST(receipt_json AS BLOB)) BETWEEN 2 AND 16384),
+ status TEXT NOT NULL CHECK(status='synchronized'),
+ accepted_at INTEGER NOT NULL, purge_at INTEGER NOT NULL,
+ UNIQUE(workspace_id,project_ref,finding_id), UNIQUE(workspace_id,project_ref,run_id),
+ FOREIGN KEY(workspace_id,project_ref,run_id,grant_id)
+  REFERENCES canary_runs(workspace_id,project_ref,run_id,grant_id),
+ FOREIGN KEY(workspace_id,project_ref,permit_id,run_id,grant_id,runner_id,runner_key_id)
+  REFERENCES canary_disclosure_permits(
+   workspace_id,project_ref,permit_id,run_id,grant_id,runner_id,runner_key_id),
+ FOREIGN KEY(workspace_id,runner_id,runner_key_id)
+  REFERENCES canary_runner_keys(workspace_id,runner_id,key_id));
+INSERT INTO canary_disclosure_requests SELECT * FROM canary_disclosure_requests_v35;
+INSERT INTO canary_disclosure_permits SELECT * FROM canary_disclosure_permits_v35;
+INSERT INTO canary_findings_projections SELECT * FROM canary_findings_projections_v35;
+DROP TABLE canary_findings_projections_v35;
+DROP TABLE canary_disclosure_permits_v35;
+DROP TABLE canary_disclosure_requests_v35;
+CREATE INDEX idx_canary_disclosure_expiry ON canary_disclosure_permits(status,expires_at);
+CREATE INDEX idx_canary_findings_purge ON canary_findings_projections(purge_at);
+"""
+
+
+def ensure_configured_findings_disclosure_schema(conn: sqlite3.Connection) -> None:
+    """Bring direct construction to migration-36 parity; a tracked database is left to Migrator."""
+    current = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='canary_disclosure_requests'"
+    ).fetchone()
+    if current is None or "heel.canary-findings-projection.v2" in current[0]:
+        return
+    tracked = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone() is not None
+    if tracked:
+        version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        if int(version or 0) >= 36:
+            raise RuntimeError("configured findings disclosure schema does not match migration 36")
+        return
+    savepoint = "configured_findings_disclosure_apply"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for statement in _sqlite_schema_statements(CONFIGURED_FINDINGS_DISCLOSURE_MIGRATION):
+            if statement:
+                conn.execute(statement)
+    except Exception as error:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise RuntimeError("configured findings disclosure schema initialization failed") from error
+    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+
 class CanaryStore:
     """Typed schema owner. Higher canary services are added in later packets."""
 
@@ -1668,3 +1788,4 @@ class CanaryStore:
         ensure_runner_context_schema(self.conn)
         ensure_host_authority_schema(self.conn)
         ensure_stop_ack_witness_schema(self.conn)
+        ensure_configured_findings_disclosure_schema(self.conn)
