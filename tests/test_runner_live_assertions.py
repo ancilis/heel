@@ -674,12 +674,24 @@ def test_total_canonical_definition_bound():
     (b"[]", "field_type_invalid"),
     (b" " * 8193, "definition_too_large"),
     ("{}", "definition_malformed"),
-    (b"[" * 3000 + b"]" * 3000, "field_type_invalid"),
 ], ids=lambda value: value[:24] if isinstance(value, (bytes, str)) else value)
 def test_raw_definition_parsing_is_strict(raw, reason):
     with pytest.raises(LiveAssertionError) as info:
         parse_live_read_assertion(raw)
     assert info.value.reason == reason
+    assert info.value.__cause__ is None
+
+
+def test_raw_definition_deep_nesting_rejected_at_either_stage():
+    # 3000 nested arrays is well-formed JSON whose top level is not an object. Which stage
+    # rejects it depends on the interpreter's json decoder, not on Heel: where json.loads
+    # raises RecursionError (e.g. CPython 3.11) the parser rejects it as
+    # definition_malformed; where the decoder returns the nested list (e.g. CPython 3.13)
+    # the validator rejects the non-object top level as field_type_invalid. Both are closed
+    # rejection codes; any other code, any other exception, or acceptance still fails.
+    with pytest.raises(LiveAssertionError) as info:
+        parse_live_read_assertion(b"[" * 3000 + b"]" * 3000)
+    assert info.value.reason in {"definition_malformed", "field_type_invalid"}
     assert info.value.__cause__ is None
 
 
