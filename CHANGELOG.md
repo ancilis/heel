@@ -66,13 +66,22 @@ record.
   have no recorded acceptance. There are no writes, multi-step workflows, trials or cumulative usage
   tests, and the scenario library is breadth, not executed coverage.
 - The standalone synthetic staging target (`tests/fixtures/customer_staging`: `README.md`,
-  `openapi.json`, `worker.mjs`, `wrangler.jsonc`) is prepared for separate distribution as the
-  `heel-staging-fixture-*` assets of the same prerelease, listed with sizes and SHA-256 digests in
-  `release/heel-staging-fixture-manifest.json`. It is a test fixture, not inside the wheel or source
-  archive, and not product code. The release notes state its `SOURCE_REVISION`.
+  `openapi.json`, `worker.mjs`, `wrangler.jsonc`) is published as the `heel-staging-fixture-*`
+  assets of the same prerelease, together with `heel-staging-fixture-manifest.json`, which lists their
+  sizes and SHA-256 digests (`release/heel-staging-fixture-manifest.json`). It is a test fixture, not
+  inside the wheel or source archive, and not product code. The release notes state its
+  `SOURCE_REVISION`.
 - Findings semantics of the existing `plan_entitlement_read` and `anonymous_authenticated_read`
-  checks are unchanged from 1.3.0rc5. These runner changes are proven with local test fixtures and
-  a local browser journey only; no deployed or customer run is recorded for 1.3.0rc6.
+  checks are unchanged from 1.3.0rc5. These runner changes were first proven with local test
+  fixtures and a local browser journey. On 2026-11-16 the release was deployed to the hosted preview,
+  and an independent fresh-customer review against its own deployment of the synthetic staging
+  target recorded a first real result: three browser-authored `GET` read tests using the `bearer`
+  profile were all observed with their controls established, and the signed redacted summary was
+  shared 12 minutes 50 seconds after the journey began. Full public acceptance failed. Two later
+  runs ended `incomplete` with `cloud_disconnected` (one after only 2 of 4 planned reads), and each
+  was followed by a `response_rejected` runner exit. The edited-condition and numeric-equality
+  outcomes, the frozen-revision regression replay after the target was corrected, error-envelope
+  mode, in-flight stop and recovery remain unproven. This is not a launch or complete-coverage claim.
 
 ## [1.3.0rc5]: 2026-11-13
 
