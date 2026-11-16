@@ -140,10 +140,11 @@ class ReleaseVersionContractTests(unittest.TestCase):
         card = ROOT / "apps/heel-cloud/components/canary/RunnerPairingCard.tsx"
         self.assertIn(PUBLIC_WHEEL_URL, card.read_text(encoding="utf-8"), card)
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        # The CHANGELOG names exactly one unpublished candidate, rc6, and keeps the rc5 publication
-        # record: its real date and release URL.
-        self.assertIn(f"## [{VERSION}]: unpublished candidate", changelog)
-        self.assertEqual(changelog.count("unpublished candidate"), 1)
+        # The CHANGELOG records the rc6 publication (its real date and release URL), names no
+        # unpublished candidate, and keeps the rc5 publication record.
+        self.assertIn(f"## [{VERSION}]: 2026-11-16", changelog)
+        self.assertIn(f"https://github.com/ancilis/heel/releases/tag/v{VERSION}", changelog)
+        self.assertEqual(changelog.count("unpublished candidate"), 0)
         self.assertIn(f"## [{RC5_VERSION}]: 2026-11-13", changelog)
         self.assertIn(RC5_RELEASE_URL, changelog)
         # The rc5 entry no longer says customer copy stays on rc4.

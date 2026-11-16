@@ -33,14 +33,20 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc6]: unpublished candidate
+## [1.3.0rc6]: 2026-11-16
 
-Runner preview candidate for browser-configured live read tests. It is not yet a GitHub release, it
-will not be on PyPI, and nothing in it is deployed. Customer install surfaces name the one
-hash-pinned 1.3.0rc6 install from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, whose
-wheel digest equals the bundled `/downloads/` wheel. That pin is provisional: the copy may be
-deployed only after the release owner's anonymous verify-public for v1.3.0rc6 has checked the exact
-published bytes. 1.3.0rc1 through 1.3.0rc5 stay published, unchanged, and are named only as history.
+Runner preview prerelease for browser-configured live read tests, published as a GitHub prerelease
+at <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6> from source commit
+`50a60ea6db80d811630c8bfe9efe832cc1ba5899` after its anonymous public verification passed: the
+anonymously downloaded wheel is 3021024 bytes with SHA-256
+`40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0`, and a source-free install of it
+reported `heel 1.3.0rc6`. That verification proves packaging and the synthetic reference only. It is
+not a stable release and it is not published to PyPI. Every customer install surface uses the one
+hash-pinned 1.3.0rc6 install from that release, whose wheel digest equals the bundled `/downloads/`
+wheel; 1.3.0rc1 through 1.3.0rc5 stay published, unchanged, and are named only as history. The
+packaged `release/open-core/README.md` inside the source archive is its build-time snapshot and
+still describes 1.3.0rc6 as not yet published; this entry and the release page are the publication
+record.
 
 - Version identity 1.3.0rc6 (npm 1.3.0-rc.6) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc5 stays an accepted saved-review and
