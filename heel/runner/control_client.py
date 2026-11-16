@@ -114,6 +114,19 @@ class RunnerControlRecoveryError(RuntimeError):
         super().__init__(message or self.code)
 
 
+class RunnerContextAnswerRejected(ValueError):
+    """A context-chain call was answered with a status other than the one its contract expects.
+
+    Still a ``ValueError`` (classified exactly as before). It carries only the integer HTTP
+    status as local diagnostic metadata; nothing from the answer body (not even its refusal
+    code), headers or path is kept.
+    """
+
+    def __init__(self, status: int):
+        super().__init__("invalid runner context response")
+        self.status = status if 100 <= status <= 599 else None
+
+
 class RunnerUploadDeferred(ValueError):
     """A 502/503/504 answered a findings upload; the sealed upload stays staged unchanged.
 
@@ -1521,6 +1534,11 @@ class RunnerControlClient:
             and self._authority_rejected(response[0], response[2])
         ):
             raise _ClaimChainAuthorityLost(runtime_pending)
+        if (
+            isinstance(response, tuple) and len(response) == 3 and type(response[0]) is int
+            and response[0] != expected_status
+        ):
+            raise RunnerContextAnswerRejected(response[0])
         if (not isinstance(response, tuple) or len(response) != 3 or response[0] != expected_status
                 or not isinstance(response[1], dict) or not isinstance(response[2], dict)
                 or set(response[2]) == set() or response[2].get("schema_version") != schema):
