@@ -7,14 +7,28 @@ import type { RunnerPairingView } from "../../lib/canary-api";
 
 
 /**
- * The 1.3.0rc6 runner install line, verbatim from the rc6 release-owner runbook (docs/RUNNER_PREVIEW_RELEASE_RC6.md,
- * "Customer install command"). Deploy it only after the release owner's anonymous `verify-public` for v1.3.0rc6 has
- * passed; the wheel digest is the rc6 wheel bundled byte for byte under public/downloads.
+ * Everything after the interpreter in the 1.3.0rc7 runbook install line (docs/RUNNER_PREVIEW_RELEASE_RC7.md, "Customer
+ * install command", which is `python3 ` followed by exactly this). The wheel URI, its SHA-256 and the pip flags are the
+ * published rc7 pin and never change here; the wheel is the one bundled byte for byte under public/downloads.
  */
-export const RUNNER_RC6_INSTALL = "python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version";
-export const RUNNER_RC6_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc6";
-/** The CLI that {@link RUNNER_RC6_INSTALL} creates; every runner command the dashboard shows starts with it. */
-export const RUNNER_RC6_CLI = "./heel-rc6/bin/heel";
+export const RUNNER_RC7_VENV_INSTALL_TAIL = "-m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/heel_sim-1.3.0rc7-py3-none-any.whl#sha256=da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21' && ./heel-rc7/bin/heel --version";
+
+/**
+ * The one public rc7 install command every customer surface shows. Before any venv exists it selects an installed
+ * interpreter (an optional HEEL_PYTHON path first, then PATH) that is 3.11 or newer and has venv and ensurepip, and
+ * prints which one it uses; if none qualifies it stops with a clear message and a failing status, without closing the
+ * shell (`false`, never `exit`) and without creating anything. It downloads no Python and adds no dependency. Deploy
+ * it only after the release owner's anonymous `verify-public` for v1.3.0rc7 has passed.
+ */
+export const RUNNER_RC7_INSTALL = "HEEL_PY=; for py in \"${HEEL_PYTHON:-python3}\" python3 python3.14 python3.13 python3.12 python3.11; do "
+  + "if command -v \"$py\" >/dev/null 2>&1 && \"$py\" -c 'import sys, venv, ensurepip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; "
+  + "then HEEL_PY=\"$(command -v \"$py\")\"; break; fi; done; "
+  + "if [ -z \"$HEEL_PY\" ]; then echo \"Heel needs Python 3.11 or newer with venv and ensurepip; none was found on PATH or at HEEL_PYTHON. "
+  + "Nothing was installed. Install one, or set HEEL_PYTHON to its path, then run this again.\" >&2; false; "
+  + "else echo \"Using $HEEL_PY: $(\"$HEEL_PY\" --version 2>&1)\" && \"$HEEL_PY\" " + RUNNER_RC7_VENV_INSTALL_TAIL + "; fi";
+export const RUNNER_RC7_RELEASE_URL = "https://github.com/ancilis/heel/releases/tag/v1.3.0rc7";
+/** The CLI that {@link RUNNER_RC7_INSTALL} creates; every runner command the dashboard shows starts with it. */
+export const RUNNER_RC7_CLI = "./heel-rc7/bin/heel";
 const PAIRING_ID_SHAPE = /^pending_[0-9a-f]{32}$/;
 export const PAIRING_UNCONFIGURED = "Runner pairing is unavailable: this dashboard's public address is not configured, so no pair command can be shown. No invitation was created; contact your Heel operator.";
 
@@ -68,12 +82,12 @@ export function RunnerPairingCard({
   return (
     <section className="runner-recovery" aria-labelledby="pair-runner-title"><p className="canary-kicker">Local runner</p><h2 id="pair-runner-title">Pair a runner</h2>
       <p>The runner runs on your machine and sends the only target traffic. Target credentials stay on that machine; this browser never asks for them.</p>
-      <p>1. Install the public preview runner (<a href={RUNNER_RC6_RELEASE_URL}>Heel 1.3.0rc6 release</a>):</p>
-      <p><code>{RUNNER_RC6_INSTALL}</code></p>
+      <p>1. Install the public preview runner (<a href={RUNNER_RC7_RELEASE_URL}>Heel 1.3.0rc7 release</a>):</p>
+      <p><code>{RUNNER_RC7_INSTALL}</code></p>
       <p>2. Create a one-time invitation. It expires after 10 minutes and is shown only here, once.</p>
       {origin === null ? <p role="status">{PAIRING_UNCONFIGURED}</p> : invitation !== null && !invitationExpired ? <div role="group" aria-label="Runner pairing invitation">
         <p>Run this on the runner machine before {clock(invitation.expiresAt)}. It prints a pairing id, six words and a fingerprint:</p>
-        <p><code>{`${RUNNER_RC6_CLI} runner pair --origin ${origin} --invite ${invitation.token}`}</code></p>
+        <p><code>{`${RUNNER_RC7_CLI} runner pair --origin ${origin} --invite ${invitation.token}`}</code></p>
       </div> : <>
         {invitationExpired ? <p role="status">This invitation expired unused or unopened. Create a new one.</p> : null}
         <button className="button button-primary" disabled={busy} onClick={onCreateInvitation} type="button">Create pairing invitation</button>

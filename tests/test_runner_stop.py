@@ -2255,7 +2255,10 @@ def test_runner_service_real_executor_sparse_sequences_survive_cloud_stop_progre
             return status
 
         def heartbeat(self, run_id, value):
-            watchdog.wait(heartbeat_released, "heartbeat awaits stop progress")
+            # Hold only the independent heartbeat loop; the supervisor's own post-progress
+            # gate refresh on the executor thread is part of the serialized progress step.
+            if threading.current_thread().name == "heel-runner-heartbeat":
+                watchdog.wait(heartbeat_released, "heartbeat awaits stop progress")
             try:
                 with cloud_request_lock:
                     gate = coordinator.heartbeat(

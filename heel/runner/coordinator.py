@@ -49,6 +49,11 @@ from heel.runner.store import RunReservationProbe, RunnerContext, RunnerStore, R
 _MAX_AUTHENTICATED_GATE_AGE_SECONDS = 0.5
 
 
+def _configured_replay_name(instance: Mapping[str, Any]) -> str:
+    """The saved-regression name of one browser-requested configured replay instance."""
+    return f"replay {instance['source']['source_scenario_id']} r{instance['source']['source_revision']}"[:64]
+
+
 def _signed_projection(unsigned: dict[str, Any], signer: SecureSigner) -> dict[str, Any]:
     signature = signer.sign(canonical_bytes(unsigned))
     if not isinstance(signature, bytes) or len(signature) != 64:
@@ -135,6 +140,8 @@ class RunnerCoordinator:
         if dict(control._trusted_disclosure_keys) != trust:
             raise ValueError("runner control disclosure authority binding is invalid")
         self.trusted_grant_keys = MappingProxyType(trust)
+        # (exception, closed stage) of the last failed ``process_configured_plan``; diagnostic only.
+        self.configured_failure: tuple[BaseException, str] | None = None
         self.clock_ms = clock_ms
         self.monotonic = monotonic
         self._gates: dict[str, ExecutionGate] = {}
@@ -936,17 +943,24 @@ class RunnerCoordinator:
         frozen_handles: dict[str, list[str]] | None = None
         if request["plan_kind"] == "configured_regression":
             frozen_handles = {}
-            from heel.runner.regressions import SavedRegressionError, _verified_terminal_run
+            from heel.runner.regressions import SavedRegressionError, derive_configured_saved_regression
 
-            try:
-                manifest = _verified_terminal_run(self.store, request["source_run_id"])["manifest"]
-            except (RunnerStoreError, SavedRegressionError, ValueError, KeyError, TypeError):
-                manifest = None
-            if isinstance(manifest, Mapping) and manifest.get("schema_version") == "heel.test-manifest.v2":
-                for instance in manifest["test_instances"]:
-                    frozen_handles[instance["test_instance_id"]] = [
-                        item["input_handle_id"] for item in instance["local_inputs"]
-                    ]
+            # The frozen run is ready only when it is an eligible replay source: the exact
+            # derivation ``add_saved_regression`` performs (verified terminal finals bound to this
+            # context and runner, an ``observed`` result with a finding for this instance). A run
+            # that is present but ineligible is reported like an absent one, never compiled.
+            for instance in request["instances"]:
+                try:
+                    record = derive_configured_saved_regression(
+                        self.store, run_id=request["source_run_id"],
+                        test_instance_id=instance["test_instance_id"],
+                        name=_configured_replay_name(instance), now_ms=self._now_ms(),
+                    )
+                except (RunnerStoreError, SavedRegressionError, ValueError, KeyError, TypeError):
+                    continue
+                frozen_handles[instance["test_instance_id"]] = [
+                    item["input_handle_id"] for item in record["local_inputs"]
+                ]
         report = []
         for instance in request["instances"]:
             requirements: list[dict[str, Any]] = []
@@ -994,7 +1008,18 @@ class RunnerCoordinator:
 
         The projection is admitted only with the request's single-use nonce; it creates an
         awaiting-approval record and nothing else. No target request happens here.
+
+        A failure is re-raised unchanged; only its closed stage name is kept locally
+        (``configured_failure``) for the serve owner's failure diagnostic.
         """
+        stage = ["sync"]
+        try:
+            return self._process_configured_plan(stage)
+        except BaseException as error:
+            self.configured_failure = (error, stage[0])
+            raise
+
+    def _process_configured_plan(self, stage: list[str]) -> dict[str, Any] | None:
         try:
             binding = self.store.verify_cloud_context_binding(
                 identity=self.identity, trusted_cloud_keys=self.trusted_grant_keys, now_ms=self._now_ms(),
@@ -1005,8 +1030,10 @@ class RunnerCoordinator:
         request = synced["request"]
         if request is None:
             return None
+        stage[0] = "readiness"
         readiness = self._configured_readiness(request)
         ready = all(item["state"] == "ready" for entry in readiness for item in entry["requirements"])
+        stage[0] = "report_readiness"
         if not ready:
             self.control.configured_plan_sync(binding["binding_id"], binding["binding_digest"], {
                 "plan_request_id": request["plan_request_id"],
@@ -1021,18 +1048,21 @@ class RunnerCoordinator:
             "plan_request_nonce": request["plan_request_nonce"],
             "instances": readiness,
         })
+        stage[0] = "compile"
         compiler = CanaryCompiler(
             store=self.store, identity=self.identity, signer=self.signer, now_ms=self._now_ms(),
         )
         queued = None
         if request["plan_kind"] == "configured_regression":
             instance = request["instances"][0]
+            stage[0] = "save_regression"
             regression, _created = self.store.add_saved_regression(
                 run_id=request["source_run_id"], test_instance_id=instance["test_instance_id"],
-                name=f"replay {instance['source']['source_scenario_id']} r{instance['source']['source_revision']}"[:64],
-                now_ms=self._now_ms(),
+                name=_configured_replay_name(instance), now_ms=self._now_ms(),
             )
+            stage[0] = "compile"
             result = compiler.compile_configured_replay(regression)
+            stage[0] = "queue_replay"
             queued, _replay = self.store.queue_regression_replay(
                 regression["regression_id"], result.projection["projection_id"],
                 binding_digest=binding["binding_digest"], now_ms=self._now_ms(),
@@ -1048,6 +1078,7 @@ class RunnerCoordinator:
                 "assertion": item["assertion"],
                 "local_inputs": {ref: ref for ref in item["local_input_refs"]},
             } for item in request["instances"]])
+        stage[0] = "submit"
         submitted = self.control.submit_configured_projection(
             binding["binding_id"], binding["binding_digest"], request["plan_request_id"],
             request["plan_request_nonce"], result.projection,
@@ -1055,6 +1086,7 @@ class RunnerCoordinator:
         if (submitted.get("approval_id") != result.projection["projection_id"]
                 or submitted.get("projection_digest") != result.projection["projection_digest"]):
             raise ValueError("configured submission answer does not match the compiled plan")
+        stage[0] = "settle"
         if queued is not None:
             self.store.settle_projection_submission(
                 queued, state="submitted", approval_id=submitted["approval_id"],

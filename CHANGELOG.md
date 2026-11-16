@@ -33,14 +33,54 @@ Final integration pass for the adapter-driven SaaS abuse rehearsal platform.
 - dashboard war room over the same MCP-first capability.
 - shadow-API/UI backing endpoint abuse detection for scripted lookup paths that bypass paid bulk API access.
 
-## [1.3.0rc6]: unpublished candidate
+## [1.3.0rc7]: unpublished candidate
 
-Runner preview candidate for browser-configured live read tests. It is not yet a GitHub release, it
-will not be on PyPI, and nothing in it is deployed. Customer install surfaces name the one
-hash-pinned 1.3.0rc6 install from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, whose
-wheel digest equals the bundled `/downloads/` wheel. That pin is provisional: the copy may be
-deployed only after the release owner's anonymous verify-public for v1.3.0rc6 has checked the exact
-published bytes. 1.3.0rc1 through 1.3.0rc5 stay published, unchanged, and are named only as history.
+Runner preview candidate after the 1.3.0rc6 public review, whose full acceptance failed. It is not
+published, not a stable release and not on PyPI; customer copy names the hash-pinned 1.3.0rc7
+install from <https://github.com/ancilis/heel/releases/tag/v1.3.0rc7> and may be deployed only after
+the release owner's anonymous verify-public for v1.3.0rc7 has checked the exact published bytes.
+1.3.0rc1 through 1.3.0rc6 stay published, unchanged, and are named only as history.
+
+- Version identity 1.3.0rc7 (npm 1.3.0-rc.7) across the package, release contract, review engine,
+  MCP server info, `server.json` and browser engine; 1.3.0rc6 stays an accepted saved-review and
+  findings-sync engine version. Wheel, source archive, manifest, browser wheel/manifest, browser
+  sample and review golden are regenerated with the unchanged builders. The published 1.3.0rc6
+  runner and staging-fixture bytes are kept byte for byte as the historical fixture
+  `tests/fixtures/runner_preview_rc6/`, and the Worker answers the two rc6 `/downloads/` names with a
+  permanent redirect to the immutable v1.3.0rc6 release assets.
+- Runner reliability (proven with local test fixtures and reproduced red witnesses only): after each
+  synchronous progress call `heel runner serve` takes one fresh authenticated heartbeat, so a slow
+  progress round trip no longer ages the unchanged 0.5 s freshness bound into an `incomplete` run
+  with `cloud_disconnected`; a configured test whose frozen replay source is not eligible is
+  reported as not ready instead of ending `serve`; and a cycle failure that ends `serve` records a
+  closed local diagnostic (operation, stage and HTTP status only). The cause of the public rc6
+  `response_rejected` exits remains unknown. Freshness, scopes, grants, targets and error-envelope
+  rules are unchanged.
+- The paired-runner install shown by the dashboard, `/guide`, `/runner`, `/agent` and the staging
+  fixture README is one guarded command: it picks an installed Python 3.11 or newer with venv and
+  ensurepip, or stops before creating anything, then runs the runbook's exact pinned install.
+  Activation copy states configured-test, incomplete-run and Python state honestly, and `/runner`
+  describes the browser-configured read tests instead of two fixed checks.
+- The standalone synthetic staging target is prepared for publication as the `heel-staging-fixture-*`
+  assets of this prerelease with its manifest; it is a test fixture, not inside the wheel or source
+  archive, and not product code. Its behaviour files are unchanged from 1.3.0rc6.
+- No public, hosted or customer run is recorded for 1.3.0rc7. This is not a launch or
+  complete-coverage claim.
+
+## [1.3.0rc6]: 2026-11-16
+
+Runner preview prerelease for browser-configured live read tests, published as a GitHub prerelease
+at <https://github.com/ancilis/heel/releases/tag/v1.3.0rc6> from source commit
+`50a60ea6db80d811630c8bfe9efe832cc1ba5899` after its anonymous public verification passed: the
+anonymously downloaded wheel is 3021024 bytes with SHA-256
+`40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0`, and a source-free install of it
+reported `heel 1.3.0rc6`. That verification proves packaging and the synthetic reference only. It is
+not a stable release and it is not published to PyPI. Every customer install surface uses the one
+hash-pinned 1.3.0rc6 install from that release, whose wheel digest equals the bundled `/downloads/`
+wheel; 1.3.0rc1 through 1.3.0rc5 stay published, unchanged, and are named only as history. The
+packaged `release/open-core/README.md` inside the source archive is its build-time snapshot and
+still describes 1.3.0rc6 as not yet published; this entry and the release page are the publication
+record.
 
 - Version identity 1.3.0rc6 (npm 1.3.0-rc.6) across the package, release contract, review engine,
   MCP server info, `server.json` and browser engine; 1.3.0rc5 stays an accepted saved-review and
@@ -60,13 +100,22 @@ published bytes. 1.3.0rc1 through 1.3.0rc5 stay published, unchanged, and are na
   have no recorded acceptance. There are no writes, multi-step workflows, trials or cumulative usage
   tests, and the scenario library is breadth, not executed coverage.
 - The standalone synthetic staging target (`tests/fixtures/customer_staging`: `README.md`,
-  `openapi.json`, `worker.mjs`, `wrangler.jsonc`) is prepared for separate distribution as the
-  `heel-staging-fixture-*` assets of the same prerelease, listed with sizes and SHA-256 digests in
-  `release/heel-staging-fixture-manifest.json`. It is a test fixture, not inside the wheel or source
-  archive, and not product code. The release notes state its `SOURCE_REVISION`.
+  `openapi.json`, `worker.mjs`, `wrangler.jsonc`) is published as the `heel-staging-fixture-*`
+  assets of the same prerelease, together with `heel-staging-fixture-manifest.json`, which lists their
+  sizes and SHA-256 digests (`release/heel-staging-fixture-manifest.json`). It is a test fixture, not
+  inside the wheel or source archive, and not product code. The release notes state its
+  `SOURCE_REVISION`.
 - Findings semantics of the existing `plan_entitlement_read` and `anonymous_authenticated_read`
-  checks are unchanged from 1.3.0rc5. These runner changes are proven with local test fixtures and
-  a local browser journey only; no deployed or customer run is recorded for 1.3.0rc6.
+  checks are unchanged from 1.3.0rc5. These runner changes were first proven with local test
+  fixtures and a local browser journey. On 2026-11-16 the release was deployed to the hosted preview,
+  and an independent fresh-customer review against its own deployment of the synthetic staging
+  target recorded a first real result: three browser-authored `GET` read tests using the `bearer`
+  profile were all observed with their controls established, and the signed redacted summary was
+  shared 12 minutes 50 seconds after the journey began. Full public acceptance failed. Two later
+  runs ended `incomplete` with `cloud_disconnected` (one after only 2 of 4 planned reads), and each
+  was followed by a `response_rejected` runner exit. The edited-condition and numeric-equality
+  outcomes, the frozen-revision regression replay after the target was corrected, error-envelope
+  mode, in-flight stop and recovery remain unproven. This is not a launch or complete-coverage claim.
 
 ## [1.3.0rc5]: 2026-11-13
 

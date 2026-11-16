@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: LicenseRef-Heel-Commercial
 
-import { RUNNER_RC6_CLI } from "./RunnerPairingCard";
+import { RUNNER_RC7_CLI } from "./RunnerPairingCard";
 
 /**
  * `unauthorized`: a runner is paired but holds no active authorization for this verified environment.
  * `authorized`: it does; its local credentials are not observable here, so this step is not complete until a plan.
+ * `ready`: a runner-signed plan (pending, or a run past approval) demonstrated the roles at submission time only.
  */
 export type CanaryAccessState = "locked" | "unauthorized" | "authorized" | "missing" | "partial" | "ready" | "error";
 
@@ -41,19 +42,19 @@ export function CanaryAccessStep({ state, roles = [], recovery }: CanaryAccessSt
           {state === "authorized" ? <div className="step-recovery">
             <p>The paired runner is authorized for this verified environment. Test credentials are added only on the runner machine; Heel Cloud never receives them and cannot confirm them here.</p>
             <ol>
-              <li>Keep <code>{`${RUNNER_RC6_CLI} runner serve`}</code> running so the runner claims this authorization.</li>
-              <li>Add one staging-only credential per plan: <code>{`${RUNNER_RC6_CLI} runner credential add --role lower_plan --plan-label free --profile bearer --label "free canary" --backend keychain`}</code>, then <code>{`${RUNNER_RC6_CLI} runner credential add --role higher_plan --plan-label pro --profile bearer --label "pro canary" --backend keychain`}</code> (on Linux, <code>--backend secret-service</code>).</li>
-              <li>Import your read routes: <code>{`${RUNNER_RC6_CLI} runner import-openapi ./openapi.json`}</code>.</li>
-              <li>Check <code>{`${RUNNER_RC6_CLI} runner status`}</code> on that machine; it reports <code>access.ready</code> when local access is complete.</li>
+              <li>Keep <code>{`${RUNNER_RC7_CLI} runner serve`}</code> running so the runner claims this authorization.</li>
+              <li>Add one staging-only credential for each role your selected tests compare. An anonymous vs signed-in read needs only the signed-in role: <code>{`${RUNNER_RC7_CLI} runner credential add --role authenticated --profile bearer --label "signed-in canary" --backend keychain`}</code>. A lower plan vs higher plan read needs one per plan: <code>{`${RUNNER_RC7_CLI} runner credential add --role lower_plan --plan-label free --profile bearer --label "free canary" --backend keychain`}</code>, then <code>{`${RUNNER_RC7_CLI} runner credential add --role higher_plan --plan-label pro --profile bearer --label "pro canary" --backend keychain`}</code> (on Linux, <code>--backend secret-service</code>). After you request a dry run under Configured live tests, the runner lists exactly what those tests still need.</li>
+              <li>Import your read routes: <code>{`${RUNNER_RC7_CLI} runner import-openapi ./openapi.json`}</code>.</li>
+              <li>Check <code>{`${RUNNER_RC7_CLI} runner status`}</code> on that machine; it reports <code>access.ready</code> when local access is complete.</li>
             </ol>
             <p>If the runner submits a valid signed plan, it appears here for review; nothing runs unless you approve it.</p>
           </div> : null}
-          {state === "missing" ? <p className="step-recovery">Add two staging-only identities on the runner machine with <code>{`${RUNNER_RC6_CLI} runner credential add`}</code>, one per plan role.</p> : null}
-          {state === "partial" ? <p className="step-recovery" role="alert">One required role is still missing. Add the second isolated identity with <code>{`${RUNNER_RC6_CLI} runner credential add`}</code> before preparing the plan.</p> : null}
+          {state === "missing" ? <p className="step-recovery">Add two staging-only identities on the runner machine with <code>{`${RUNNER_RC7_CLI} runner credential add`}</code>, one per plan role.</p> : null}
+          {state === "partial" ? <p className="step-recovery" role="alert">One required role is still missing. Add the second isolated identity with <code>{`${RUNNER_RC7_CLI} runner credential add`}</code> before preparing the plan.</p> : null}
           {state === "ready" ? <p className="step-success">{roles.length > 0
             ? `${roles.length} local roles are mapped and eligible for the selected scenarios.`
-            : "The signed runner plan confirms its required local role mappings."}</p> : null}
-          {state === "error" ? <p className="step-recovery" role="alert">{recovery ?? `Local access check failed. Run ${RUNNER_RC6_CLI} runner status on the runner machine and repair the named role.`}</p> : null}
+            : "A runner-signed plan for this environment confirmed the local roles its tests needed when it was submitted. Heel Cloud cannot see the credentials themselves."}</p> : null}
+          {state === "error" ? <p className="step-recovery" role="alert">{recovery ?? `Local access check failed. Run ${RUNNER_RC7_CLI} runner status on the runner machine and repair the named role.`}</p> : null}
         </div>
       </article>
     </li>

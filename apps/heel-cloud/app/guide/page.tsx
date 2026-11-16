@@ -2,12 +2,12 @@
 
 import type { Metadata } from "next";
 import Link from "next/link";
-import { RUNNER_RC6_CLI, RUNNER_RC6_INSTALL, RUNNER_RC6_RELEASE_URL } from "../../components/canary/RunnerPairingCard";
+import { RUNNER_RC7_CLI, RUNNER_RC7_INSTALL, RUNNER_RC7_RELEASE_URL } from "../../components/canary/RunnerPairingCard";
 
 /** The installed executable path; every runner command on this page starts with it, never a bare `heel`. */
-const CLI = RUNNER_RC6_CLI;
+const CLI = RUNNER_RC7_CLI;
 /** The release named next to the shared install constants above; it changes with them. */
-const RELEASE = "1.3.0rc6";
+const RELEASE = "1.3.0rc7";
 
 const LINUX_VAULT = `sudo apt-get install dbus gnome-keyring libsecret-tools    # Debian/Ubuntu package names
 dbus-run-session -- bash                                   # headless only: private session bus
@@ -145,17 +145,27 @@ export default function Guide() {
             <p className="step-number">03 · Install</p>
             <h2>Install the released runner</h2>
             <p>
-              You need Python 3.11 or newer as <code>python3</code> with its <code>venv</code> module, on
-              Apple silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview.
+              You need an installed Python 3.11 or newer with its <code>venv</code> module, on Apple
+              silicon macOS or Linux x86_64/aarch64. Intel macOS is unsupported by this preview.
               In an empty private directory, the command below installs the public{" "}
-              <a href={RUNNER_RC6_RELEASE_URL}>{RELEASE} release</a> wheel and prints its version. pip
+              <a href={RUNNER_RC7_RELEASE_URL}>{RELEASE} release</a> wheel and prints its version. pip
               refuses the wheel unless its SHA-256 matches. The pinned <code>cryptography</code>{" "}
               dependency comes from your package index and is not hash-pinned by this command. No source
               checkout is needed. Every command below starts with the installed path{" "}
               <code>{CLI}</code>, not a bare <code>heel</code>. Where the dashboard shows a command
               starting with <code>heel</code>, run it with that same path.
             </p>
-            <pre><code>{RUNNER_RC6_INSTALL}</code></pre>
+            <p>
+              On some Macs the default <code>python3</code> is 3.9, which is too old. The command
+              therefore first picks the first Python 3.11 or newer with <code>venv</code> and{" "}
+              <code>ensurepip</code> on your PATH, and prints which one it uses. To use one installed at
+              another absolute path, first run <code>HEEL_PYTHON=/path/to/python3</code> in the same
+              shell. If none is found, it says so and stops before creating anything; install Python 3.11
+              or newer (for example from python.org, Homebrew, or your Linux package manager) and run it
+              again. Heel never downloads Python for you. If an earlier attempt already created{" "}
+              <code>./heel-rc7</code> with an older Python, start again in a new empty private directory.
+            </p>
+            <pre><code>{RUNNER_RC7_INSTALL}</code></pre>
             <p>
               The runner keeps its signing key, credentials and expected values only in the operating
               system vault. On macOS that is the Keychain: use <code>--backend keychain</code>. On Linux
@@ -428,7 +438,7 @@ export default function Guide() {
             <p>
               The fixture is a small Cloudflare Worker, distributed separately from the runner package:
               its four files are the <code>heel-staging-fixture-</code> assets of the{" "}
-              <a href={RUNNER_RC6_RELEASE_URL}>{RELEASE} release</a>, with a manifest of their digests.
+              <a href={RUNNER_RC7_RELEASE_URL}>{RELEASE} release</a>, with a manifest of their digests.
               Its README explains how to download, check and deploy them with no repository checkout.
               Deploying and changing its mode needs your own authorized Cloudflare account; Heel does
               not provide one.

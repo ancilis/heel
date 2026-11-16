@@ -275,6 +275,14 @@ class RunnerService:
                 # same bounded controller synchronously so a last-action stop cannot wait for
                 # the independent heartbeat loop.
                 stop_controller.request(stop_reason)
+                return
+            # The progress call held this run's control guard for one full Cloud round trip, so
+            # no heartbeat could refresh the authenticated gate meanwhile; on a public link that
+            # alone can age it past the executor's unchanged freshness bound.  Take one fresh
+            # authenticated sample now, before the executor's next authority check, with the
+            # same fail-closed handling as the heartbeat loop (a failure cancels this run).
+            if not stop_controller.initiated.is_set() and not heartbeat_failure:
+                beat()
 
         def accept_projection(value: dict[str, Any]) -> None:
             with projection_lock:
@@ -296,54 +304,61 @@ class RunnerService:
             self._active_cancellation = cancellation
             self._active_stop_controller = stop_controller
 
+        def beat() -> bool:
+            """One authenticated heartbeat and its gate handling; False once it failed closed."""
+            cycle = self.monotonic()
+            try:
+                gate = self.coordinator.heartbeat(lease.run_id, snapshot())
+                if not isinstance(gate, ExecutionGate):
+                    raise ValueError("coordinator returned an invalid execution gate")
+                if (
+                    gate.stop_reason != "none"
+                    or not gate.active
+                    or gate.runner_state != "active"
+                    or gate.proof_state != "valid"
+                    or gate.proof_expires_at_ms <= gate.server_time_ms
+                ):
+                    actual_stop = (
+                        gate.stop_reason != "none"
+                        or gate.runner_state != "active"
+                        or gate.proof_state == "revoked"
+                        or not gate.active
+                    )
+                    if gate.stop_reason != "none":
+                        requested_stop_reason = gate.stop_reason
+                    elif gate.runner_state != "active":
+                        requested_stop_reason = "runner_revoked"
+                        cancellation.control_error = "runner_fault"
+                    elif gate.proof_state == "revoked":
+                        requested_stop_reason = "target_revoked"
+                        cancellation.control_error = "proof_expired"
+                    elif gate.proof_state != "valid" or gate.proof_expires_at_ms <= gate.server_time_ms:
+                        requested_stop_reason = "none"
+                        cancellation.control_error = "proof_expired"
+                    elif not gate.active:
+                        requested_stop_reason = "kill_switch"
+                    else:
+                        requested_stop_reason = "none"
+                    if actual_stop:
+                        stop_controller.request(
+                            requested_stop_reason, deadline=cycle + 5.0,
+                        )
+                    else:
+                        cancellation.cancel()
+            except BaseException as exc:
+                heartbeat_failure.append(exc)
+                cancellation.control_error = "cloud_disconnected"
+                cancellation.cancel()
+                return False
+            return True
+
         def heartbeats() -> None:
             # Once stop control owns the run, target cancellation and the bounded ack worker
             # are authoritative.  Continuing heartbeats can race the ack's timestamp re-signing
             # and replay a pre-ack digest at the same containment sequence.
             while not finished.is_set() and not stop_controller.initiated.is_set():
                 cycle = self.monotonic()
-                try:
-                    gate = self.coordinator.heartbeat(lease.run_id, snapshot())
-                    if not isinstance(gate, ExecutionGate):
-                        raise ValueError("coordinator returned an invalid execution gate")
-                    if (
-                        gate.stop_reason != "none"
-                        or not gate.active
-                        or gate.runner_state != "active"
-                        or gate.proof_state != "valid"
-                        or gate.proof_expires_at_ms <= gate.server_time_ms
-                    ):
-                        actual_stop = (
-                            gate.stop_reason != "none"
-                            or gate.runner_state != "active"
-                            or gate.proof_state == "revoked"
-                            or not gate.active
-                        )
-                        if gate.stop_reason != "none":
-                            requested_stop_reason = gate.stop_reason
-                        elif gate.runner_state != "active":
-                            requested_stop_reason = "runner_revoked"
-                            cancellation.control_error = "runner_fault"
-                        elif gate.proof_state == "revoked":
-                            requested_stop_reason = "target_revoked"
-                            cancellation.control_error = "proof_expired"
-                        elif gate.proof_state != "valid" or gate.proof_expires_at_ms <= gate.server_time_ms:
-                            requested_stop_reason = "none"
-                            cancellation.control_error = "proof_expired"
-                        elif not gate.active:
-                            requested_stop_reason = "kill_switch"
-                        else:
-                            requested_stop_reason = "none"
-                        if actual_stop:
-                            stop_controller.request(
-                                requested_stop_reason, deadline=cycle + 5.0,
-                            )
-                        else:
-                            cancellation.cancel()
-                except BaseException as exc:
-                    heartbeat_failure.append(exc)
-                    cancellation.control_error = "cloud_disconnected"
-                    cancellation.cancel()
+                if not beat():
                     return
                 remaining = self.heartbeat_interval - (self.monotonic() - cycle)
                 if remaining > 0:

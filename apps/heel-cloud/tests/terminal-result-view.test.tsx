@@ -218,6 +218,73 @@ describe("CUSTOMER-TERMINAL-RESULT-VIEW: an approved run is followed to its term
     expect(screen.queryByRole("button", { name: "Review exact plan" })).toBeNull();
   });
 
+  test("a terminal run the runner signed incomplete (cloud_disconnected) is never shown as complete", async () => {
+    const incomplete = dashboard("terminal", "incomplete", {
+      scenariosCompleted: 1, requestsStarted: 2, requestsCompleted: 2, remainingRequests: 18, remainingWallMs: 0, localResultReady: true,
+    });
+    runReads = [APPROVED, { ...incomplete, run: { ...incomplete.run, errorCategory: "cloud_disconnected" } }];
+    render(<Dashboard />);
+    await screen.findByText("Rehearsal incomplete", undefined, { timeout: 4_000 });
+    expect(screen.queryByText("Rehearsal complete")).toBeNull();
+    const progress = screen.getByRole("region", { name: "Rehearsal progress" });
+    expect(within(progress).getByRole("alert").textContent).toMatch(
+      /signed this rehearsal as incomplete \(cloud_disconnected: the runner could not keep confirming this run with Heel Cloud while it ran\)/);
+    expect(progress.textContent).toMatch(/do not rely on its test outcomes either way/);
+    expect(progress.textContent).toContain("./heel-rc7/bin/heel runner status");
+    // Completion stays distinct from any finding outcome: nothing here reads as a pass, a clean result or a finding.
+    expect(progress.textContent).not.toMatch(/\b(passed|clean|no findings|observed|blocked)\b/i);
+    // The run proves its signed plan (step 3) but not a completed rehearsal (step 4).
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    expect(screen.getByLabelText("3 of 4 setup steps complete")).toBeTruthy();
+    expect(within(activation).getByText("Needs attention")).toBeTruthy();
+    expect(within(activation).queryByText("Finish setup")).toBeNull();
+    expect(within(activation).getByRole("status").textContent).toMatch(/next action: check the paired runner, then request a fresh dry run/i);
+    expect(activation.textContent).not.toMatch(/finish local setup/i);
+    expect(activation.textContent).toMatch(/confirmed the local roles its tests needed when it was submitted/);
+    expect(activation.textContent).not.toMatch(/credentials (are )?ready/i);
+    expect(activation.textContent).toMatch(/cannot see whether it is running right now/);
+  });
+
+  test("a revoked authorization and runner outrank run history; the earlier shared result stays readable", async () => {
+    const revoked = {
+      bindingId: `rcb_${"1".repeat(32)}`, bindingDigest: "2".repeat(64), environmentId: ENV, origin: ORIGIN,
+      environmentClass: "staging", verificationRecordDigest: "f".repeat(64), runnerId: "runr_synthetic",
+      runnerKeyId: "k_synthetic", status: "revoked", issuedAtMs: 1, expiresAtMs: 4_000_000_000_000, firstClaimedAtMs: 2,
+    };
+    vi.spyOn(CanaryApi.prototype, "listRunnerContextBindings").mockResolvedValue({ runners: [], bindings: [revoked] } as never);
+    serverDisclosure = disclosureState("synchronized");
+    render(<Dashboard />);
+    // The completed run and its shared result are still shown as history.
+    await screen.findByText("Rehearsal complete", undefined, { timeout: 4_000 });
+    const card = await screen.findByRole("region", { name: "Rehearsal result" }, { timeout: 4_000 });
+    expect(within(card).getByRole("heading", { name: FINDING_TITLE })).toBeTruthy();
+    // But setup progress reflects the current revocation, not the earlier success.
+    const activation = screen.getByRole("region", { name: /launch activation/i });
+    expect(screen.getByLabelText("1 of 4 setup steps complete")).toBeTruthy();
+    expect(within(activation).getByRole("status").textContent).toMatch(/next action: pair runner/i);
+    expect(within(activation).queryByText("Complete")).toBeNull();
+    expect(within(activation).queryByText("Ready", { selector: ".step-state" })).not.toBeNull();  // step 1 only
+    expect(activation.textContent).not.toMatch(/runner-signed plan for this environment confirmed/);
+  }, 10_000);
+
+  test("an incomplete run never yields a history-derived next action for a revoked runner", async () => {
+    vi.spyOn(CanaryApi.prototype, "listRunnerContextBindings").mockResolvedValue({ runners: [], bindings: [{
+      bindingId: `rcb_${"1".repeat(32)}`, bindingDigest: "2".repeat(64), environmentId: ENV, origin: ORIGIN,
+      environmentClass: "staging", verificationRecordDigest: "f".repeat(64), runnerId: "runr_synthetic",
+      runnerKeyId: "k_synthetic", status: "revoked", issuedAtMs: 1, expiresAtMs: 4_000_000_000_000, firstClaimedAtMs: 2,
+    }] } as never);
+    const incomplete = dashboard("terminal", "incomplete", { scenariosCompleted: 1, requestsStarted: 2, remainingRequests: 18, localResultReady: true });
+    runReads = [APPROVED, { ...incomplete, run: { ...incomplete.run, errorCategory: "cloud_disconnected" } }];
+    render(<Dashboard />);
+    await screen.findByText("Rehearsal incomplete", undefined, { timeout: 4_000 });
+    const again = screen.getByRole("region", { name: /launch activation/i });
+    expect(screen.getByLabelText("1 of 4 setup steps complete")).toBeTruthy();
+    expect(within(again).queryByText("Needs attention")).toBeNull();
+    expect(within(again).getByRole("status").textContent).not.toMatch(/request a fresh dry run/);
+    // The run's own signed status is still shown honestly as history.
+    expect(screen.getByRole("region", { name: "Rehearsal progress" }).textContent).toMatch(/signed this rehearsal as incomplete/);
+  });
+
   test("no link is offered to a fixed loopback port the runner never binds", async () => {
     render(<Dashboard />);
     await screen.findByText("Rehearsal complete", undefined, { timeout: 4_000 });

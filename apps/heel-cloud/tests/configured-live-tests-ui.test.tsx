@@ -96,10 +96,10 @@ describe("guided private live test authoring", () => {
     expect((input.definition.containment_limits as Record<string, unknown>).no_live_targets).toBe(true);
     expect(input.liveTest.routeTemplate).toBe("/billing/features");
     expect(input.liveTest.assertion.condition).toEqual({ kind: "json_field_present", path: ["audit_log"] });
-    expect(await screen.findByText("./heel-rc6/bin/heel runner input add --name export_ok --type text --backend keychain")).toBeTruthy();
+    expect(await screen.findByText("./heel-rc7/bin/heel runner input add --name export_ok --type text --backend keychain")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Value type for export_ok"), { target: { value: "number" } });
     fireEvent.change(screen.getByLabelText("Runner machine secret store"), { target: { value: "secret-service" } });
-    expect(screen.getByText("./heel-rc6/bin/heel runner input add --name export_ok --type number --backend secret-service")).toBeTruthy();
+    expect(screen.getByText("./heel-rc7/bin/heel runner input add --name export_ok --type number --backend secret-service")).toBeTruthy();
     expect(screen.queryByLabelText(/expected value$/i)).toBeNull();
   });
 
@@ -110,6 +110,17 @@ describe("guided private live test authoring", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Edit sc\.internal\.export-hint/ }));
     expect(screen.getByText(/Saving creates revision 2; revision 1 and every run that used it stay unchanged/)).toBeTruthy();
     expect((screen.getByLabelText(/^Imported route/) as HTMLInputElement).value).toBe("/billing/features");
+  });
+
+  test("a configured custom revision names its live execution mode; static rows keep the static label", async () => {
+    const api: ScenarioLibraryApi = { listScenarioLibrary: vi.fn(async () => LIBRARY), createCustomScenario: vi.fn() };
+    render(<ScenarioLibraryCard api={api} canManage createAssessor={vi.fn()} workspaceRef={WS} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open scenario library" }));
+    const configured = await screen.findByTestId("scenario-row-sc.internal.export-hint");
+    expect(configured.textContent).toContain("ExecutionConfigured live test on your paired runner: Lower plan vs higher plan read");
+    expect(configured.textContent).not.toContain("Static analysis only");
+    expect(screen.getByTestId("scenario-row-sc.internal.static-only").textContent).toContain("ExecutionStatic analysis only");
+    expect(screen.getByTestId("scenario-row-sc.flag.tiergate").textContent).toContain("ExecutionStatic analysis only");
   });
 });
 
@@ -170,10 +181,10 @@ describe("configured tests panel", () => {
     render(<ConfiguredTestsPanel api={ready} bindingId={"rcb_" + "d".repeat(32)} canManage projectRef={PRJ} workspaceRef={WS} />);
     const list = await screen.findByRole("list", { name: /Runner readiness for sc\.internal\.export-hint/ });
     expect(within(list).getAllByRole("listitem")).toHaveLength(4);
-    expect(within(list).getByText("./heel-rc6/bin/heel runner input add --name secret_hint --type text --backend keychain")).toBeTruthy();
+    expect(within(list).getByText("./heel-rc7/bin/heel runner input add --name secret_hint --type text --backend keychain")).toBeTruthy();
     fireEvent.change(within(list).getByLabelText("Value type for secret_hint"), { target: { value: "boolean" } });
     fireEvent.change(screen.getByLabelText("Runner machine secret store"), { target: { value: "secret-service" } });
-    expect(within(list).getByText("./heel-rc6/bin/heel runner input add --name secret_hint --type boolean --backend secret-service")).toBeTruthy();
+    expect(within(list).getByText("./heel-rc7/bin/heel runner input add --name secret_hint --type boolean --backend secret-service")).toBeTruthy();
     expect(within(list).getByText(/equality is strict, so text "42" never equals the number 42/)).toBeTruthy();
     expect(within(list).queryByText(/--name export_ok/)).toBeNull();
   });
@@ -304,15 +315,15 @@ describe("setup and replay advice", () => {
       commands.push(credentialCommand("lower_plan", "Free tier", backend), credentialCommand("authenticated", null, backend));
     }
     for (const command of commands) {
-      expect(command.startsWith("./heel-rc6/bin/heel runner ")).toBe(true);
+      expect(command.startsWith("./heel-rc7/bin/heel runner ")).toBe(true);
       expect(command).not.toMatch(/[<>|]/);
       expect(spawnSync("bash", ["-n", "-c", command]).status).toBe(0);
     }
     expect(credentialCommand("lower_plan", "Free tier", "keychain")).toBe(
-      './heel-rc6/bin/heel runner credential add --role lower_plan --label "lower plan" --plan-label "Free tier" --profile bearer --backend keychain');
+      './heel-rc7/bin/heel runner credential add --role lower_plan --label "lower plan" --plan-label "Free tier" --profile bearer --backend keychain');
     const credential = readinessAdvice({ kind: "role_credential", subject: "higher_plan", state: "missing" }, "GET /x", "configured_live_read",
       { backend: "secret-service", typeFor: () => "text", planLabelFor: () => "Pro" });
-    expect(credential?.commands).toEqual(["./heel-rc6/bin/heel runner credential add --role higher_plan --label \"higher plan\" --plan-label Pro --profile bearer --backend secret-service"]);
+    expect(credential?.commands).toEqual(["./heel-rc7/bin/heel runner credential add --role higher_plan --label \"higher plan\" --plan-label Pro --profile bearer --backend secret-service"]);
     expect(() => inputCommand("bad name;rm", "text", "keychain")).toThrow();
   });
 
@@ -325,6 +336,18 @@ describe("setup and replay advice", () => {
     }
     const fresh = readinessAdvice({ kind: "local_input", subject: "secret_hint", state: "revoked" }, "GET /x", "configured_live_read");
     expect(fresh?.commands[0]).toContain("runner input add --name secret_hint");
+  });
+
+  test("an unavailable frozen run is described as not eligible, never as certainly absent", async () => {
+    const { readinessAdvice, requirementLabel } = await import("../lib/live-test-text");
+    const item = { kind: "frozen_run", subject: null, state: "missing" } as const;
+    const advice = readinessAdvice(item, "GET /x", "configured_regression");
+    expect(advice?.commands).toEqual([]);
+    expect(advice?.text).toMatch(/no eligible original run for this replay/);
+    expect(advice?.text).toMatch(/not stored on this runner, or its result for this test cannot be replayed/);
+    expect(advice?.text).toMatch(/request a new dry run of the test and approve that instead/);
+    expect(advice?.text).not.toMatch(/^The original run is not on this runner/);
+    expect(requirementLabel(item)).toBe("Eligible original run on this runner");
   });
 
   test("the replay panel shows the replay-specific advice for a revoked original value", async () => {

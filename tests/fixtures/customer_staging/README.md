@@ -4,7 +4,7 @@ A tiny standalone Cloudflare Worker that stands in for a customer's staging SaaS
 real customer-local Heel journey. It is a test fixture: not Heel product code and not Heel's
 control plane. It is not inside the Heel runner package: the wheel and source archive exclude
 `tests/` (`scripts/build_open_core_release.py`). Its four files are distributed separately, as
-the `heel-staging-fixture-*` assets of the Heel 1.3.0rc6 runner preview prerelease, next to a
+the `heel-staging-fixture-*` assets of the Heel 1.3.0rc7 runner preview prerelease, next to a
 manifest of their sizes and SHA-256 digests. It has no bindings, storage, outbound fetch,
 redirect, dependency or paid feature, and serves only static fake data.
 
@@ -30,7 +30,7 @@ extracted copy. `target.test.mjs` and the repository paths named below (`heel/ru
 ### Download without a checkout
 
 The files are published as assets of the GitHub prerelease
-<https://github.com/ancilis/heel/releases/tag/v1.3.0rc6>, each under the prefix
+<https://github.com/ancilis/heel/releases/tag/v1.3.0rc7>, each under the prefix
 `heel-staging-fixture-`, with `heel-staging-fixture-manifest.json` listing every file's asset name,
 original name, byte count and SHA-256. The release notes state `SOURCE_REVISION` and repeat the
 same table, including this README's digest. Download them anonymously into one new directory under
@@ -38,7 +38,7 @@ their original names:
 
 ```sh
 mkdir heel-staging-target && cd heel-staging-target
-B=https://github.com/ancilis/heel/releases/download/v1.3.0rc6
+B=https://github.com/ancilis/heel/releases/download/v1.3.0rc7
 for F in README.md openapi.json worker.mjs wrangler.jsonc; do
   curl -fsSL --proto '=https' --proto-redir '=https' -o "$F" "$B/heel-staging-fixture-$F"
 done
@@ -232,12 +232,13 @@ Expected outcome per mode, derived from the response tables above and the config
 | `patched` | `blocked` (empty `401`) | `blocked` (free `200` profile, leaf withheld) | `blocked` (empty `403`) |
 | `error_envelope` | `inconclusive` (JSON `401`) | `inconclusive` (JSON `403`) | `inconclusive` (JSON `403`) |
 
-Runner side, with the released runner's installed path `./heel-rc6/bin/heel`, which the
-guide's one hash-pinned install command creates in an empty private directory (Python 3.11 or
-newer; Apple silicon macOS or Linux x86_64/aarch64):
+Runner side, with the released runner's installed path `./heel-rc7/bin/heel`, which the
+guide's one guarded, hash-pinned install command creates in an empty private directory. It first
+picks an installed Python 3.11 or newer with venv and ensurepip (`HEEL_PYTHON`, then `PATH`) and
+stops before creating anything if there is none (Apple silicon macOS or Linux x86_64/aarch64):
 
 ```sh
-python3 -m venv heel-rc6 && ./heel-rc6/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc6/heel_sim-1.3.0rc6-py3-none-any.whl#sha256=40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0' && ./heel-rc6/bin/heel --version
+HEEL_PY=; for py in "${HEEL_PYTHON:-python3}" python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys, venv, ensurepip; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then HEEL_PY="$(command -v "$py")"; break; fi; done; if [ -z "$HEEL_PY" ]; then echo "Heel needs Python 3.11 or newer with venv and ensurepip; none was found on PATH or at HEEL_PYTHON. Nothing was installed. Install one, or set HEEL_PYTHON to its path, then run this again." >&2; false; else echo "Using $HEEL_PY: $("$HEEL_PY" --version 2>&1)" && "$HEEL_PY" -m venv heel-rc7 && ./heel-rc7/bin/python -m pip --isolated install 'heel-sim[runner] @ https://github.com/ancilis/heel/releases/download/v1.3.0rc7/heel_sim-1.3.0rc7-py3-none-any.whl#sha256=da4ac495e67e3b4a90801dd22901a513427f2b6d28afc97939effcbb9d9dcf21' && ./heel-rc7/bin/heel --version; fi
 ```
 
 Use `--backend secret-service` instead of `keychain` on Linux. Credentials come from the operator's Keychain items (step 1 below) over a
@@ -245,7 +246,7 @@ file descriptor, never argv; the value `acct_canary` is typed at the hidden prom
 `SVC` are set in [Operator setup](#operator-setup-after-independent-review-only):
 
 ```sh
-H=./heel-rc6/bin/heel                       # used as "$H" below; quoted, so zsh and bash agree
+H=./heel-rc7/bin/heel                       # used as "$H" below; quoted, so zsh and bash agree
 curl -sS -o openapi.json "https://HOST/openapi.json"     # or this directory's openapi.json
 "$H" runner import-openapi openapi.json
 "$H" runner credential add --role lower_plan  --profile bearer --label "staging free" --backend keychain --secret-fd 3 \
@@ -450,8 +451,9 @@ in step 2, and its runner credentials.
 ## Expected deployed acceptance (not yet run)
 
 From a clean machine with the released runner, ownership verifies over HTTPS and each runner
-request appears as one receipt. When these files were published, none of the following had been
-run against a deployment of them; a later run is evidence only where its own record says so.
+request appears as one receipt. When these files were first published, with 1.3.0rc6, none of the
+following had been run against a deployment of them; a later run is evidence only where its own
+record says so (the CHANGELOG records the first 1.3.0rc6 result and its failed full acceptance).
 
 - **Configured tests**, the three tests in
   [Configured tests on this fixture](#configured-tests-on-this-fixture): `observed` in

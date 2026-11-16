@@ -9,9 +9,12 @@ The rc6 tool is a copy of the reviewed, published rc5 tool (scripts/publish_runn
 that differs only in the enumerated hunks E1-E3, E5-E7 and F1-F6; E4 (the FINAL pin status and its
 refusal of every other status) is carried over byte for byte.  DiffBoundTests enforces that.  The F
 hunks add the standalone synthetic staging target (tests/fixtures/customer_staging) as five exactly
-named, pinned ``heel-staging-fixture-*`` assets of the same prerelease.  Its candidate is the 1.3.0rc6
-runner bytes and fixture files this checkout carries, bound below by git blob id, SHA-256 and size;
-this module fails at import on purpose if they differ.
+named, pinned ``heel-staging-fixture-*`` assets of the same prerelease.  Its candidate is the published
+1.3.0rc6 runner bytes and staging-fixture files, bound below by git blob id, SHA-256 and size.  The
+1.3.0rc7 candidate replaced the checkout's downloads, staging-fixture README and manifest, and version
+sources, so, as the rc1 to rc5 precedents did, those rc6 bytes now load from the historical fixture
+tests/fixtures/runner_preview_rc6/, exported from the pinned rc6 commit and verified offline; this
+module still fails at import on purpose if they differ.
 
 The pins below are the rc6 candidate built once at source 49e813ef and the tool's PIN_STATUS is FINAL.
 InterimPinTests keeps proving that any other status refuses every mode; FinalizationTests requires the
@@ -74,6 +77,7 @@ PINNED_BLOBS = {
     "release/open-core-v1.json": "e5a81c1149b9004955e89ccbf1f6b35f24bdea73",
     "heel/__init__.py": "e0c2a87faa6c37af134c6c84f524353aeb4cec60",
     "scripts/build_open_core_release.py": "f0ed8a9eead64aa29fb02277db61dccebd5fe387",
+    "tests/fixtures/customer_staging/target.test.mjs": "4911cbca3c62d04cc0454c76f05a33ade7d41939",
 }
 ACCEPTED_SHA256 = {
     "heel_sim-1.3.0rc6-py3-none-any.whl": "40b7cc7a4a1364cb412d820727c69b8474e17dc587d49c52fee9fcda137166b0",
@@ -201,40 +205,57 @@ SOURCE_PATH = {
     **{asset: f"{FIXTURE_DIR}/{name}" for asset, name in FIXTURE_FILES.items()},
     P.FIXTURE_MANIFEST: FIXTURE_MANIFEST_PATH,
 }
-REPOSITORY_ONLY_FIXTURE = {f"{FIXTURE_DIR}/target.test.mjs": (ROOT / FIXTURE_DIR / "target.test.mjs").read_bytes()}
+# The publisher names the public 1.3.0rc6 release, whatever candidate this checkout carries, so its
+# input is the historical rc6 bytes: exported from the pinned rc6 commit, committed here and bound by
+# git blob id, so a shallow or source-only checkout loads them without history or git.
+HISTORICAL_FIXTURE = ROOT / "tests/fixtures/runner_preview_rc6"
+REPOSITORY_ONLY_SOURCE = f"{FIXTURE_DIR}/target.test.mjs"
+FIXTURE_LAYOUT = {SOURCE_PATH[name]: f"artifacts/{name}" for name in P.ASSET_NAMES}
+FIXTURE_LAYOUT.update({source: f"version_sources/{Path(source).name}.txt" for source in P.VERSION_SOURCES})
+FIXTURE_LAYOUT[REPOSITORY_ONLY_SOURCE] = "repository_only/target.test.mjs"
 
 
-def load_pinned_rc6(directory: Path = ROOT) -> tuple[dict[str, bytes], dict[str, bytes]]:
-    """The pinned rc6 assets by asset name and version sources by path, each pinned by blob id.
+def load_pinned_rc6(directory: Path = HISTORICAL_FIXTURE) -> tuple[dict[str, bytes], dict[str, bytes], dict[str, bytes]]:
+    """The pinned rc6 assets by asset name, version sources by path and the repository-only fixture test.
 
-    A mismatch is a hard failure, never a skip: it means this checkout no longer carries the pinned
-    rc6 candidate (see the module docstring).
+    Each is pinned by blob id.  A mismatch is a hard failure, never a skip: it means the historical
+    fixture no longer holds the pinned rc6 bytes (see the module docstring).
     """
     try:
-        if sorted(os.listdir(directory / DOWNLOADS)) != sorted(P.RUNNER_ASSET_NAMES):
-            raise PinnedCandidateError("downloads are not exactly the pinned rc6 wheel, sdist and manifest")
-        if sorted(os.listdir(directory / FIXTURE_DIR)) != sorted([*FIXTURE_FILES.values(), "target.test.mjs"]):
-            raise PinnedCandidateError("staging fixture is not exactly its four files and repository test")
+        present = sorted(path.relative_to(directory).as_posix()
+                         for path in directory.rglob("*") if not path.is_dir())
+        if present != sorted([*FIXTURE_LAYOUT.values(), "provenance.json"]):
+            raise PinnedCandidateError("fixture is not exactly the rc6 assets, sources, repository test and provenance")
+        provenance = json.loads((directory / "provenance.json").read_text(encoding="utf-8"))
+        entries = [*provenance["artifacts"], *provenance["version_sources"], *provenance["repository_only"]]
+        if (provenance["source_commit"] != PINNED_COMMIT or provenance["version"] != P.VERSION
+                or [entry["source_path"] for entry in entries] != list(FIXTURE_LAYOUT)
+                or [entry["name"] for entry in provenance["artifacts"]] != list(P.ASSET_NAMES)):
+            raise PinnedCandidateError("provenance does not name the rc6 commit, version and layout")
         loaded = {}
-        for source in [SOURCE_PATH[name] for name in P.ASSET_NAMES] + list(P.VERSION_SOURCES):
-            path = directory / source
+        for entry in entries:
+            source = entry["source_path"]
+            path = directory / FIXTURE_LAYOUT[source]
             if path.is_symlink() or not path.is_file():
-                raise PinnedCandidateError(f"{source} is not a regular file")
+                raise PinnedCandidateError(f"{FIXTURE_LAYOUT[source]} is not a regular file")
             payload = path.read_bytes()
-            if _git_blob_id(payload) != PINNED_BLOBS[source]:
-                raise PinnedCandidateError(f"{source} is not the pinned rc6 blob")
+            if not (_git_blob_id(payload) == entry["git_blob"] == PINNED_BLOBS[source]
+                    and len(payload) == entry["size"]
+                    and hashlib.sha256(payload).hexdigest() == entry["sha256"]):
+                raise PinnedCandidateError(f"{FIXTURE_LAYOUT[source]} is not the pinned rc6 blob")
             loaded[source] = payload
         for name in P.ASSET_NAMES:
             payload = loaded[SOURCE_PATH[name]]
             if (hashlib.sha256(payload).hexdigest(), len(payload)) != (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]):
                 raise PinnedCandidateError(f"{name} digest or size is not the pinned rc6 value")
-    except (OSError, KeyError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         raise PinnedCandidateError(f"pinned rc6 candidate unreadable ({type(error).__name__})") from None
     artifacts = {name: loaded[SOURCE_PATH[name]] for name in P.ASSET_NAMES}
-    return artifacts, {source: loaded[source] for source in P.VERSION_SOURCES}
+    return (artifacts, {source: loaded[source] for source in P.VERSION_SOURCES},
+            {REPOSITORY_ONLY_SOURCE: loaded[REPOSITORY_ONLY_SOURCE]})
 
 
-CANDIDATE, CANDIDATE_SOURCES = load_pinned_rc6()
+CANDIDATE, CANDIDATE_SOURCES, REPOSITORY_ONLY_FIXTURE = load_pinned_rc6()
 MANIFEST_SHA = hashlib.sha256(CANDIDATE[P.MANIFEST]).hexdigest()
 
 
@@ -620,7 +641,7 @@ class FixtureCheckout:
 
 
 class PinnedLoaderTests(unittest.TestCase):
-    """The candidate is the pinned rc6 bytes this checkout carries, loaded offline."""
+    """The candidate is the historical pinned rc6 fixture, loaded offline."""
 
     def setUp(self):
         self.temporary = Path(tempfile.mkdtemp(prefix="heel-publisher-rc6-pinned-")).resolve()
@@ -628,11 +649,7 @@ class PinnedLoaderTests(unittest.TestCase):
 
     def copy(self, name="pinned") -> Path:
         target = self.temporary / name
-        for relative, payload in {**{SOURCE_PATH[n]: p for n, p in CANDIDATE.items()},
-                                  **REPOSITORY_ONLY_FIXTURE, **CANDIDATE_SOURCES}.items():
-            path = target / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(payload)
+        shutil.copytree(HISTORICAL_FIXTURE, target)
         return target
 
     def test_candidate_is_the_pinned_rc6_identity_the_publisher_names(self):
@@ -654,19 +671,23 @@ class PinnedLoaderTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", refused), \
                 mock.patch.object(subprocess, "Popen", refused), \
                 mock.patch.object(socket, "socket", refused):
-            self.assertEqual(load_pinned_rc6(copied), (CANDIDATE, CANDIDATE_SOURCES))
+            self.assertEqual(load_pinned_rc6(copied), (CANDIDATE, CANDIDATE_SOURCES, REPOSITORY_ONLY_FIXTURE))
 
     def test_loader_rejects_missing_altered_relabelled_or_extra_bytes(self):
-        downloads = Path(DOWNLOADS)
+        def provenance(directory, change):
+            path = directory / "provenance.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            change(document)
+            path.write_text(json.dumps(document), encoding="utf-8")
 
         def flip_sdist_byte(directory):
-            path = directory / downloads / P.SDIST
+            path = directory / "artifacts" / P.SDIST
             payload = bytearray(path.read_bytes())
             payload[100] ^= 1
             path.write_bytes(bytes(payload))
 
         def symlink_manifest(directory):
-            path = directory / downloads / P.MANIFEST
+            path = directory / "artifacts" / P.MANIFEST
             outside = self.temporary / "outside.json"
             outside.write_bytes(path.read_bytes())
             path.unlink()
@@ -674,21 +695,41 @@ class PinnedLoaderTests(unittest.TestCase):
 
         def canonical_but_wrong(directory):
             for name, payload in canonical_but_unaccepted().items():
-                (directory / downloads / name).write_bytes(payload)
+                (directory / "artifacts" / name).write_bytes(payload)
 
         def relabel_pyproject(directory):
-            path = directory / "pyproject.toml"
-            path.write_bytes(path.read_bytes().replace(b'version = "1.3.0rc6"', b'version = "1.3.0rc7"', 1))
+            # New bytes with a self-consistent provenance entry still differ from the pinned blob.
+            path = directory / "version_sources/pyproject.toml.txt"
+            payload = path.read_bytes().replace(b'version = "1.3.0rc6"', b'version = "1.3.0rc7"', 1)
+            path.write_bytes(payload)
+
+            def change(document):
+                entry = document["version_sources"][0]
+                entry.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                             git_blob=_git_blob_id(payload))
+            provenance(directory, change)
+
+        def edit_staging_readme(directory):
+            path = directory / "artifacts/heel-staging-fixture-README.md"
+            path.write_bytes(path.read_bytes().replace(b"1.3.0rc6", b"1.3.0rc7"))
 
         mutations = {
-            "missing wheel": lambda d: (d / downloads / P.WHEEL).unlink(),
+            "missing wheel": lambda d: (d / "artifacts" / P.WHEEL).unlink(),
             "altered sdist": flip_sdist_byte,
-            "extra download": lambda d: (d / downloads / "notes.txt").write_bytes(b"x"),
+            "extra file": lambda d: (d / "artifacts/notes.txt").write_bytes(b"x"),
             "symlinked manifest": symlink_manifest,
             "canonical but unpinned bytes": canonical_but_wrong,
-            "truncated version source": lambda d: (d / "heel/__init__.py").write_bytes(b""),
+            "edited staging README": edit_staging_readme,
+            "missing repository test": lambda d: (d / "repository_only/target.test.mjs").unlink(),
+            "truncated version source": lambda d: (d / "version_sources/__init__.py.txt").write_bytes(b""),
             "relabelled version source": relabel_pyproject,
-            "missing version source": lambda d: (d / "release/open-core-v1.json").unlink(),
+            "missing version source": lambda d: (d / "version_sources/open-core-v1.json.txt").unlink(),
+            "movable reference": lambda d: provenance(d, lambda doc: doc.update(source_commit="main")),
+            "other version": lambda d: provenance(d, lambda doc: doc.update(version="1.3.0rc7")),
+            "reordered sources": lambda d: provenance(d, lambda doc: doc["version_sources"].reverse()),
+            "reordered assets": lambda d: provenance(d, lambda doc: doc["artifacts"].reverse()),
+            "malformed provenance": lambda d: (d / "provenance.json").write_bytes(b"{not json"),
+            "missing provenance field": lambda d: provenance(d, lambda doc: doc.pop("repository_only")),
         }
         for index, (label, mutate) in enumerate(mutations.items()):
             with self.subTest(label):
@@ -912,7 +953,7 @@ class ImportAndCommandLineTests(unittest.TestCase):
         self.assertNotIn("http", notes.replace("HTTPS target traffic", "").replace(install, ""))
         self.assertNotIn(TOKEN, notes)
         # The manifest is the artifact; rendering external metadata leaves its bytes unchanged.
-        self.assertEqual((ROOT / DOWNLOADS / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
+        self.assertEqual((HISTORICAL_FIXTURE / "artifacts" / P.MANIFEST).read_bytes(), CANDIDATE[P.MANIFEST])
 
     def test_default_credential_source_is_gh_without_token_in_argv(self):
         completed = subprocess.CompletedProcess([], 0, stdout=TOKEN + "\n", stderr="")
@@ -2094,14 +2135,18 @@ class DiffBoundTests(unittest.TestCase):
 
 
 class PinnedCandidateTests(unittest.TestCase):
-    def test_checkout_artifacts_and_version_sources_are_the_pinned_rc6_blobs(self):
-        self.assertEqual(sorted(os.listdir(ROOT / DOWNLOADS)), sorted(P.RUNNER_ASSET_NAMES))
+    def test_fixture_artifacts_and_version_sources_are_the_pinned_rc6_blobs(self):
+        self.assertEqual(sorted(os.listdir(HISTORICAL_FIXTURE / "artifacts")), sorted(P.ASSET_NAMES))
         self.assertEqual(sorted(ACCEPTED_SHA256), sorted(P.ASSET_NAMES))
         for relative, blob in PINNED_BLOBS.items():
             with self.subTest(relative):
-                path = ROOT / relative
+                path = HISTORICAL_FIXTURE / FIXTURE_LAYOUT[relative]
                 self.assertFalse(path.is_symlink())
                 self.assertEqual(_git_blob_id(path.read_bytes()), blob)
+        for name in ACCEPTED_SHA256:
+            payload = (HISTORICAL_FIXTURE / "artifacts" / name).read_bytes()
+            self.assertEqual((hashlib.sha256(payload).hexdigest(), len(payload)),
+                             (ACCEPTED_SHA256[name], ACCEPTED_SIZES[name]))
         sources = {source: payload.decode("utf-8") for source, payload in CANDIDATE_SOURCES.items()}
         self.assertIn('version = "1.3.0rc6"', sources["pyproject.toml"])
         self.assertIn('requires-python = ">=3.11"', sources["pyproject.toml"])
@@ -2290,7 +2335,7 @@ class StagingFixtureAssetTests(unittest.TestCase):
                          ["README.md", "openapi.json", "worker.mjs", "wrangler.jsonc"])
         self.assertEqual(json.loads(CANDIDATE[P.FIXTURE_MANIFEST]), expected)
         for asset, name in FIXTURE_FILES.items():
-            self.assertEqual(CANDIDATE[asset], (ROOT / FIXTURE_DIR / name).read_bytes())
+            self.assertEqual(CANDIDATE[asset], (HISTORICAL_FIXTURE / "artifacts" / asset).read_bytes())
         # The README's own table names the same three behaviour files' sizes and digests.
         readme = CANDIDATE["heel-staging-fixture-README.md"].decode("utf-8")
         for asset, name in FIXTURE_FILES.items():

@@ -25,6 +25,7 @@ network collaborators through the constructor; the CLI never passes any of them.
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import os
 import re
@@ -42,7 +43,7 @@ from . import identity as _identity
 from .catalog import CATALOG
 from .control_client import (
     RunnerAuthenticationRejected, RunnerChainRecoveryDeferred, RunnerChainRecoveryRequired,
-    RunnerControlClient,
+    RunnerContextAnswerRejected, RunnerControlClient,
 )
 from .control_transport import (
     CONTROL_TIMEOUT_SECONDS, BoundedControlResponse, ControlTransportError, HTTPSControlTransport,
@@ -116,6 +117,20 @@ _SERVE_STATE_FIELDS = frozenset({
     "schema_version", "state", "runner_id", "since_ms", "updated_at_ms", "last_error_code",
     "binding_id", "access", "pid",
 })
+# Optional closed diagnostic of the cycle failure that ended serve (``failure``): which local
+# coordinator operation raised it, the configured-plan stage when that step failed, and the HTTP
+# status of a refused context-chain answer. Never exception text, answer bodies or codes, headers,
+# paths, identifiers or values. Older state files simply have no ``failure`` field.
+_SERVE_FAILURE_OPERATIONS = frozenset({
+    "ensure_runner_context", "submit_pending_projection", "process_configured_plan", "claim",
+    "advance_disclosures", "maintenance_once", "heartbeat", "progress", "result", "stop_ack",
+})
+_SERVE_FAILURE_STAGES = frozenset({
+    "sync", "readiness", "report_readiness", "save_regression", "compile", "queue_replay",
+    "submit", "settle",
+})
+_SERVE_FAILURE_FIELDS = frozenset({"operation", "stage", "http_status"})
+_MAX_RECORDED_FAILURES = 8
 # Answers of a live edge whose upstream control plane is unreachable (the Worker's 502/503).
 _UPSTREAM_UNAVAILABLE = frozenset({502, 503, 504})
 SERVE_IDLE_POLL_SECONDS = 2.0
@@ -244,6 +259,31 @@ def _serve_failure(error: BaseException) -> tuple[str, str]:
     if isinstance(error, (ValueError, TypeError, KeyError)):
         return "failed", "response_rejected"
     return "failed", "local_state_invalid"
+
+
+def _valid_serve_failure(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != _SERVE_FAILURE_FIELDS:
+        return False
+    operation, stage, status = value["operation"], value["stage"], value["http_status"]
+    return (
+        type(operation) is str and operation in _SERVE_FAILURE_OPERATIONS
+        and (stage is None or (type(stage) is str and stage in _SERVE_FAILURE_STAGES))
+        and (status is None or (type(status) is int and 100 <= status <= 599))
+    )
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """``error`` and its explicit ``__cause__`` chain, bounded; for attribution only.
+
+    As in ``_serve_failure``, an implicit ``__context__`` is never followed: it is whatever an
+    unrelated handler happened to be processing.
+    """
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < 32 and not any(current is seen for seen in chain):
+        chain.append(current)
+        current = current.__cause__
+    return chain
 
 
 def _recovery_delay_seconds(error: BaseException) -> float:
@@ -497,6 +537,11 @@ class _ServeCoordinator:
         self._calls = threading.Condition()
         self._in_flight = 0
         self._closed = False
+        # (exception, operation) for the last few coordinator calls that raised; diagnostic only.
+        self._raised: collections.deque[tuple[BaseException, str]] = collections.deque(
+            maxlen=_MAX_RECORDED_FAILURES,
+        )
+        self._raised_lock = threading.Lock()
 
     def _enter(self) -> None:
         with self._calls:
@@ -516,39 +561,60 @@ class _ServeCoordinator:
             while self._in_flight:
                 self._calls.wait()
 
-    def ensure_runner_context(self) -> bool:
+    def _call(self, operation: str, function: Callable[[], Any]) -> Any:
         self._enter()
         try:
+            return function()
+        except BaseException as error:
+            with self._raised_lock:
+                self._raised.append((error, operation))
+            raise
+        finally:
+            self._leave()
+
+    def diagnose(self, error: BaseException) -> dict[str, Any] | None:
+        """The closed local diagnostic for a cycle failure, or ``None`` when it cannot be attributed
+        to one coordinator call (exact exception identity, never message text)."""
+        chain = _exception_chain(error)
+        with self._raised_lock:
+            raised = list(self._raised)
+        for item in chain:
+            match = next(((exc, op) for exc, op in reversed(raised) if exc is item), None)
+            if match is not None:
+                break
+        else:
+            return None
+        failed, operation = match
+        stage = None
+        configured = getattr(self._coordinator, "configured_failure", None)
+        if operation == "process_configured_plan" and configured is not None and configured[0] is failed:
+            stage = configured[1]
+        refusal = next((item for item in _exception_chain(failed)
+                        if isinstance(item, RunnerContextAnswerRejected)), None)
+        failure = {
+            "operation": operation, "stage": stage,
+            "http_status": None if refusal is None else refusal.status,
+        }
+        return failure if _valid_serve_failure(failure) else None
+
+    def ensure_runner_context(self) -> bool:
+        def call() -> bool:
             bound = self._coordinator.ensure_runner_context()
             self._on_contact()
             return bound
-        finally:
-            self._leave()
+        return self._call("ensure_runner_context", call)
 
     def submit_pending_projection(self):
-        self._enter()
-        try:
-            return self._coordinator.submit_pending_projection()
-        finally:
-            self._leave()
+        return self._call("submit_pending_projection", self._coordinator.submit_pending_projection)
 
     def process_configured_plan(self):
-        self._enter()
-        try:
-            return self._coordinator.process_configured_plan()
-        finally:
-            self._leave()
+        return self._call("process_configured_plan", self._coordinator.process_configured_plan)
 
     def advance_disclosures(self):
-        self._enter()
-        try:
-            return self._coordinator.advance_disclosures()
-        finally:
-            self._leave()
+        return self._call("advance_disclosures", self._coordinator.advance_disclosures)
 
     def claim(self):
-        self._enter()
-        try:
+        def call():
             runtime = self._coordinator.control.runtime
             before = {item.run_id for item in runtime.load_active_run_controls(limit=64)}
             try:
@@ -561,43 +627,25 @@ class _ServeCoordinator:
                 raise
             self._on_contact()
             return lease
-        finally:
-            self._leave()
+        return self._call("claim", call)
 
     def maintenance_once(self, *, limit: int):
-        self._enter()
-        try:
-            return self._coordinator.maintenance_once(limit=limit)
-        finally:
-            self._leave()
+        return self._call("maintenance_once", lambda: self._coordinator.maintenance_once(limit=limit))
 
     def heartbeat(self, run_id, operational_projection):
-        self._enter()
-        try:
-            return self._coordinator.heartbeat(run_id, operational_projection)
-        finally:
-            self._leave()
+        return self._call("heartbeat", lambda: self._coordinator.heartbeat(run_id, operational_projection))
 
     def progress(self, run_id, operational_projection):
-        self._enter()
-        try:
-            return self._coordinator.progress(run_id, operational_projection)
-        finally:
-            self._leave()
+        return self._call("progress", lambda: self._coordinator.progress(run_id, operational_projection))
 
     def result(self, run_id, operational_projection):
-        self._enter()
-        try:
-            return self._coordinator.result(run_id, operational_projection)
-        finally:
-            self._leave()
+        return self._call("result", lambda: self._coordinator.result(run_id, operational_projection))
 
     def stop_ack(self, run_id, operational_projection, *, deadline):
-        self._enter()
-        try:
-            return self._coordinator.stop_ack(run_id, operational_projection, deadline=deadline)
-        finally:
-            self._leave()
+        return self._call(
+            "stop_ack",
+            lambda: self._coordinator.stop_ack(run_id, operational_projection, deadline=deadline),
+        )
 
 
 class RunnerDaemon:
@@ -840,9 +888,11 @@ class RunnerDaemon:
         except (RunnerStoreError, OSError):
             return None
         if (
-            not isinstance(value, Mapping) or set(value) != _SERVE_STATE_FIELDS
+            not isinstance(value, Mapping)
+            or set(value) not in (_SERVE_STATE_FIELDS, _SERVE_STATE_FIELDS | {"failure"})
             or value["schema_version"] != _SERVE_STATE_SCHEMA or value["state"] not in _SERVE_STATES
             or value["runner_id"] != runner_id
+            or ("failure" in value and not _valid_serve_failure(value["failure"]))
         ):
             return None
         return dict(value)
@@ -855,6 +905,8 @@ class RunnerDaemon:
             if state is not None:
                 view.update(last_state=state["state"], last_error_code=state["last_error_code"],
                             updated_at_ms=state["updated_at_ms"])
+                if "failure" in state:
+                    view["last_failure"] = dict(state["failure"])
             return view
         if state is None:
             return {"state": "starting"}
@@ -915,7 +967,7 @@ class RunnerDaemon:
                     if turnstile is None:
                         turnstile = self._acquire_turnstile(directory, poll=_TURNSTILE_POLL_OWNER)
                     state, code = session.final
-                    session._publish(state, error_code=code, force=True)
+                    session._publish(state, error_code=code, force=True, failure=session.failure)
             finally:
                 if lock is not None:
                     _release_serve_lock(lock)
@@ -1423,22 +1475,34 @@ class _ServeSession:
         # The final (state, code), published by ``RunnerDaemon.serve`` under the turnstile together
         # with the instance-lock release.
         self.final: tuple[str, str | None] | None = None
+        # Closed diagnostic of the cycle failure that ended this serve, if attributable.
+        self.failure: dict[str, Any] | None = None
+        self._owner: _ServeCoordinator | None = None
 
-    def _publish(self, state: str, *, error_code: str | None = None, force: bool = False) -> None:
+    def _publish(
+        self, state: str, *, error_code: str | None = None, force: bool = False,
+        failure: Mapping[str, Any] | None = None,
+    ) -> None:
         now = self.daemon._clock_ms()
         if state != self.state:
             self.since_ms = now
-        key = (state, error_code, self.binding_id, self.access)
+        failure = dict(failure) if failure is not None and _valid_serve_failure(failure) else None
+        key = (state, error_code, self.binding_id, self.access,
+               None if failure is None else tuple(sorted(failure.items())))
         if not force and key == self._last_key and time.monotonic() - self._last_write < _SERVE_STATE_REFRESH_SECONDS:
             return
-        _write_json(self.directory, _SERVE_STATE, {
+        record = {
             "schema_version": _SERVE_STATE_SCHEMA, "state": state, "runner_id": self.record["runner_id"],
             "since_ms": self.since_ms, "updated_at_ms": now, "last_error_code": error_code,
             "binding_id": self.binding_id, "access": self.access, "pid": os.getpid(),
-        })
+        }
+        event = {"event": "serve_state", "state": state, "last_error_code": error_code,
+                 "binding_id": self.binding_id, "access": self.access}
+        if failure is not None:
+            record["failure"] = event["failure"] = failure
+        _write_json(self.directory, _SERVE_STATE, record)
         if key != self._last_key:
-            self.emit({"event": "serve_state", "state": state, "last_error_code": error_code,
-                       "binding_id": self.binding_id, "access": self.access})
+            self.emit(event)
         self.state, self._last_key, self._last_write = state, key, time.monotonic()
 
     def _end(self, state: str, code: str) -> RunnerServeError:
@@ -1500,6 +1564,8 @@ class _ServeSession:
                     if daemon._shutdown.wait(max(self._backoff(), _recovery_delay_seconds(error))):
                         return self._stopped()
                     continue
+                owner = self._owner
+                self.failure = None if owner is None else owner.diagnose(error)
                 raise self._end(state, code) from None
             if self.once or daemon._shutdown.is_set():
                 return self._stopped()
@@ -1511,6 +1577,7 @@ class _ServeSession:
             raise RunnerServeError("local_state_invalid")
         runtime = RunnerRuntimeState(daemon.runtime_path, self.identity, self.signer)
         owner: _ServeCoordinator | None = None
+        self._owner = None
         try:
             control = RunnerControlClient(
                 origin=origin, workspace_id=self.identity.workspace_id,
@@ -1524,6 +1591,7 @@ class _ServeSession:
                 trusted_grant_keys=self.trusted, clock_ms=daemon._clock_ms,
             )
             owner = _ServeCoordinator(coordinator, lambda: self._contact(coordinator))
+            self._owner = owner
             service = RunnerService(
                 coordinator=owner,
                 executor=_ServeExecution(

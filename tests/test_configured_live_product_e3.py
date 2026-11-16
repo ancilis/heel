@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 
 import pytest
 
@@ -491,3 +492,249 @@ def test_a_runner_signed_condition_that_differs_from_the_frozen_request_is_refus
     assert view["status"] == "open" and view["run_id"] is None
     assert c.browser("GET", f"{c.base}/canary-approval-requests")[1]["requests"] == []
     assert c.target.requests == []
+
+
+def _readiness(view):
+    readiness = view.get("readiness")
+    if readiness is None:
+        return None
+    return {(item["kind"], item["subject"], item["state"]) for entry in readiness["instances"]
+            for item in entry["requirements"]}
+
+
+def test_an_ineligible_replay_source_is_reported_unavailable_and_one_serve_keeps_running(customer):
+    """A replay of a terminal instance that was NOT observed (here: blocked) cannot be saved as a
+    regression. The runner reports its frozen run as not ready for that request (no compile, no
+    submission, no target request) and the same long-lived serve stays online; an eligible
+    frozen replay requested next in that process still runs under a fresh approval."""
+    from tests.test_runner_daemon import _daemon, _serve_in_thread, _serve_state, _wait_serve_state
+
+    c = customer
+    assert c.save_test("export-hint", HINT_EQUALS)[0] == 201
+    assert c.save_test("export-plan", PLAN_EQUALS)[0] == 201
+    c.setup_runner()
+    for name, value in (("export_ok", "ok"), ("secret_hint", SECRET_HINT), ("pro_plan", "pro")):
+        c.add_input(name, value)
+    labels = [{"role": "higher_plan", "plan_label": "Pro"}, {"role": "lower_plan", "plan_label": "Free"}]
+    status, _created = c.request_plan({
+        "schema_version": "heel.configured-plan-request.v1", "plan_kind": "configured_live_read",
+        "tests": [{"source_scenario_id": "sc.internal.export-hint", "source_revision": 1},
+                  {"source_scenario_id": "sc.internal.export-plan", "source_revision": 1}],
+        "plan_labels": labels})
+    assert status == 201
+    assert not isinstance(c.serve(), BaseException)
+    request = c.approval_request()
+    assert c.approve_configured(request)[0] == 201
+    assert not isinstance(c.serve(), BaseException)
+    run_id = request["run_id"]
+    local = c.store.load_final_projections(run_id)["local_view"]["findings_projection"]
+    outcomes = {item["source"]["source_scenario_id"]: item for item in local["test_results"]}
+    assert outcomes["sc.internal.export-hint"]["assessment_outcome"] == "observed"
+    assert outcomes["sc.internal.export-plan"]["assessment_outcome"] == "blocked"
+    blocked = outcomes["sc.internal.export-plan"]["test_instance_id"]
+    observed = outcomes["sc.internal.export-hint"]["test_instance_id"]
+    assert len(c.target.requests) == 4
+
+    daemon = _daemon(c.home, c.harness, c.backend, vault_factory=lambda backend: c.vault,
+                     target_network=c.target.network())
+    thread, events, outcome = _serve_in_thread(daemon)
+    try:
+        _wait_serve_state(c.home, lambda state: state["state"] == "online")
+        c.target.mode = "patched"
+        status, ineligible = c.request_plan({"schema_version": "heel.configured-plan-request.v1",
+                                             "plan_kind": "configured_regression", "source_run_id": run_id,
+                                             "test_instance_id": blocked})
+        assert status == 201, ineligible
+        deadline = time.monotonic() + 30
+        view = c.plan_view(ineligible["plan_request_id"])
+        while _readiness(view) is None and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
+            view = c.plan_view(ineligible["plan_request_id"])
+        assert thread.is_alive(), outcome
+        # The run is present but not an eligible source: frozen_run is not ready, nothing else is
+        # claimed about the run, nothing is compiled, submitted or sent to the target.
+        assert _readiness(view) == {("route", None, "ready"), ("role_credential", "lower_plan", "ready"),
+                                    ("role_credential", "higher_plan", "ready"),
+                                    ("frozen_run", None, "missing")}, view
+        assert view["status"] == "open" and view["run_id"] is None, view
+        time.sleep(2.5)  # one more idle cycle of the same process sees the same open request
+        assert thread.is_alive(), outcome
+        assert _serve_state(c.home)["state"] == "online"
+        assert c.browser("GET", f"{c.base}/canary-approval-requests")[1]["requests"] == []
+        assert len(c.target.requests) == 4
+        status, cancelled = c.browser(
+            "POST", f"{c.base}/configured-plan-requests/{ineligible['plan_request_id']}/cancel",
+            {"schema_version": "heel.configured-plan-request-cancel.v1"})
+        assert status == 200 and cancelled["status"] == "cancelled", cancelled
+
+        # The ordinary eligible frozen replay, requested next in the SAME serve, still runs.
+        status, eligible = c.request_plan({"schema_version": "heel.configured-plan-request.v1",
+                                           "plan_kind": "configured_regression", "source_run_id": run_id,
+                                           "test_instance_id": observed})
+        assert status == 201, eligible
+        deadline = time.monotonic() + 30
+        listed: list = []
+        while not listed and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.1)
+            listed = c.browser("GET", f"{c.base}/canary-approval-requests")[1]["requests"]
+        (replay,) = listed
+        assert replay["configured"]["plan_kind"] == "configured_regression"
+        assert [item["test_instance_id"] for item in replay["configured"]["instances"]] == [observed]
+        assert c.approve_configured(replay)[0] == 201
+        deadline = time.monotonic() + 30
+        while thread.is_alive() and time.monotonic() < deadline:
+            try:
+                if c.store.load_run(replay["run_id"])["state"] == "terminal":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        assert thread.is_alive(), outcome
+        replayed = c.store.load_final_projections(replay["run_id"])["local_view"]["findings_projection"]
+        (result,) = replayed["test_results"]
+        assert result["test_instance_id"] == observed
+        assert (result["assessment_outcome"], result["reason"]) == ("blocked", "restricted_empty_denial")
+        assert len(c.target.requests) == 6  # exactly the replay's two approved reads
+    finally:
+        daemon.request_stop()
+        thread.join(15)
+    assert outcome.get("result", {}).get("state") == "stopped", outcome
+    assert "failed" not in [event["state"] for event in events if event.get("event") == "serve_state"]
+
+
+def _requested_hint_plan(c):
+    assert c.save_test("diag", HINT_EQUALS)[0] == 201
+    c.setup_runner()
+    for name, value in (("export_ok", "ok"), ("secret_hint", SECRET_HINT)):
+        c.add_input(name, value)
+    labels = [{"role": "higher_plan", "plan_label": "Pro"}, {"role": "lower_plan", "plan_label": "Free"}]
+    status, created = c.request_plan({"schema_version": "heel.configured-plan-request.v1",
+                                      "plan_kind": "configured_live_read",
+                                      "tests": [{"source_scenario_id": "sc.internal.diag", "source_revision": 1}],
+                                      "plan_labels": labels})
+    assert status == 201, created
+    return created
+
+
+def _failed_view(c):
+    from tests.test_runner_daemon import _daemon, _serve_state
+
+    state = _serve_state(c.home)
+    view = _daemon(c.home, c.harness, c.backend).status(check_control_plane=False)["serve"]
+    return state, view
+
+
+def test_a_cloud_refused_configured_submission_records_only_a_closed_local_diagnostic(customer, monkeypatch):
+    """The serve exit stays ``failed/response_rejected``; the serve state and status add only the
+    failing operation, its configured stage and the HTTP status; never the answer's code or body."""
+    from heel.runner import compiler as compiler_module
+
+    c = customer
+    created = _requested_hint_plan(c)
+    real = compiler_module.CanaryCompiler.compile_configured
+
+    def widened(self, instances, **kwargs):  # the Cloud must refuse a plan differing from its request
+        changed = [{**item, "assertion": _assertion({"kind": "json_field_present", "path": ["export"]}),
+                    "local_inputs": {"export_ok": "export_ok"}} for item in instances]
+        return real(self, changed, **kwargs)
+
+    monkeypatch.setattr(compiler_module.CanaryCompiler, "compile_configured", widened)
+    result = c.serve()
+    assert isinstance(result, BaseException) and (result.state, result.code) == ("failed", "response_rejected")
+    state, view = _failed_view(c)
+    failure = state["failure"]
+    assert failure == {"operation": "process_configured_plan", "stage": "submit", "http_status": 409}, failure
+    assert view["last_state"] == "failed" and view["last_error_code"] == "response_rejected"
+    assert view["last_failure"] == failure
+    assert c.plan_view(created["plan_request_id"])["status"] == "open"
+    assert c.target.requests == []
+    text = json.dumps(state) + json.dumps(view)
+    # The Cloud's answer named a refusal code; no answer text, including that code, is kept.
+    for absent in (c.harness.origin, created["plan_request_id"], SECRET_HINT, "invalid runner", "/v1/",
+                   "configured_plan_mismatch"):
+        assert absent not in text
+    assert "code" not in failure and "code" not in view["last_failure"]
+
+
+def test_a_local_configured_step_failure_names_its_stage_without_any_exception_text(customer, monkeypatch):
+    from heel.runner import compiler as compiler_module
+
+    c = customer
+    _requested_hint_plan(c)
+    sentinel = "diag-sentinel https://staging.example.test/private?token=abc"
+
+    def broken(self, instances, **kwargs):
+        raise ValueError(sentinel)
+
+    monkeypatch.setattr(compiler_module.CanaryCompiler, "compile_configured", broken)
+    result = c.serve()
+    assert isinstance(result, BaseException) and (result.state, result.code) == ("failed", "response_rejected")
+    state, view = _failed_view(c)
+    assert state["failure"] == {"operation": "process_configured_plan", "stage": "compile", "http_status": None}
+    assert view["last_failure"] == state["failure"]
+    assert "sentinel" not in json.dumps(state) and "token" not in json.dumps(view)
+    # Recovery is unchanged: the next ordinary serve is online again and the failure is history.
+    monkeypatch.undo()
+    assert not isinstance(c.serve(), BaseException)
+    state, view = _failed_view(c)
+    assert "failure" not in state and "last_failure" not in view
+
+
+def test_a_malformed_failure_diagnostic_is_not_read_as_serve_history(customer):
+    from tests.test_runner_daemon import _serve_state
+
+    c = customer
+    _requested_hint_plan(c)
+    assert not isinstance(c.serve(), BaseException)
+    path = c.home / "runner-daemon" / "serve-state.json"
+    good = _serve_state(c.home)
+    for failure in ({"operation": "process_configured_plan", "stage": "compile", "http_status": None, "message": "x"},
+                    {"operation": "process_configured_plan", "stage": None, "http_status": 409,
+                     "code": "any_lowercase_text"},  # no body/code field is ever accepted
+                    {"operation": "process_configured_plan", "stage": "compile", "http_status": 99},
+                    {"operation": "process_configured_plan", "stage": "compile", "http_status": True},
+                    {"operation": ["claim"], "stage": None, "http_status": None},  # unhashable
+                    {"operation": "process_configured_plan", "stage": {"x": 1}, "http_status": None},
+                    {"operation": "anything", "stage": None, "http_status": None},
+                    ["operation", "stage", "http_status"]):
+        path.write_text(json.dumps({**good, "state": "failed", "failure": failure}))
+        _state, view = _failed_view(c)
+        assert view == {"state": "not_running"}, (failure, view)
+    path.write_text(json.dumps({**good, "state": "failed", "failure": {
+        "operation": "claim", "stage": None, "http_status": 409}}))
+    assert _failed_view(c)[1]["last_failure"] == {"operation": "claim", "stage": None, "http_status": 409}
+
+
+def test_failure_attribution_follows_only_exact_identity_and_explicit_causes():
+    """An exception that merely occurred while a coordinator failure was being handled (implicit
+    ``__context__``) is not attributed to that call; an explicit ``raise ... from`` is."""
+    from heel.runner import daemon as daemon_module
+
+    class Failing:
+        configured_failure = None
+
+        def process_configured_plan(self):
+            raise ValueError("local detail that must never be reported")
+
+    owner = daemon_module._ServeCoordinator(Failing(), lambda: None)
+    with pytest.raises(ValueError) as raised:
+        owner.process_configured_plan()
+    original = raised.value
+    assert owner.diagnose(original) == {"operation": "process_configured_plan", "stage": None, "http_status": None}
+    try:
+        try:
+            raise original
+        except ValueError:
+            raise RuntimeError("unrelated")  # implicit context only
+    except RuntimeError as unrelated:
+        assert unrelated.__context__ is original and unrelated.__cause__ is None
+        assert owner.diagnose(unrelated) is None
+    try:
+        raise RuntimeError("wrapped") from original
+    except RuntimeError as wrapped:
+        assert owner.diagnose(wrapped)["operation"] == "process_configured_plan"
+    assert owner.diagnose(ValueError("never raised by a coordinator call")) is None
+    for malformed in ({"operation": ["claim"], "stage": None, "http_status": None},
+                      {"operation": "claim", "stage": ["sync"], "http_status": None},
+                      {"operation": "claim", "stage": None, "http_status": 409, "code": "x"}):
+        assert daemon_module._valid_serve_failure(malformed) is False
